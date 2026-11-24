@@ -925,7 +925,7 @@ async def stop_all():
     _SERVERS.clear()
 
 
-WEBPROXY_VERSION = "1.2.3"
+WEBPROXY_VERSION = "1.3.0"
 WEBPROXY_CARRIER = "websocket-lanes"
 WEB_PROXY_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
 WEBPROXY_DC_PORTS = [443, 80, 5222]
@@ -940,6 +940,7 @@ DC_HOSTS = {
 WEBPROXY_TOKEN_BOOTSTRAP = 1
 WEBPROXY_TOKEN_SESSION = 2
 WEBPROXY_PORT_MODE_BASE = 10
+WEBPROXY_TOKEN_MODE = 200
 WEBPROXY_FRAME_OPEN = 1
 WEBPROXY_FRAME_DATA = 2
 WEBPROXY_FRAME_CLOSE = 3
@@ -1006,12 +1007,12 @@ def webproxy_set_hooks(count=None, quota_ok=None, session_allowed=None, uid_for_
     return True
 
 
-def webproxy_uid_for_mode(mode):
+def webproxy_uid_for_mode(mode, token=None):
     fn = _WEB_HOOKS.get("uid_for_mode")
     if fn is None:
         return ""
     try:
-        return str(fn(mode) or "")
+        return str(fn(mode, token) or "")
     except (TypeError, ValueError):
         return ""
 
@@ -1074,7 +1075,8 @@ def _webproxy_log(event, detail):
 def _webproxy_parse_secret(value):
     if value is None:
         return None
-    text = str(value).strip().lower()
+    raw_text = str(value).strip()
+    text = raw_text.lower()
     if text.startswith("0x"):
         text = text[2:]
     hexdigits = "0123456789abcdef"
@@ -1082,6 +1084,9 @@ def _webproxy_parse_secret(value):
         return bytes.fromhex(text)
     if len(text) == 34 and text.startswith("dd") and all(c in hexdigits for c in text[2:]):
         return bytes.fromhex(text[2:])
+    raw_b64 = _b64u_decode_strict(raw_text)
+    if raw_b64 is not None and len(raw_b64) == 18 and raw_b64[0] == 0x70 and raw_b64[1] == 0xDD:
+        return raw_b64[2:]
     return None
 
 
@@ -1151,19 +1156,52 @@ def webproxy_per_port_secret(port):
     return "dd" + webproxy_per_port_secret_bytes(port).hex()
 
 
+def webproxy_token_secret_bytes(token):
+    base = _webproxy_base_secret()
+    token = str(token).strip().lower()
+    material = hashlib.sha256(b"proxygosha-web-token-secret-v1\n" + base + b"\n" + token.encode("ascii")).digest()
+    return material[:16]
+
+
+def webproxy_token_secret(token):
+    return _b64u_encode(b"\x70\xdd" + webproxy_token_secret_bytes(token))
+
+
+def webproxy_token_secret_matches(token, secret):
+    try:
+        raw = _webproxy_parse_secret(secret)
+    except (TypeError, ValueError):
+        return False
+    if raw is None:
+        return False
+    try:
+        expected = webproxy_token_secret_bytes(token)
+    except (RuntimeError, ValueError):
+        return False
+    return hmac_mod.compare_digest(expected, raw)
+
+
 def webproxy_port_mode(port):
     return WEBPROXY_PORT_MODE_BASE + WEB_PROXY_PORTS.index(int(port))
 
 
-def webproxy_link(host, port):
+def webproxy_link(host, port, token=None):
     port = int(port)
+    if token:
+        token = str(token).strip().lower()
+        secret = webproxy_token_secret(token)
+        return "tg://webproxy?server=" + str(host) + "/" + token + "&secret=" + secret
     secret = webproxy_per_port_secret(port)
     suffix = "" if port == 443 else "&port=" + str(port)
     return "tg://webproxy?server=" + str(host) + suffix + "&secret=" + secret
 
 
-def webproxy_link_https(host, port):
+def webproxy_link_https(host, port, token=None):
     port = int(port)
+    if token:
+        token = str(token).strip().lower()
+        secret = webproxy_token_secret(token)
+        return "https://t.me/webproxy?server=" + str(host) + "/" + token + "&secret=" + secret
     secret = webproxy_per_port_secret(port)
     suffix = "" if port == 443 else "&port=" + str(port)
     return "https://t.me/webproxy?server=" + str(host) + suffix + "&secret=" + secret
@@ -1209,7 +1247,7 @@ def _b64u_decode_strict(value):
     return raw
 
 
-def _webproxy_issue_token(kind, ttl, mode):
+def _webproxy_issue_token(kind, ttl, mode, token=None):
     if kind not in (WEBPROXY_TOKEN_BOOTSTRAP, WEBPROXY_TOKEN_SESSION):
         raise ValueError("unknown token kind")
     if not 0 <= int(mode) <= 255:
@@ -1218,7 +1256,13 @@ def _webproxy_issue_token(kind, ttl, mode):
     nonce = bytearray(16)
     nonce[0:4] = struct.pack(">I", expiry)
     nonce[4] = int(mode)
-    nonce[5:16] = os.urandom(11)
+    if int(mode) == WEBPROXY_TOKEN_MODE:
+        if not token:
+            raise ValueError("token mode needs a token")
+        nonce[5:11] = bytes.fromhex(str(token).strip().lower())
+        nonce[11:16] = os.urandom(5)
+    else:
+        nonce[5:16] = os.urandom(11)
     mac = hmac_mod.new(_webproxy_token_key(), WEBPROXY_TOKEN_DOMAIN + bytes([kind]) + bytes(nonce), hashlib.sha256).digest()
     return _b64u_encode(bytes(nonce) + mac)
 
@@ -1239,11 +1283,16 @@ def webproxy_verify_token(token, kind=WEBPROXY_TOKEN_SESSION):
     expires = struct.unpack(">I", nonce[0:4])[0]
     if expires < int(time.time()):
         return None
-    return {"mode": nonce[4], "expires": expires}
+    out = {"mode": nonce[4], "expires": expires}
+    if nonce[4] == WEBPROXY_TOKEN_MODE:
+        out["token"] = bytes(nonce[5:11]).hex()
+    else:
+        out["token"] = ""
+    return out
 
 
-def webproxy_bootstrap_token(mode=0, ttl=WEBPROXY_BOOTSTRAP_TTL):
-    return _webproxy_issue_token(WEBPROXY_TOKEN_BOOTSTRAP, ttl, mode)
+def webproxy_bootstrap_token(mode=0, ttl=WEBPROXY_BOOTSTRAP_TTL, token=None):
+    return _webproxy_issue_token(WEBPROXY_TOKEN_BOOTSTRAP, ttl, mode, token)
 
 
 def webproxy_issue_session(bootstrap_token, handshake_body, ttl=WEBPROXY_SESSION_TTL):
@@ -1254,7 +1303,9 @@ def webproxy_issue_session(bootstrap_token, handshake_body, ttl=WEBPROXY_SESSION
         raise ValueError("generated-domain bootstrap tokens are not accepted")
     if bytes(handshake_body) != WEBPROXY_HANDSHAKE:
         raise ValueError("invalid session handshake")
-    _issue_uid = webproxy_uid_for_mode(verified["mode"])
+    _issue_uid = webproxy_uid_for_mode(verified["mode"], verified.get("token") or None)
+    if verified["mode"] == WEBPROXY_TOKEN_MODE and not _issue_uid:
+        raise ValueError("no WEB proxy inbound for this token")
     if _issue_uid:
         _allowed = _WEB_HOOKS.get("session_allowed")
         if _allowed is not None and not _allowed(_issue_uid, ""):
@@ -1262,7 +1313,7 @@ def webproxy_issue_session(bootstrap_token, handshake_body, ttl=WEBPROXY_SESSION
         _qsync = _WEB_HOOKS.get("quota_ok_sync")
         if _qsync is not None and not _qsync(_issue_uid):
             raise ValueError("quota exceeded for this inbound")
-    token = _webproxy_issue_token(WEBPROXY_TOKEN_SESSION, ttl, verified["mode"])
+    token = _webproxy_issue_token(WEBPROXY_TOKEN_SESSION, ttl, verified["mode"], verified.get("token") or None)
     return {"session_token": token, "welcome": WEBPROXY_WELCOME, "carrier": WEBPROXY_CARRIER, "mode": verified["mode"]}
 
 
@@ -1270,7 +1321,14 @@ def webproxy_delete_session(session_token):
     return webproxy_verify_token(session_token, WEBPROXY_TOKEN_SESSION) is not None
 
 
-def _webproxy_secret_for_mode(mode):
+def _webproxy_secret_for_mode(mode, token=None):
+    if mode == WEBPROXY_TOKEN_MODE:
+        if not token:
+            return None
+        try:
+            return webproxy_token_secret_bytes(token)
+        except (RuntimeError, ValueError):
+            return None
     if mode == 0:
         return _webproxy_base_secret()
     if WEBPROXY_PORT_MODE_BASE <= mode < WEBPROXY_PORT_MODE_BASE + len(WEB_PROXY_PORTS):
@@ -1304,11 +1362,24 @@ def _webproxy_decode_capability(value):
     return None
 
 
-def webproxy_verify_bridge_capability(host, capability, port=None):
+def webproxy_verify_bridge_capability(host, capability, port=None, token=None):
     provided = _webproxy_decode_capability(capability)
     if provided is None or len(provided) != 32:
-        return -1
+        return (-1, "")
     host = str(host).strip().lower()
+    if token:
+        token = str(token).strip().lower()
+        try:
+            secret = webproxy_token_secret_bytes(token)
+        except (RuntimeError, ValueError):
+            secret = None
+        if secret is not None:
+            for key in (secret, b"\xdd" + secret):
+                for context in ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(int(port) if port else 443), "tdesktop-web-proxy-bridge-v1\n" + host):
+                    mac = hmac_mod.new(key, context.encode("utf-8"), hashlib.sha256).digest()
+                    if hmac_mod.compare_digest(mac, provided):
+                        return (WEBPROXY_TOKEN_MODE, token)
+        return (-1, "")
     ports = []
     if port is not None:
         try:
@@ -1326,8 +1397,8 @@ def webproxy_verify_bridge_capability(host, capability, port=None):
             for context in ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(item), "tdesktop-web-proxy-bridge-v1\n" + host):
                 mac = hmac_mod.new(key, context.encode("utf-8"), hashlib.sha256).digest()
                 if hmac_mod.compare_digest(mac, provided):
-                    return WEBPROXY_PORT_MODE_BASE + WEB_PROXY_PORTS.index(item)
-    return -1
+                    return (WEBPROXY_PORT_MODE_BASE + WEB_PROXY_PORTS.index(item), "")
+    return (-1, "")
 
 
 def _webproxy_aes_ctr_at(key, iv, position, data):
@@ -1981,11 +2052,11 @@ async def webproxy_websocket_handler(websocket, protocol=None):
         _WEB_STATS["ws_rejects"] += 1
         _webproxy_log("ws_reject", "invalid or expired session token")
         raise ValueError("invalid or expired session token")
-    secret = _webproxy_secret_for_mode(verified["mode"])
+    secret = _webproxy_secret_for_mode(verified["mode"], verified.get("token") or None)
     if secret is None:
         _WEB_STATS["ws_rejects"] += 1
         raise ValueError("unsupported token mode")
-    _ws_uid = webproxy_uid_for_mode(verified["mode"])
+    _ws_uid = webproxy_uid_for_mode(verified["mode"], verified.get("token") or None)
     if not _ws_uid:
         _WEB_STATS["ws_rejects"] += 1
         _webproxy_log("ws_reject", "no WEB proxy link for this port")
@@ -2210,9 +2281,12 @@ addEventListener('pagehide',()=>closeAll(true),{once:true});
 """
 
 
-def webproxy_bridge_html(host, port):
-    mode = webproxy_port_mode(port)
-    bootstrap = webproxy_bootstrap_token(mode=mode)
+def webproxy_bridge_html(host, port, token=None):
+    if token:
+        bootstrap = webproxy_bootstrap_token(mode=WEBPROXY_TOKEN_MODE, token=token)
+    else:
+        mode = webproxy_port_mode(port)
+        bootstrap = webproxy_bootstrap_token(mode=mode)
     page = _WEBPROXY_BRIDGE_HTML
     page = page.replace("__NONCE__", _b64u_encode(os.urandom(18)))
     page = page.replace("__BOOTSTRAP__", json.dumps(bootstrap))
@@ -2237,6 +2311,7 @@ def webproxy_status():
         "version": WEBPROXY_VERSION,
         "carrier": WEBPROXY_CARRIER,
         "mode": "direct-dc",
+        "token_mode": WEBPROXY_TOKEN_MODE,
         "me_supported": WEBPROXY_ME_SUPPORTED,
         "configured": configured,
         "secret_source": source,
@@ -2256,9 +2331,12 @@ def webproxy_status():
     }
 
 
-def webproxy_capability_for(host, port):
+def webproxy_capability_for(host, port, token=None):
     port = int(port)
-    secret = webproxy_per_port_secret_bytes(port)
+    if token:
+        secret = webproxy_token_secret_bytes(token)
+    else:
+        secret = webproxy_per_port_secret_bytes(port)
     host = str(host).strip().lower()
     mac = hmac_mod.new(secret, ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(port)).encode("utf-8"), hashlib.sha256).digest()
     return _b64u_encode(mac)
@@ -2286,7 +2364,7 @@ def webproxy_self_check(host):
     try:
         host = str(host or "").strip().lower() or "localhost"
         capability = webproxy_capability_for(host, 443)
-        mode = webproxy_verify_bridge_capability(host, capability, 443)
+        mode, _self_token = webproxy_verify_bridge_capability(host, capability, 443)
         if mode != WEBPROXY_PORT_MODE_BASE:
             return {"ok": False, "detail": "web proxy capability for port 443 did not verify (mode " + str(mode) + "); the secret used to build links is not the secret the bridge verifies with"}
         bootstrap = webproxy_bootstrap_token(mode=mode)
