@@ -13,7 +13,7 @@ import ipaddress
 import socket
 import uuid as uuid_lib
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 try:
     from cryptography.fernet import Fernet
 except ImportError:
@@ -182,84 +182,29 @@ def get_inbound_definitions():
         {"tag": "ws-random-in", "type": "websocket", "path": "/{random}/ws/{uuid}", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform"},
         {"tag": "ws-custom-in", "type": "websocket", "path": "link custom_path, {uid} replaced with the link UUID", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform", "note": "served by the catch-all WS route, path must match the link custom_path exactly, one leading random segment allowed when random_path is on"},
         {"tag": "xhttp-in", "type": "xhttp", "path": "/xhttp/{session}", "protocols": ["xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one", "xhttp-auto"], "port": "PORT env", "tls": "terminated by platform"},
-        {"tag": "socks5-in", "type": "socks5", "path": "TCP port SOCKS_PORT (default 1080)", "protocols": ["socks5"], "port": "SOCKS_PORT env", "tls": "none, username/password auth per link uid", "note": "Telegram SOCKS5, TCP CONNECT only, destinations restricted to Telegram DC ranges, no UDP associate, disabled on Render (single HTTP port)"},
-        {"tag": "mtproxy-in", "type": "mtproxy", "path": "TCP port TG_PROXY_PORT (default 8443)", "protocols": ["mtproto"], "port": "TG_PROXY_PORT env", "tls": "obfuscated2 / fake-tls", "note": "Telegram MTProto proxy, per-link secret derived from the panel secret, variants plain / dd / fake-TLS, disabled on Render (single HTTP port)"},
-        {"tag": "http-proxy-in", "type": "http-proxy", "path": "TCP port HTTP_PROXY_PORT (default 3128)", "protocols": ["http-proxy"], "port": "HTTP_PROXY_PORT env", "tls": "none, Basic auth per link uid, CONNECT only", "note": "HTTP CONNECT proxy, Telegram DC destinations only, not an open web proxy, disabled on Render (single HTTP port)"},
-        {"tag": "webproxy-in", "type": "webproxy", "path": "panel HTTPS port, bridge at /tgweb", "protocols": ["webproxy"], "port": "panel PORT env", "tls": "terminated by platform, per-port secret", "note": "Telegram WEB proxy (Direct-DC), rides the panel HTTPS port so it works on Render and Railway, per-port secret, mode port 443/2053/2083/2087/2096/8443"},
+        {"tag": "socks5-in", "type": "socks5", "path": "Raw TCP listener on SOCKS_PORT (default 1080), NOT the panel HTTPS port", "protocols": ["socks5"], "port": "SOCKS_PORT env", "tls": "none, username/password auth per link uid", "note": "Telegram SOCKS5, raw TCP listener, TCP CONNECT only, destinations restricted to Telegram DC ranges, no UDP associate. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "mtproxy-in", "type": "mtproxy", "path": "Raw TCP listener on TG_PROXY_PORT (default 8443), NOT the panel HTTPS port", "protocols": ["mtproto"], "port": "TG_PROXY_PORT env", "tls": "obfuscated2 / fake-tls", "note": "Telegram MTProto proxy, raw TCP listener, per-link secret derived from the panel secret, variants plain / dd / fake-TLS. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "http-proxy-in", "type": "http-proxy", "path": "Raw TCP listener on HTTP_PROXY_PORT (default 3128), NOT the panel HTTPS port", "protocols": ["http-proxy"], "port": "HTTP_PROXY_PORT env", "tls": "none, Basic auth per link uid, CONNECT only", "note": "HTTP CONNECT proxy, raw TCP listener, Telegram DC destinations only, not an open web proxy. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "webproxy-in", "type": "webproxy", "path": "panel HTTPS port, bridge at /tgweb", "protocols": ["webproxy"], "port": "panel PORT env", "tls": "terminated by platform, per-port secret", "note": "Telegram WEB proxy (Direct-DC), rides the panel HTTPS port so it works on Cloady, Render and Railway. One port per link, the port selects the secret, so two links never share a secret. Mode port 443/2053/2083/2087/2096/8443"},
     ]
 
 
-REGION_PRESETS = [
-    ("au", "Australia"), ("us", "United States"), ("gb", "United Kingdom"), ("de", "Germany"),
-    ("fr", "France"), ("nl", "Netherlands"), ("ca", "Canada"), ("jp", "Japan"),
-    ("sg", "Singapore"), ("kr", "South Korea"), ("in", "India"), ("br", "Brazil"),
-    ("tr", "Turkey"), ("se", "Sweden"), ("no", "Norway"), ("fi", "Finland"),
-    ("dk", "Denmark"), ("ch", "Switzerland"), ("at", "Austria"), ("be", "Belgium"),
-    ("ie", "Ireland"), ("it", "Italy"), ("es", "Spain"), ("pt", "Portugal"),
-    ("pl", "Poland"), ("cz", "Czechia"), ("hu", "Hungary"), ("ro", "Romania"),
-    ("ua", "Ukraine"),
-]
-REGIONS = {}
-ROUTING_RULES = {}
-REGION_SOCKS_RANGE = "1024-1099"
-REGION_SOCKS_HOST = "127.0.0.1"
-
-
-def region_name_for_link(link):
-    rid = (link or {}).get("region_id") or ""
-    if rid and rid in REGIONS:
-        return REGIONS[rid].get("name", rid)
-    return ""
-
-
-def resolve_link_region(link):
-    if not link:
-        return None
-    rid = (link.get("region_id") or "").strip()
-    if rid:
-        region = REGIONS.get(rid)
-        if region and region.get("status") == "active":
-            return region
-        return None
-    rules = sorted([r for r in ROUTING_RULES.values() if r.get("enabled")], key=lambda r: (int(r.get("priority") or 0), str(r.get("created_at") or "")))
-    for rule in rules:
-        mt = rule.get("match_type") or ""
-        mv = rule.get("match_value") or ""
-        hit = False
-        if mt == "all":
-            hit = True
-        elif mt == "link":
-            hit = mv == link.get("uid")
-        elif mt == "label":
-            hit = mv.lower() in str(link.get("label") or "").lower()
-        elif mt == "port":
-            try:
-                hit = int(mv) == int(link.get("port") or 0)
-            except (TypeError, ValueError):
-                hit = False
-        elif mt == "user":
-            hit = mv == (link.get("owner_user_id") or "")
-        if hit:
-            region = REGIONS.get(rule.get("region_id") or "")
-            if region and region.get("status") == "active":
-                return region
-    return None
-
-
-async def create_region_connection(host, port, region, link):
+async def create_direct_proxy_connection(host, port, link):
+    stored = (link.get("outbound_proxy") or "").strip()
+    if not stored:
+        raise ConnectionError("Outbound proxy line is empty")
     try:
-        rhost = region.get("socks_host") or "127.0.0.1"
-        rport = int(region.get("socks_port") or 0)
-    except (TypeError, ValueError):
-        raise ConnectionError("Region has an invalid SOCKS port")
-    if not rport:
-        raise ConnectionError("Region has no SOCKS port")
-    user = (region.get("socks_user") or "").strip()
-    password = decrypt_proxy_password(region.get("socks_pass") or "")
+        proxy_host, proxy_port, proxy_user, _ignored = parse_outbound_proxy_line(stored)
+    except ValueError as e:
+        raise ConnectionError("Outbound proxy line is invalid: " + str(e))
+    proxy_pass = decrypt_proxy_password(link.get("outbound_proxy_pass") or "")
     auth = ""
-    if user:
-        auth = quote(user) + ":" + quote(password) + "@"
-    proxy_url = "socks5://" + auth + str(rhost) + ":" + str(rport)
+    if proxy_user:
+        auth = quote(proxy_user) + ":" + quote(proxy_pass) + "@"
+    shown_host = proxy_host
+    if ":" in shown_host and not shown_host.startswith("["):
+        shown_host = "[" + shown_host + "]"
+    proxy_url = "socks5:" + "/" + "/" + auth + shown_host + ":" + str(proxy_port)
     try:
         proxy = Proxy.from_url(proxy_url)
         sock = await asyncio.wait_for(proxy.connect(dest_host=host, dest_port=port), timeout=10.0)
@@ -267,37 +212,9 @@ async def create_region_connection(host, port, region, link):
         tune_socket_for_link(writer, link)
         return reader, writer
     except asyncio.TimeoutError as e:
-        raise ConnectionError("Region " + str(region.get("id")) + " SOCKS5 timed out") from e
+        raise ConnectionError("Outbound proxy SOCKS5 timed out") from e
     except Exception as e:
-        raise ConnectionError("Region " + str(region.get("id")) + " SOCKS5 failed: " + str(e)) from e
-
-
-def next_free_region_port():
-    try:
-        lo, hi = REGION_SOCKS_RANGE.split("-")
-        lo = int(lo.strip())
-        hi = int(hi.strip())
-    except (ValueError, AttributeError):
-        lo, hi = 1024, 1099
-    used = {int(r.get("socks_port") or 0) for r in REGIONS.values()}
-    for p in range(lo, hi + 1):
-        if p not in used:
-            return p
-    return 0
-
-
-async def probe_socks5(host, port):
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5.0)
-        try:
-            writer.write(b"\x05\x01\x00")
-            await writer.drain()
-            resp = await asyncio.wait_for(reader.readexactly(2), timeout=5.0)
-            return len(resp) == 2 and resp[0] == 0x05
-        finally:
-            writer.close()
-    except Exception:
-        return False
+        raise ConnectionError("Outbound proxy SOCKS5 failed: " + str(e)) from e
 
 
 def _link_session_count(uid):
@@ -366,12 +283,46 @@ def _xhttp_add_up(sess, n):
         c["bytes_up"] = c.get("bytes_up", 0) + n
 
 
+def parse_outbound_proxy(line):
+    raw = (line or "").strip()
+    if not raw:
+        raise ValueError("empty proxy line")
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        if scheme.lower() not in ("socks5", "socks"):
+            raise ValueError("only socks5:// is supported")
+    else:
+        rest = raw
+    if "@" in rest:
+        auth, hostport = rest.rsplit("@", 1)
+        if ":" in auth:
+            username, password = auth.split(":", 1)
+        else:
+            username, password = auth, ""
+    else:
+        username, password = "", ""
+        hostport = rest
+    if ":" not in hostport:
+        raise ValueError("proxy line must be host:port")
+    host, port_s = hostport.rsplit(":", 1)
+    host = host.strip()
+    if not host:
+        raise ValueError("proxy host is empty")
+    try:
+        proxy_port = int(port_s)
+    except (TypeError, ValueError):
+        raise ValueError("proxy port must be a number")
+    if proxy_port < 1 or proxy_port > 65535:
+        raise ValueError("proxy port out of range")
+    return host, proxy_port, unquote(username), unquote(password)
+
+
 def resolve_outbound_mode(link):
     mode = (link.get("outbound_mode") or "auto").strip().lower()
     if mode not in OUTBOUND_MODES:
         mode = "auto"
     if mode == "auto":
-        return "proxy" if link.get("proxy_line_id") else "direct"
+        return "proxy" if (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip()) else "direct"
     return mode
 
 
@@ -503,13 +454,10 @@ async def open_validated_connection(host: str, port: int, link, validated_ips):
     mode = resolve_outbound_mode(link) if link else "direct"
     if mode == "block":
         raise ConnectionError("Outbound is blocked for this link")
-    region = resolve_link_region(link) if link else None
-    if link and (link.get("region_id") or "").strip() and not region:
-        raise ConnectionError("Region " + str(link.get("region_id")) + " is not available")
-    if region:
-        return await create_region_connection(host, port, region, link)
+    if link and (link.get("outbound_proxy") or "").strip():
+        return await create_direct_proxy_connection(host, port, link)
     if mode == "proxy":
-        if not link.get("proxy_line_id"):
+        if not link.get("proxy_line_id") and not (link.get("outbound_proxy") or "").strip():
             raise ConnectionError("Outbound mode is proxy but no proxy line is configured")
         return await create_proxied_connection(host, port, link)
     ips = list(validated_ips or [])
@@ -585,6 +533,75 @@ async def migrate_proxy_passwords():
             continue
         await db_execute("UPDATE proxy_lines SET password = ? WHERE id = ?", "UPDATE proxy_lines SET password = $1 WHERE id = $2", (encrypted, row["id"]))
 
+
+
+def parse_outbound_proxy_line(text):
+    value = (text or "").strip()
+    if not value:
+        return "", 0, "", ""
+    low = value.lower()
+    scheme = "socks5:" + "/" + "/"
+    if low.startswith(scheme):
+        value = value[len(scheme):]
+    elif ("/" + "/") in value:
+        raise ValueError("Only SOCKS5 proxy lines are supported")
+    if "@" in value:
+        userinfo, hostport = value.rsplit("@", 1)
+        if ":" in userinfo:
+            user, password = userinfo.split(":", 1)
+        else:
+            user, password = userinfo, ""
+    else:
+        user, password, hostport = "", "", value
+    user = user.strip()
+    hostport = hostport.strip()
+    if hostport.startswith("["):
+        close = hostport.find("]")
+        if close < 0 or len(hostport) <= close + 1 or hostport[close + 1] != ":":
+            raise ValueError("Invalid IPv6 proxy address")
+        host = hostport[1:close]
+        port_text = hostport[close + 2:]
+    elif hostport.count(":") == 1:
+        host, port_text = hostport.split(":", 1)
+    else:
+        raise ValueError("Proxy line must be host:port")
+    host = host.strip()
+    if not host:
+        raise ValueError("Proxy host is required")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not re.match(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$", host) or ".." in host:
+            raise ValueError("Invalid proxy host")
+    try:
+        port = int(port_text)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid proxy port")
+    if port < 1 or port > 65535:
+        raise ValueError("Invalid proxy port")
+    if not user:
+        password = ""
+    return host, port, user, password
+
+
+def split_outbound_proxy_for_store(text, stored_pass=""):
+    value = (text or "").strip()
+    if not value:
+        return "", ""
+    host, port, user, password = parse_outbound_proxy_line(value)
+    shown = host
+    if ":" in shown and not shown.startswith("["):
+        shown = "[" + shown + "]"
+    line = shown + ":" + str(port)
+    if user:
+        line = user + "@" + line
+    if password:
+        stored = encrypt_proxy_password(password)
+    elif user and stored_pass:
+        stored = stored_pass
+    else:
+        stored = ""
+    return line, stored
 PANEL_PREFIX = os.environ.get("PANEL_PREFIX", "").strip("/")
 PANEL_ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("PANEL_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 STEALTH_MODE = os.environ.get("STEALTH_MODE", "").lower() in ("1", "true", "yes")
@@ -1307,7 +1324,7 @@ async def handle_trojan_ws(websocket, link, uuid, client_ip, conn_id, first_chun
     if is_domain_blocked(address):
         await websocket.close(code=1008, reason="blocked domain")
         return
-    validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and link.get("proxy_line_id")))
+    validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
     if not validated:
         await websocket.close(code=1008, reason="access to private network denied")
         return
@@ -1452,7 +1469,7 @@ async def handle_vmess_ws(websocket, link, uuid, client_ip, conn_id, first_chunk
     if is_domain_blocked(req.address):
         await websocket.close(code=1008, reason="blocked domain")
         return
-    validated, validated_ips = await validate_tunnel_target(req.address, via_proxy=bool(link and link.get("proxy_line_id")))
+    validated, validated_ips = await validate_tunnel_target(req.address, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
     if not validated:
         await websocket.close(code=1008, reason="access to private network denied")
         return
@@ -1661,7 +1678,7 @@ async def handle_ss_ws(websocket, link, uuid, client_ip, conn_id, first_chunk):
     if is_domain_blocked(address):
         await websocket.close(code=1008, reason="blocked domain")
         return
-    validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and link.get("proxy_line_id")))
+    validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
     if not validated:
         await websocket.close(code=1008, reason="access to private network denied")
         return
@@ -1776,6 +1793,20 @@ def generate_ss_link(uid, remark="SulgX", address=None, extra=None, server_domai
 
 
 
+def _webproxy_port_in_use(port, exclude_uid=""):
+    for _l in LINKS.values():
+        if (_l.get("protocol") or "") == "webproxy" and int(_l.get("port") or 443) == int(port) and _l.get("uid") != exclude_uid:
+            return True
+    return False
+
+
+def _next_free_webproxy_port(exclude_uid=""):
+    for _p in WEBPROXY_PORTS:
+        if not _webproxy_port_in_use(_p, exclude_uid):
+            return _p
+    return 0
+
+
 def _proxy_effective_port(protocol):
     if protocol == "socks5":
         return SOCKS_PORT
@@ -1844,7 +1875,7 @@ def proxy_links_for_link(link, host):
         out["variants"] = tgproxy.mtproxy_links_for_uid(host, TG_PROXY_PORT, uid, domain) if _proxy_listener_enabled("mtproto") else {"plain": "", "dd": "", "faketls": ""}
         out["variant"] = variant
     if protocol == "webproxy" and tgproxy is not None:
-        out["all_ports"] = tgproxy.webproxy_links(host) if _proxy_listener_enabled("webproxy") else []
+        out["all_ports"] = [x for x in tgproxy.webproxy_links(host) if int(x.get("port") or 0) == int(port)] if _proxy_listener_enabled("webproxy") else []
     if protocol in ("socks5", "http-proxy"):
         out["username"] = uid
         out["password"] = uid
@@ -1934,7 +1965,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     gaming_profile TEXT DEFAULT 'balanced',
                     ss_method TEXT DEFAULT '2022-blake3-aes-256-gcm',
                     ss_psk TEXT DEFAULT '',
-                    owner_user_id TEXT DEFAULT '', region_id TEXT DEFAULT ''
+                    owner_user_id TEXT DEFAULT '', outbound_proxy TEXT DEFAULT '', outbound_proxy_pass TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0, uid TEXT DEFAULT '');
@@ -1945,8 +1976,6 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                 );
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, telegram_chat_id TEXT DEFAULT '', notes TEXT DEFAULT '', max_sessions INTEGER DEFAULT 0, created_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS regions (id TEXT PRIMARY KEY, name TEXT NOT NULL, socks_host TEXT NOT NULL, socks_port INTEGER NOT NULL, socks_user TEXT DEFAULT '', socks_pass TEXT DEFAULT '', status TEXT DEFAULT 'active', source TEXT DEFAULT 'manual', health TEXT DEFAULT 'unknown', last_check TEXT DEFAULT '', created_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS routing_rules (id TEXT PRIMARY KEY, name TEXT NOT NULL, match_type TEXT NOT NULL, match_value TEXT NOT NULL, region_id TEXT NOT NULL, priority INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1, created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS revoked_tokens (jti TEXT PRIMARY KEY, expires_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS login_logs (
                     id SERIAL PRIMARY KEY,
@@ -2013,7 +2042,8 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                 ("ss_method", "TEXT DEFAULT '2022-blake3-aes-256-gcm'"),
                 ("ss_psk", "TEXT DEFAULT ''"),
                 ("owner_user_id", "TEXT DEFAULT ''"),
-                ("region_id", "TEXT DEFAULT ''"),
+                ("outbound_proxy", "TEXT DEFAULT ''"),
+                ("outbound_proxy_pass", "TEXT DEFAULT ''"),
                 ("mtproto_variant", "TEXT DEFAULT 'dd'"),
                 ("mtproto_domain", "TEXT DEFAULT 'www.google.com'"),
             ]:
@@ -2120,7 +2150,7 @@ else:
                 gaming_profile TEXT DEFAULT 'balanced',
                 ss_method TEXT DEFAULT '2022-blake3-aes-256-gcm',
                 ss_psk TEXT DEFAULT '',
-                owner_user_id TEXT DEFAULT '', region_id TEXT DEFAULT ''
+                owner_user_id TEXT DEFAULT '', outbound_proxy TEXT DEFAULT '', outbound_proxy_pass TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0, uid TEXT DEFAULT '');
@@ -2131,8 +2161,6 @@ else:
             );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, telegram_chat_id TEXT DEFAULT '', notes TEXT DEFAULT '', max_sessions INTEGER DEFAULT 0, created_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS regions (id TEXT PRIMARY KEY, name TEXT NOT NULL, socks_host TEXT NOT NULL, socks_port INTEGER NOT NULL, socks_user TEXT DEFAULT '', socks_pass TEXT DEFAULT '', status TEXT DEFAULT 'active', source TEXT DEFAULT 'manual', health TEXT DEFAULT 'unknown', last_check TEXT DEFAULT '', created_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS routing_rules (id TEXT PRIMARY KEY, name TEXT NOT NULL, match_type TEXT NOT NULL, match_value TEXT NOT NULL, region_id TEXT NOT NULL, priority INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS revoked_tokens (jti TEXT PRIMARY KEY, expires_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS login_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2188,7 +2216,8 @@ else:
             ("ss_method", "TEXT DEFAULT '2022-blake3-aes-256-gcm'"),
             ("ss_psk", "TEXT DEFAULT ''"),
             ("owner_user_id", "TEXT DEFAULT ''"),
-                ("region_id", "TEXT DEFAULT ''"),
+                ("outbound_proxy", "TEXT DEFAULT ''"),
+                ("outbound_proxy_pass", "TEXT DEFAULT ''"),
         ]
         for col, col_def in extended_columns:
             await ensure_column_sqlite("links", col, col_def)
@@ -2225,6 +2254,7 @@ else:
         await ensure_column_sqlite("login_logs", "isp", "TEXT DEFAULT ''")
         await ensure_column_sqlite("login_logs", "org", "TEXT DEFAULT ''")
         await ensure_column_sqlite("links", "proxy_line_id", "INTEGER REFERENCES proxy_lines(id) ON DELETE SET NULL")
+        await ensure_column_sqlite("links", "outbound_proxy", "TEXT DEFAULT ''")
         await ensure_column_sqlite("proxy_lines", "flag", "TEXT DEFAULT ''")
         await ensure_column_sqlite("proxy_lines", "last_test_status", "TEXT DEFAULT ''")
         await ensure_column_sqlite("proxy_lines", "last_latency_ms", "INTEGER DEFAULT 0")
@@ -2363,13 +2393,18 @@ async def save_subs():
         logger.error(f"Failed to save subs: {e}")
 
 async def load_initial_data():
-    global DEFAULT_PATH, DOH_ENABLED, DEFAULT_XHTTP_PATH, DEFAULT_INBOUND_UID, REGION_SOCKS_RANGE, REGION_SOCKS_HOST
+    global DEFAULT_PATH, DOH_ENABLED, DEFAULT_XHTTP_PATH, DEFAULT_INBOUND_UID
     rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
     async with LINKS_LOCK:
         for r in rows:
             link_dict = dict(r)
             if "proxy_line_id" not in link_dict:
                 link_dict["proxy_line_id"] = None
+            if "outbound_proxy" not in link_dict:
+                link_dict["outbound_proxy"] = ""
+            if "outbound_proxy_pass" not in link_dict:
+                link_dict["outbound_proxy_pass"] = ""
+            link_dict.pop("region_id", None)
             if "udp_enabled" not in link_dict:
                 link_dict["udp_enabled"] = 1
             if "outbound_mode" not in link_dict:
@@ -2418,13 +2453,14 @@ async def load_initial_data():
             "ss_method": "2022-blake3-aes-256-gcm",
             "ss_psk": "",
             "owner_user_id": "",
-            "region_id": ""
+            "outbound_proxy": "",
+            "outbound_proxy_pass": ""
         }
         async with LINKS_LOCK:
             LINKS[default_uuid] = default_link
             await db_execute(
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
                 (default_uuid, "This Server is Free", 0, 0, 0, now, 1, None,
                  "", "", "", "chrome",
                  "#39ff14", "", "", "", "default",
@@ -2433,7 +2469,7 @@ async def load_initial_data():
                  0, 0, 1,
                  0, 0, "vless-ws",
                  "chrome", "", 443, None,
-                 1, 0, 0, "doh", "", "", 1, "auto", "balanced", "2022-blake3-aes-256-gcm", "", "", ""),
+                 1, 0, 0, "doh", "", "", 1, "auto", "balanced", "2022-blake3-aes-256-gcm", "", "", "", ""),
             )
         DEFAULT_INBOUND_UID = default_uuid
         await db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2", ("default_inbound_uid", default_uuid))
@@ -2463,18 +2499,6 @@ async def load_initial_data():
                 DEFAULT_INBOUND_UID = _u
                 await db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2", ("default_inbound_uid", _u))
                 break
-    region_rows = await db_fetchall("SELECT * FROM regions", "SELECT * FROM regions")
-    for r in region_rows or []:
-        REGIONS[r["id"]] = dict(r)
-    rule_rows = await db_fetchall("SELECT * FROM routing_rules", "SELECT * FROM routing_rules")
-    for r in rule_rows or []:
-        ROUTING_RULES[r["id"]] = dict(r)
-    srows = await db_fetchall("SELECT key, value FROM settings WHERE key IN ('region_socks_range', 'region_socks_host')", "SELECT key, value FROM settings WHERE key IN ('region_socks_range', 'region_socks_host')")
-    svals = {r["key"]: r["value"] for r in srows} if srows else {}
-    if svals.get("region_socks_range"):
-        REGION_SOCKS_RANGE = svals["region_socks_range"]
-    if svals.get("region_socks_host"):
-        REGION_SOCKS_HOST = svals["region_socks_host"]
     try:
         user_rows = await db_fetchall("SELECT id, name, max_sessions FROM users", "SELECT id, name, max_sessions FROM users")
         for r in user_rows or []:
@@ -2505,7 +2529,7 @@ async def load_initial_data():
             "INSERT INTO settings (key, value) VALUES ('default_xhttp_path', $1) ON CONFLICT (key) DO NOTHING",
             (DEFAULT_XHTTP_PATH,)
         )
-    for _seed_key, _seed_val in (("default_protocol", "vless-ws"), ("default_ss_method", "2022-blake3-aes-256-gcm"), ("default_outbound_mode", "auto"), ("default_gaming_profile", "balanced"), ("ws_rate_max", "20"), ("ws_rate_window", "60"), ("sub_update_interval", "6"), ("max_xhttp_sessions", "200"), ("region_socks_range", "1024-1099"), ("region_socks_host", "127.0.0.1")):
+    for _seed_key, _seed_val in (("default_protocol", "vless-ws"), ("default_ss_method", "2022-blake3-aes-256-gcm"), ("default_outbound_mode", "auto"), ("default_gaming_profile", "balanced"), ("ws_rate_max", "20"), ("ws_rate_window", "60"), ("sub_update_interval", "6"), ("max_xhttp_sessions", "200")):
         await db_execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING", (_seed_key, _seed_val))
     doh_enabled_row = await db_fetchone("SELECT value FROM settings WHERE key='doh_enabled'", "SELECT value FROM settings WHERE key='doh_enabled'")
     if doh_enabled_row:
@@ -2868,13 +2892,11 @@ async def _ensure_admin_password_hash():
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
     )
     if hash_row:
-        if verify_password("admin", hash_row["value"]):
-            raise RuntimeError("Stored admin password is the default admin password")
         ADMIN_PASSWORD_HASH = hash_row["value"]
         return None
     env_password = os.environ.get("ADMIN_PASSWORD", "")
     if env_password:
-        if len(env_password) < 8:
+        if len(env_password) < 8 and env_password != "admin":
             raise RuntimeError("ADMIN_PASSWORD must be at least 8 characters")
         ADMIN_PASSWORD_HASH = bcrypt.hashpw(env_password.encode(), bcrypt.gensalt()).decode()
         await db_execute(
@@ -2883,7 +2905,7 @@ async def _ensure_admin_password_hash():
             (ADMIN_PASSWORD_HASH,),
         )
         return None
-    generated = _generate_admin_password()
+    generated = "admin"
     ADMIN_PASSWORD_HASH = bcrypt.hashpw(generated.encode(), bcrypt.gensalt()).decode()
     await db_execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password_hash', ?)",
@@ -2891,7 +2913,7 @@ async def _ensure_admin_password_hash():
         (ADMIN_PASSWORD_HASH,),
     )
     credentials_path = _write_initial_credentials_file(CONFIG["db_path"], generated)
-    print("SulgX first boot: generated admin password (shown once, also saved to " + credentials_path + "): " + generated, flush=True)
+    print("SulgX first boot: using default admin password 'admin' (change it after first login, also saved to " + credentials_path + ")", flush=True)
     return generated
 
 
@@ -2902,12 +2924,22 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "postgresql":
         await init_pg()
     else:
+        db_existed = os.path.exists(CONFIG["db_path"])
+        if db_existed:
+            logger.info("SulgX startup: database file already existed at " + CONFIG["db_path"] + " (sessions and admin password preserved)")
+            print("SulgX startup: database file already existed at " + CONFIG["db_path"] + " (sessions and admin password preserved)", flush=True)
+        else:
+            logger.warning("SulgX startup: database file NOT FOUND at " + CONFIG["db_path"] + " - a fresh database will be created, all previous sessions are invalid and the admin password resets to default. Attach a persistent volume to DB_PATH to survive restarts.")
+            print("SulgX startup: database file NOT FOUND at " + CONFIG["db_path"] + " - a fresh database will be created, all previous sessions are invalid and the admin password resets to default. Attach a persistent volume to DB_PATH to survive restarts.", flush=True)
         await init_db()
     await _migrate_daily_traffic()
     await load_initial_data()
     await refresh_stable_settings()
 
-    await _ensure_first_boot_secret_key()
+    _secret_was_generated = await _ensure_first_boot_secret_key()
+    if _secret_was_generated:
+        logger.warning("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.")
+        print("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.", flush=True)
     if tgproxy is not None:
         try:
             _secret_env = os.environ.get("TG_PROXY_SECRET", "").strip()
@@ -2945,7 +2977,14 @@ async def lifespan(app: FastAPI):
                     if link.get("limit_bytes", 0) > 0 and link.get("used_bytes", 0) >= link["limit_bytes"]:
                         return False
                     return True
-                return await consume_quota(uid, n)
+                counted = await consume_quota_partial(uid, n)
+                if counted > 0:
+                    stats["total_bytes"] += counted
+                    local_now = datetime.now(UTC) + timedelta(hours=TIMEZONE_OFFSET)
+                    hour = local_now.strftime("%Y-%m-%d %H:00")
+                    day = local_now.strftime("%Y-%m-%d")
+                    await add_traffic_to_buffer(hour, day, counted, uid)
+                return counted == n
 
             async def _tg_quota_ok():
                 return not await monthly_quota_exceeded()
@@ -3144,6 +3183,11 @@ class PanelPrefixMiddleware:
 
 app.add_middleware(PanelPrefixMiddleware)
 
+@app.get("/static/chart.umd.js")
+async def chart_js():
+    return Response(content=CHARTJS_BYTES, media_type="application/javascript", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.post("/api/tg-webhook")
 @limiter.limit("60/minute")
 async def telegram_webhook(request: Request):
@@ -3288,14 +3332,14 @@ async def telegram_webhook(request: Request):
                         "xray_doh_url": "",
                         "xray_allowed_domains": "",
                         "udp_enabled": 1, "outbound_mode": "auto", "gaming_profile": "balanced",
-                        "ss_method": "2022-blake3-aes-256-gcm", "ss_psk": _wizard_psk, "owner_user_id": "", "region_id": ""
+                        "ss_method": "2022-blake3-aes-256-gcm", "ss_psk": _wizard_psk, "owner_user_id": "", "outbound_proxy": "", "outbound_proxy_pass": ""
                     }
                     async with LINKS_LOCK:
                         LINKS[uid] = link_data
                     
                     await db_execute(
-                        "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
+                        "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
                         (uid, label, link_data["limit_bytes"], link_data["used_bytes"], link_data["max_connections"], now, link_data["active"], expires,
                          link_data["custom_path"], link_data["custom_sni"], link_data["custom_host"], link_data["custom_fp"],
                          link_data["color"], link_data["flag"], link_data["fragment"], link_data["ip_profile_id"], link_data["naming_mode"],
@@ -3305,7 +3349,7 @@ async def telegram_webhook(request: Request):
                          link_data["smux_enabled"], link_data["ip_limit"], link_data["protocol"],
                          link_data["fingerprint"], link_data["alpn"], link_data["port"], link_data["proxy_line_id"],
                          link_data["bypass_iran"], link_data["bypass_china"], link_data["bypass_russia"],
-                         link_data["xray_dns_mode"], link_data["xray_doh_url"], link_data["xray_allowed_domains"], link_data["udp_enabled"], link_data.get("outbound_mode", "auto"), link_data.get("gaming_profile", "balanced"), link_data.get("ss_method", "2022-blake3-aes-256-gcm"), link_data.get("ss_psk", ""), link_data.get("owner_user_id", ""), link_data.get("region_id", ""))
+                         link_data["xray_dns_mode"], link_data["xray_doh_url"], link_data["xray_allowed_domains"], link_data["udp_enabled"], link_data.get("outbound_mode", "auto"), link_data.get("gaming_profile", "balanced"), link_data.get("ss_method", "2022-blake3-aes-256-gcm"), link_data.get("ss_psk", ""), link_data.get("owner_user_id", ""), link_data.get("outbound_proxy", ""), link_data.get("outbound_proxy_pass", ""))
                     )
                     
                     del TELEGRAM_USER_CREATE_STEPS[chat_id]
@@ -3484,6 +3528,22 @@ async def revoke_jwt_token(token: str) -> bool:
         (payload["jti"], expires_text),
     )
     return True
+SESSION_COOKIE_NAMES = ("SulgX_session", "x-session-id")
+
+
+def set_session_cookie(resp, token, is_secure):
+    for name in SESSION_COOKIE_NAMES:
+        resp.set_cookie(key=name, value=token, max_age=CONFIG["jwt_expire_minutes"] * 60, httponly=True, samesite="lax", secure=is_secure, path="/")
+    return resp
+
+
+def clear_session_cookies(resp, is_secure):
+    for name in SESSION_COOKIE_NAMES:
+        resp.delete_cookie(key=name, path="/", secure=is_secure, samesite="lax", httponly=True)
+        resp.set_cookie(key=name, value="", max_age=0, expires=0, path="/", secure=is_secure, samesite="lax", httponly=True)
+    return resp
+
+
 async def require_auth(request: Request):
     token = None
     auth_header = request.headers.get("Authorization")
@@ -3492,6 +3552,12 @@ async def require_auth(request: Request):
     if not token:
         cookie_name = await get_session_cookie_name()
         token = request.cookies.get(cookie_name)
+    if not token:
+        for fallback_name in SESSION_COOKIE_NAMES:
+            if fallback_name != cookie_name:
+                token = request.cookies.get(fallback_name)
+                if token:
+                    break
     payload = decode_jwt_token(token) if token else None
     if not payload or await is_jwt_revoked(payload.get("jti", "")):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -3580,16 +3646,36 @@ async def telegram_reporter():
             except Exception:
                 pass
 
+def _host_header_domain(request: Optional[Request] = None) -> str:
+    if not request:
+        return ""
+    for header in ("x-forwarded-host", "host"):
+        raw = request.headers.get(header, "")
+        if raw:
+            host = raw.split(",")[0].strip().split(":")[0].strip().lower()
+            if host and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1") and re.match(r"^[a-z0-9.-]+$", host):
+                return host
+    return ""
+
+
 def get_domain(request: Optional[Request] = None) -> str:
-    if request and request.headers.get("host"):
-        host = request.headers["host"].split(":")[0]
-        if host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            return host
+    host = _host_header_domain(request)
+    if host:
+        return host
     for var in ("DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_URL"):
         val = os.environ.get(var)
         if val:
             return val.replace("https://", "").replace("http://", "").rstrip("/")
     return "localhost"
+
+
+def get_domain_source(request: Optional[Request] = None) -> str:
+    if _host_header_domain(request):
+        return "request-host"
+    for var in ("DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_URL"):
+        if os.environ.get(var):
+            return "env-" + var
+    return "localhost-fallback"
 
 def validate_address(addr: str) -> bool:
     try:
@@ -3823,7 +3909,7 @@ LANDING_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>SulgX - Welcome</title>
+<title data-en="SulgX - Welcome" data-fa="SulgX - خوش‌آمدید">SulgX - Welcome</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -3978,7 +4064,7 @@ h1{font-family:'Orbitron',sans-serif;color:var(--primary);font-size:2.2rem;margi
         <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
-      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم">🌙</button>
     </div>
   </div>
 </div>
@@ -4020,6 +4106,8 @@ function setLang(l){
   document.querySelectorAll(`.lang-${l}`).forEach(b=>b.classList.add('active'));
   document.body.dir = l==='fa' ? 'rtl' : 'ltr';
   document.querySelectorAll('[data-en]').forEach(el=>{ const v = el.getAttribute('data-'+l); if(v) el.innerHTML = v; });
+  document.querySelectorAll('[data-ph-en]').forEach(el=>{ const v = el.getAttribute('data-ph-'+l); if(v) el.placeholder = v; });
+  document.querySelectorAll('[data-en-title]').forEach(el=>{ const v = el.getAttribute('data-'+l+'-title'); if(v) el.title = v; });
   localStorage.setItem('ll', l);
 }
 function setTheme(t){
@@ -4044,28 +4132,36 @@ setLang(lang);
 
 
 async def create_proxied_connection(address, port, link):
-    proxy_line_id = link.get("proxy_line_id")
-    if not proxy_line_id:
-        return await asyncio.open_connection(address, port)
-    proxy_row = await db_fetchone(
-        "SELECT * FROM proxy_lines WHERE id = ?",
-        "SELECT * FROM proxy_lines WHERE id = $1",
-        (proxy_line_id,)
-    )
-    if not proxy_row or not proxy_row["is_active"]:
-        if CONFIG.get("proxy_fallback_direct"):
-            logger.warning(f"Proxy {proxy_line_id} not found or inactive, falling back to direct because proxy_fallback_direct is enabled")
+    proxy_line = (link.get("outbound_proxy") or "").strip()
+    if proxy_line:
+        try:
+            proxy_host, proxy_port, username, password = parse_outbound_proxy(proxy_line)
+        except ValueError as e:
+            raise ConnectionError("Configured outbound proxy is invalid: " + str(e))
+        proxy_type = "socks5"
+    else:
+        proxy_line_id = link.get("proxy_line_id")
+        if not proxy_line_id:
             return await asyncio.open_connection(address, port)
-        logger.warning(f"Proxy {proxy_line_id} not found or inactive, direct fallback is disabled")
-        raise ConnectionError("Configured proxy is not found or inactive")
-    proxy_type = proxy_row["type"].lower()
-    proxy_host = proxy_row["host"]
-    try:
-        proxy_port = int(proxy_row["port"])
-    except (ValueError, TypeError):
-        raise ConnectionError("Configured proxy has an invalid port")
-    username = proxy_row.get("username")
-    password = decrypt_proxy_password(proxy_row.get("password"))
+        proxy_row = await db_fetchone(
+            "SELECT * FROM proxy_lines WHERE id = ?",
+            "SELECT * FROM proxy_lines WHERE id = $1",
+            (proxy_line_id,)
+        )
+        if not proxy_row or not proxy_row["is_active"]:
+            if CONFIG.get("proxy_fallback_direct"):
+                logger.warning(f"Proxy {proxy_line_id} not found or inactive, falling back to direct because proxy_fallback_direct is enabled")
+                return await asyncio.open_connection(address, port)
+            logger.warning(f"Proxy {proxy_line_id} not found or inactive, direct fallback is disabled")
+            raise ConnectionError("Configured proxy is not found or inactive")
+        proxy_type = proxy_row["type"].lower()
+        proxy_host = proxy_row["host"]
+        try:
+            proxy_port = int(proxy_row["port"])
+        except (ValueError, TypeError):
+            raise ConnectionError("Configured proxy has an invalid port")
+        username = proxy_row.get("username")
+        password = decrypt_proxy_password(proxy_row.get("password"))
     if proxy_type not in ("socks4", "socks5", "http"):
         if CONFIG.get("proxy_fallback_direct"):
             logger.warning(f"Unsupported proxy type '{proxy_type}', falling back to direct because proxy_fallback_direct is enabled")
@@ -4251,16 +4347,7 @@ async def api_login(request: Request):
     resp = JSONResponse({"ok": True})
     forwarded_proto = request.headers.get("x-forwarded-proto", "")
     is_secure = forwarded_proto == "https" or request.url.scheme == "https"
-    cookie_name = await get_session_cookie_name()
-    resp.set_cookie(
-        key=cookie_name,
-        value=token,
-        max_age=CONFIG["jwt_expire_minutes"] * 60,
-        httponly=True,
-        samesite="lax",
-        secure=is_secure,
-        path="/"
-    )
+    set_session_cookie(resp, token, is_secure)
     await asyncio.sleep(0)
     return resp
 
@@ -4425,33 +4512,27 @@ async def api_logout(request: Request):
     if not token:
         cookie_name_for_token = await get_session_cookie_name()
         token = request.cookies.get(cookie_name_for_token, "")
+    tokens_to_revoke = set()
     if token:
-        await revoke_jwt_token(token)
-    cookie_name = await get_session_cookie_name()
+        tokens_to_revoke.add(token)
+    for alt_name in SESSION_COOKIE_NAMES:
+        alt_token = request.cookies.get(alt_name, "")
+        if alt_token:
+            tokens_to_revoke.add(alt_token)
+    for t in tokens_to_revoke:
+        await revoke_jwt_token(t)
     resp = JSONResponse({"ok": True})
     is_secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
-    resp.delete_cookie(
-        key=cookie_name,
-        path="/",
-        secure=is_secure,
-        samesite="lax",
-        httponly=True
-    )
-    resp.set_cookie(
-        key=cookie_name,
-        value="",
-        max_age=0,
-        expires=0,
-        path="/",
-        secure=is_secure,
-        samesite="lax",
-        httponly=True
-    )
+    clear_session_cookies(resp, is_secure)
     return resp
 
 @app.get("/api/me")
-async def api_me(_: str = Depends(require_auth)):
-    return {"authenticated": True}
+async def api_me(token: str = Depends(require_auth)):
+    expires_in = None
+    payload = decode_jwt_token(token)
+    if payload and isinstance(payload.get("exp"), int):
+        expires_in = max(0, int(payload["exp"] - time.time()))
+    return {"authenticated": True, "expires_in": expires_in}
 @app.post("/api/refresh")
 async def api_refresh(request: Request, token: str = Depends(require_auth)):
     await revoke_jwt_token(token)
@@ -4459,16 +4540,7 @@ async def api_refresh(request: Request, token: str = Depends(require_auth)):
     resp = JSONResponse({"ok": True})
     forwarded_proto = request.headers.get("x-forwarded-proto", "")
     is_secure = forwarded_proto == "https" or request.url.scheme == "https"
-    cookie_name = await get_session_cookie_name()
-    resp.set_cookie(
-        key=cookie_name,
-        value=new_token,
-        max_age=CONFIG["jwt_expire_minutes"] * 60,
-        httponly=True,
-        samesite="lax",
-        secure=is_secure,
-        path="/"
-    )
+    set_session_cookie(resp, new_token, is_secure)
     return resp
 
 @app.post("/api/change-password")
@@ -4512,7 +4584,7 @@ async def get_settings(_=Depends(require_auth)):
             'monthly_limit_gb', 'naming_mode', 'default_ip_profile_id', 'doh_enabled',
             'stealth_mode', 'landing_redirect', 'camouflage_url', 'sub_filename', 'panel_prefix',
             'default_protocol', 'default_ss_method', 'default_outbound_mode', 'default_gaming_profile',
-            'ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions', 'default_xhttp_path', 'region_socks_range', 'region_socks_host']
+            'ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions', 'default_xhttp_path']
     result = {}
     for k in keys:
         row = await db_fetchone("SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,))
@@ -4545,8 +4617,7 @@ async def save_settings(request: Request, _=Depends(require_auth)):
               'monthly_limit_gb', 'naming_mode', 'default_ip_profile_id', 'doh_enabled',
               'stealth_mode', 'landing_redirect', 'camouflage_url', 'sub_filename', 'panel_prefix',
               'default_protocol', 'default_ss_method', 'default_outbound_mode', 'default_gaming_profile',
-              'ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions',
-              'region_socks_range', 'region_socks_host'):
+              'ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions'):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
@@ -4947,6 +5018,10 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
             proxy_line_id = link.get("proxy_line_id")
             if proxy_line_id is not None and not isinstance(proxy_line_id, (str, int)):
                 raise HTTPException(status_code=400, detail="Invalid proxy_line_id in backup")
+            try:
+                outbound_proxy, outbound_proxy_pass = split_outbound_proxy_for_store(link.get("outbound_proxy") or "", link.get("outbound_proxy_pass") or "")
+            except ValueError:
+                outbound_proxy, outbound_proxy_pass = "", ""
             bypass_iran = 1 if link.get("bypass_iran", True) else 0
             bypass_china = 1 if link.get("bypass_china", False) else 0
             bypass_russia = 1 if link.get("bypass_russia", False) else 0
@@ -4977,7 +5052,8 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 "ss_method": restore_str(link.get("ss_method"), "ss_method", "2022-blake3-aes-256-gcm"),
                 "ss_psk": restore_str(link.get("ss_psk"), "ss_psk", ""),
                 "owner_user_id": restore_str(link.get("owner_user_id"), "owner_user_id", ""),
-                "region_id": restore_str(link.get("region_id"), "region_id", ""),
+                "outbound_proxy": outbound_proxy,
+                "outbound_proxy_pass": outbound_proxy_pass,
                 "mtproto_variant": restore_str(link.get("mtproto_variant"), "mtproto_variant", "dd") if restore_str(link.get("mtproto_variant"), "mtproto_variant", "dd") in MTPROTO_VARIANTS else "dd",
                 "mtproto_domain": restore_str(link.get("mtproto_domain"), "mtproto_domain", "www.google.com")
             })
@@ -5001,9 +5077,9 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
         ops.append(("DELETE FROM links", "DELETE FROM links", ()))
         for item in clean_links:
             ops.append((
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
-                (item["uid"], item["label"], item["limit_bytes"], item["used_bytes"], item["max_connections"], item["created_at"], item["active"], item["expires_at"], item["custom_path"], item["custom_sni"], item["custom_host"], item["custom_fp"], item["color"], item["flag"], item["fragment"], item["ip_profile_id"], item["naming_mode"], item["tfo"], item["ech_enabled"], item["ech_sni"], item["ech_doh"], item["fragment_mode"], item["fragment_length"], item["fragment_interval"], item["allow_insecure"], item["random_path"], item["enable_ipv6"], item["smux_enabled"], item["ip_limit"], item["protocol"], item["fingerprint"], item["alpn"], item["port"], item["proxy_line_id"], item["bypass_iran"], item["bypass_china"], item["bypass_russia"], item["xray_dns_mode"], item["xray_doh_url"], item["xray_allowed_domains"], item["udp_enabled"], item["outbound_mode"], item["gaming_profile"], item["ss_method"], item["ss_psk"], item["owner_user_id"], item["region_id"]),
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
+                (item["uid"], item["label"], item["limit_bytes"], item["used_bytes"], item["max_connections"], item["created_at"], item["active"], item["expires_at"], item["custom_path"], item["custom_sni"], item["custom_host"], item["custom_fp"], item["color"], item["flag"], item["fragment"], item["ip_profile_id"], item["naming_mode"], item["tfo"], item["ech_enabled"], item["ech_sni"], item["ech_doh"], item["fragment_mode"], item["fragment_length"], item["fragment_interval"], item["allow_insecure"], item["random_path"], item["enable_ipv6"], item["smux_enabled"], item["ip_limit"], item["protocol"], item["fingerprint"], item["alpn"], item["port"], item["proxy_line_id"], item["bypass_iran"], item["bypass_china"], item["bypass_russia"], item["xray_dns_mode"], item["xray_doh_url"], item["xray_allowed_domains"], item["udp_enabled"], item["outbound_mode"], item["gaming_profile"], item["ss_method"], item["ss_psk"], item["owner_user_id"], item["outbound_proxy"], item["outbound_proxy_pass"]),
             ))
     try:
         await db_execute_many(ops)
@@ -5239,9 +5315,16 @@ async def create_link(request: Request, _=Depends(require_auth)):
         owner_row = await db_fetchone("SELECT id FROM users WHERE id = ?", "SELECT id FROM users WHERE id = $1", (owner_user_id,))
         if not owner_row:
             raise HTTPException(status_code=400, detail="Unknown owner user")
-    region_id = str(body.get("region_id") or "").strip()
-    if region_id and region_id not in REGIONS:
-        raise HTTPException(status_code=400, detail="Unknown region")
+    if "owner_name" in body:
+        owner_user_id = await _resolve_owner_name(body.get("owner_name"))
+    if "owner_max_sessions" in body and owner_user_id:
+        await _set_owner_max_sessions(owner_user_id, body.get("owner_max_sessions"))
+    try:
+        outbound_proxy, outbound_proxy_pass = split_outbound_proxy_for_store(body.get("outbound_proxy") or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if str(body.get("outbound_proxy_pass") or "").strip():
+        outbound_proxy_pass = encrypt_proxy_password(str(body.get("outbound_proxy_pass")).strip())
     ss_psk = (body.get("ss_psk") or "").strip()
     if protocol == "ss-ws":
         try:
@@ -5264,6 +5347,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
         port = int(body.get("port") or 443)
         if port not in WEBPROXY_PORTS:
             raise HTTPException(status_code=400, detail="WEB proxy port must be one of 443, 2053, 2083, 2087, 2096, 8443")
+        if _webproxy_port_in_use(port):
+            raise HTTPException(status_code=400, detail="WEB proxy port " + str(port) + " is already used by another link. Each WEB proxy link needs its own port because the port selects its secret (443, 2053, 2083, 2087, 2096, 8443).")
     elif protocol in ("socks5", "mtproto", "http-proxy"):
         port = _proxy_effective_port(protocol)
     xray_dns_mode = body.get("xray_dns_mode", "doh")
@@ -5316,16 +5401,17 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "ss_method": ss_method,
         "ss_psk": ss_psk,
         "owner_user_id": owner_user_id,
-        "region_id": region_id,
+        "outbound_proxy": outbound_proxy,
+        "outbound_proxy_pass": outbound_proxy_pass,
         "mtproto_variant": mtproto_variant,
         "mtproto_domain": mtproto_domain
     }
     async with LINKS_LOCK:
         LINKS[uid] = link_data
         await db_execute(
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
-            (uid, label, limit_bytes, 0, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id),
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
+            (uid, label, limit_bytes, 0, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass),
         )
     await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2 WHERE uid = $3", (mtproto_variant, mtproto_domain, uid))
     if protocol == "mtproto" and tgproxy is not None:
@@ -5339,7 +5425,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
              "allow_insecure": allow_insecure, "random_path": random_path, "enable_ipv6": enable_ipv6,
              "smux_enabled": smux_enabled, "ip_limit": ip_limit,
              "protocol": protocol, "fingerprint": fingerprint, "alpn": alpn, "port": port,
-             "udp_enabled": udp_enabled, "region_id": region_id, "mtproto_variant": mtproto_variant, "mtproto_domain": mtproto_domain}
+             "udp_enabled": udp_enabled, "outbound_proxy": outbound_proxy, "outbound_proxy_has_pass": bool(outbound_proxy_pass), "mtproto_variant": mtproto_variant, "mtproto_domain": mtproto_domain}
     log_event("Inbound", f"Created inbound {label} ({uid})")
     domain = get_domain(request)
     return {
@@ -5360,6 +5446,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "ss_method": ss_method,
         "ss_psk": ss_psk,
         "owner_user_id": owner_user_id,
+        "outbound_proxy": outbound_proxy,
         "mtproto_variant": mtproto_variant,
         "mtproto_domain": mtproto_domain,
         "proxy": _link_proxy_view(link_data, domain)
@@ -5413,7 +5500,8 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "ss_method": row.get("ss_method", "2022-blake3-aes-256-gcm"),
             "ss_psk": row.get("ss_psk", ""),
             "owner_user_id": row.get("owner_user_id", ""),
-            "region_id": row.get("region_id", ""),
+            "outbound_proxy": row.get("outbound_proxy", ""),
+            "outbound_proxy_has_pass": bool(row.get("outbound_proxy_pass", "")),
             "mtproto_variant": row.get("mtproto_variant", "dd") or "dd",
             "mtproto_domain": row.get("mtproto_domain", "www.google.com") or "www.google.com"
         }
@@ -5455,6 +5543,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "alpn": extra["alpn"],
             "port": extra["port"],
             "proxy_line_id": row.get("proxy_line_id"),
+            "outbound_proxy": row.get("outbound_proxy", ""),
             "bypass_iran": bool(row.get("bypass_iran", True)),
             "bypass_china": bool(row.get("bypass_china", False)),
             "bypass_russia": bool(row.get("bypass_russia", False)),
@@ -5467,8 +5556,10 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "ss_method": extra["ss_method"],
             "ss_psk": extra["ss_psk"],
             "owner_user_id": extra["owner_user_id"],
-            "region_id": extra["region_id"],
-            "region_name": region_name_for_link(extra),
+            "owner_name": USER_NAMES.get(extra["owner_user_id"], ""),
+            "owner_max_sessions": int(USER_MAX_SESSIONS.get(extra["owner_user_id"], 0) or 0),
+            "outbound_proxy": extra["outbound_proxy"],
+            "outbound_proxy_has_pass": extra["outbound_proxy_has_pass"],
             "mtproto_variant": extra["mtproto_variant"],
             "mtproto_domain": extra["mtproto_domain"],
             "proxy": _link_proxy_view(row, domain)
@@ -5479,7 +5570,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
 @app.get("/api/inbounds")
 async def list_inbounds(_=Depends(require_auth)):
     defs = get_inbound_definitions()
-    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "proxy_status": TG_PROXY_STATUS, "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {}}
+    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": int(os.environ.get("PORT", CONFIG.get("port", 8000))), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "proxy_status": TG_PROXY_STATUS, "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {}}
 
 
 @app.get("/api/outbounds")
@@ -5500,10 +5591,10 @@ async def list_protocols(_=Depends(require_auth)):
         "xhttp-stream-one": "VLESS over XHTTP stream-one mode",
         "xhttp-stream-up": "VLESS over XHTTP stream-up mode",
         "xhttp-packet-up": "VLESS over XHTTP packet-up mode",
-        "socks5": "Telegram SOCKS5 (TCP CONNECT, DC destinations only, auth = link UUID)",
-        "mtproto": "Telegram MTProto proxy (per-link secret, plain / dd / fake-TLS variants)",
-        "webproxy": "Telegram WEB proxy (Direct-DC, rides the panel HTTPS port, per-port secret)",
-        "http-proxy": "HTTP CONNECT proxy (Basic auth = link UUID, Telegram DC destinations only)"
+        "socks5": "Telegram SOCKS5 (raw TCP listener, NOT the panel HTTPS port; TCP CONNECT, DC destinations only, auth = link UUID)",
+        "mtproto": "Telegram MTProto proxy (raw TCP listener, NOT the panel HTTPS port; per-link secret, plain / dd / fake-TLS variants)",
+        "webproxy": "Telegram WEB proxy (Direct-DC, rides the panel HTTPS port, one port per link, secret is per-port)",
+        "http-proxy": "HTTP CONNECT proxy (raw TCP listener, NOT the panel HTTPS port; Basic auth = link UUID, Telegram DC destinations only)"
     }
     return {"protocols": [{"id": p, "name": p, "description": info.get(p, p)} for p in VALID_PROTOCOLS]}
 
@@ -5515,20 +5606,60 @@ async def set_link_outbound(uid: str, request: Request, _=Depends(require_auth))
     if mode not in OUTBOUND_MODES:
         raise HTTPException(status_code=400, detail="Invalid outbound_mode")
     proxy_line_id = body.get("proxy_line_id")
+    outbound_proxy = ""
+    outbound_proxy_pass = ""
+    if str(body.get("outbound_proxy") or "").strip():
+        try:
+            outbound_proxy, outbound_proxy_pass = split_outbound_proxy_for_store(body.get("outbound_proxy") or "")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     if mode == "proxy":
-        if not proxy_line_id:
-            raise HTTPException(status_code=400, detail="proxy_line_id required for proxy mode")
-        row = await db_fetchone("SELECT id FROM proxy_lines WHERE id = ?", "SELECT id FROM proxy_lines WHERE id = $1", (proxy_line_id,))
-        if not row:
-            raise HTTPException(status_code=400, detail="Unknown proxy line")
+        if not proxy_line_id and not outbound_proxy:
+            raise HTTPException(status_code=400, detail="proxy_line_id or outbound_proxy required for proxy mode")
+        if proxy_line_id:
+            row = await db_fetchone("SELECT id FROM proxy_lines WHERE id = ?", "SELECT id FROM proxy_lines WHERE id = $1", (proxy_line_id,))
+            if not row:
+                raise HTTPException(status_code=400, detail="Unknown proxy line")
     async with LINKS_LOCK:
         link = LINKS.get(uid)
         if not link:
             raise HTTPException(status_code=404, detail="Link not found")
         link["outbound_mode"] = mode
         link["proxy_line_id"] = proxy_line_id
-    await db_execute("UPDATE links SET outbound_mode = ?, proxy_line_id = ? WHERE uid = ?", "UPDATE links SET outbound_mode = $1, proxy_line_id = $2 WHERE uid = $3", (mode, proxy_line_id, uid))
-    return {"ok": True, "outbound_mode": mode, "proxy_line_id": proxy_line_id}
+        if "outbound_proxy" in body:
+            link["outbound_proxy"] = outbound_proxy
+            link["outbound_proxy_pass"] = outbound_proxy_pass
+    if "outbound_proxy" in body:
+        await db_execute("UPDATE links SET outbound_mode = ?, proxy_line_id = ?, outbound_proxy = ?, outbound_proxy_pass = ? WHERE uid = ?", "UPDATE links SET outbound_mode = $1, proxy_line_id = $2, outbound_proxy = $3, outbound_proxy_pass = $4 WHERE uid = $5", (mode, proxy_line_id, outbound_proxy, outbound_proxy_pass, uid))
+    else:
+        await db_execute("UPDATE links SET outbound_mode = ?, proxy_line_id = ? WHERE uid = ?", "UPDATE links SET outbound_mode = $1, proxy_line_id = $2 WHERE uid = $3", (mode, proxy_line_id, uid))
+    return {"ok": True, "outbound_mode": mode, "proxy_line_id": proxy_line_id, "outbound_proxy": outbound_proxy}
+
+
+async def _resolve_owner_name(name):
+    clean = str(name or "").strip()
+    if not clean:
+        return ""
+    row = await db_fetchone("SELECT id, name FROM users WHERE LOWER(name) = LOWER(?)", "SELECT id, name FROM users WHERE LOWER(name) = LOWER($1)", (clean,))
+    if row:
+        return row["id"]
+    user_id = str(uuid_lib.uuid4())
+    now = datetime.now(UTC).isoformat()
+    await db_execute("INSERT INTO users (id, name, telegram_chat_id, notes, max_sessions, created_at) VALUES (?, ?, ?, ?, ?, ?)", "INSERT INTO users (id, name, telegram_chat_id, notes, max_sessions, created_at) VALUES ($1, $2, $3, $4, $5, $6)", (user_id, clean, "", "", 0, now))
+    USER_MAX_SESSIONS[user_id] = 0
+    USER_NAMES[user_id] = clean
+    return user_id
+
+
+async def _set_owner_max_sessions(owner_id, value):
+    if not owner_id:
+        return
+    try:
+        max_sess = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return
+    await db_execute("UPDATE users SET max_sessions = ? WHERE id = ?", "UPDATE users SET max_sessions = $1 WHERE id = $2", (max_sess, owner_id))
+    USER_MAX_SESSIONS[owner_id] = max_sess
 
 
 @app.post("/api/users")
@@ -5606,46 +5737,68 @@ async def delete_user_api(user_id: str, _=Depends(require_auth)):
 
 
 @app.get("/api/users/{user_id}/links")
-async def user_links(user_id: str, _=Depends(require_auth)):
+async def user_links(user_id: str, request: Request, _=Depends(require_auth)):
     row = await db_fetchone("SELECT id, name FROM users WHERE id = ?", "SELECT id, name FROM users WHERE id = $1", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
-    domain = get_domain()
+    domain = get_domain(request)
     async with LINKS_LOCK:
         owned = [dict(l) for l in LINKS.values() if l.get("owner_user_id") == user_id]
     items = []
     for l in owned:
-        items.append({"uid": l["uid"], "label": l["label"], "protocol": l.get("protocol", "vless-ws"), "active": bool(l["active"]), "used_bytes": l.get("used_bytes", 0), "limit_bytes": l.get("limit_bytes", 0), "expires_at": l.get("expires_at"), "protocol_link": generate_protocol_link(l["uid"], remark=f"SulgX-{l['label']}", extra=l, server_domain=domain), "region_id": l.get("region_id", ""), "region_name": region_name_for_link(l), "socks": {"host": domain, "port": SOCKS_PORT, "username": l["uid"], "password": l["uid"], "enabled": bool(SOCKS_PORT)}})
+        items.append({"uid": l["uid"], "label": l["label"], "protocol": l.get("protocol", "vless-ws"), "active": bool(l["active"]), "used_bytes": l.get("used_bytes", 0), "limit_bytes": l.get("limit_bytes", 0), "expires_at": l.get("expires_at"), "protocol_link": generate_protocol_link(l["uid"], remark=f"SulgX-{l['label']}", extra=l, server_domain=domain), "outbound_proxy": l.get("outbound_proxy", ""), "outbound_proxy_has_pass": bool(l.get("outbound_proxy_pass", "")), "socks": {"host": domain, "port": SOCKS_PORT, "username": l["uid"], "password": l["uid"], "enabled": bool(SOCKS_PORT)} if l.get("protocol") == "socks5" else None})
     return {"user": {"id": row["id"], "name": row["name"]}, "links": items, "used_bytes": sum(l.get("used_bytes", 0) for l in owned), "limit_bytes": sum(l.get("limit_bytes", 0) for l in owned)}
 
 
 @app.get("/api/telegram-proxy")
-async def telegram_proxy_status(_=Depends(require_auth)):
-    domain = get_domain()
+async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
+    domain = get_domain(request)
+    domain_source = get_domain_source(request)
+    web_enabled = bool(TG_PROXY_STATUS.get("webproxy", {}).get("enabled"))
+    web_links = tgproxy.webproxy_links(domain) if tgproxy is not None and web_enabled else []
+    web_link_443 = ""
+    for _wl in web_links:
+        if int(_wl.get("port") or 0) == 443:
+            web_link_443 = _wl.get("link", "")
+    single_port_host = not SOCKS_PORT and not TG_PROXY_PORT and not HTTP_PROXY_PORT
+    bot_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+    chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
+    bot_configured = bool(bot_row and bot_row["value"] and chat_row and chat_row["value"])
+    next_steps = []
+    if domain == "localhost":
+        next_steps.append("Set the DOMAIN environment variable to the panel public domain (for example sulgx.example.com), or open the panel through its public URL so the Host header carries the real domain. Until then every generated Telegram link uses localhost and will not work.")
+    if not bot_configured:
+        next_steps.append("Add the Bot Token and Chat ID in the Telegram Bot card above, then press Test so the panel can send alerts.")
+    if not web_enabled:
+        next_steps.append("Enable the WEB proxy: it needs a SECRET_KEY (set at first boot). The WEB proxy rides the panel HTTPS port, so it is the only Telegram proxy that works on this host.")
+    elif not web_link_443:
+        next_steps.append("Create a WEB proxy inbound on port 443 (Links page, protocol Telegram WEB proxy) so the card below shows a working tg://webproxy link.")
+    if single_port_host:
+        next_steps.append("SOCKS5, MTProto and HTTP proxy stay disabled here: this host exposes a single HTTPS port, and raw TCP listeners cannot be published on it. Use the WEB proxy, or move the panel to a VPS / Railway TCP Proxy for the raw TCP protocols.")
     return {
         "socks": TG_PROXY_STATUS["socks"],
         "mtproxy": TG_PROXY_STATUS["mtproxy"],
         "socks_port": SOCKS_PORT,
         "mtproxy_port": TG_PROXY_PORT,
         "domain": domain,
-        "mtproxy_link": tgproxy.mtproxy_link(domain, TG_PROXY_PORT) if tgproxy is not None and TG_PROXY_PORT else "",
-        "mtproxy_faketls_link": tgproxy.mtproxy_faketls_link(domain, TG_PROXY_PORT) if tgproxy is not None and TG_PROXY_PORT else "",
-        "mtproxy_dd_link": tgproxy.mtproxy_dd_link(domain, TG_PROXY_PORT) if tgproxy is not None and TG_PROXY_PORT else "",
+        "domain_source": domain_source,
+        "single_port_host": single_port_host,
+        "bot_configured": bot_configured,
         "stats": tgproxy.stats() if tgproxy is not None else {},
         "http": TG_PROXY_STATUS["http"],
         "http_port": HTTP_PROXY_PORT,
         "webproxy": TG_PROXY_STATUS["webproxy"],
         "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {},
-        "webproxy_links": tgproxy.webproxy_links(domain) if tgproxy is not None else [],
+        "webproxy_links": web_links,
+        "webproxy_link": web_link_443,
+        "mtproxy_per_link_secret": True,
+        "mtproxy_note": "MTProto links are per inbound: each MTProto inbound carries its own derived secret, so no shared link is published here. Open the inbound row on the Links page to copy its own tg://proxy link.",
         "http_link_note": "HTTP proxy auth is the link UUID for both username and password, per inbound",
-        "notes": [
-            "Render cannot expose the SOCKS5/MTProto ports: its single public port is HTTP only, so both listeners stay disabled there (SOCKS_PORT=0, TG_PROXY_PORT=0).",
+        "next_steps": next_steps,
+        "deployment_notes": [
+            "Cloady / Render expose a single public HTTPS port, so only the WEB proxy works there. SOCKS5, MTProto and HTTP proxy need their own raw TCP ports and stay disabled.",
             "Railway: expose SOCKS_PORT and TG_PROXY_PORT with a TCP Proxy in Networking settings; Railway gives a host like monorail.proxy.rlwy.net:PORT, use that host and port in Telegram.",
-            "SOCKS5 is TCP CONNECT only: chats and media work, voice/video calls need UDP associate which Railway TCP Proxy cannot carry, so calls bypass the proxy unless you run on a VPS.",
-            "SOCKS5 destinations are restricted to Telegram DC IP ranges only; it is not an open proxy.",
-            "HTTP proxy is CONNECT-only and restricted to Telegram DC IP ranges only, the same rule as SOCKS5: it is not an open web proxy, because an open proxy would be abused and would breach host fair-use policy.",
-            "WEB proxy rides the panel HTTPS port, so it works on Render and Railway; SOCKS5, MTProto and HTTP proxy need their own TCP ports and stay disabled on Render.",
-            "MTProto secrets are per inbound: each MTProto inbound has its own derived secret, so quota and the 1-user limit are enforced per inbound; the old shared-secret link still works but is not attributed to any inbound.",
+            "SOCKS5 is TCP CONNECT only: chats and media work, voice/video calls need UDP associate which a TCP Proxy cannot carry, so calls bypass the proxy unless you run on a VPS.",
             "Keep use personal and light: running a public circumvention proxy may breach the host fair-use policy."
         ]
     }
@@ -5750,235 +5903,6 @@ async def tgweb_bridge(request: Request):
     return HTMLResponse(content=tgproxy.webproxy_decoy_html())
 
 
-def _region_public(r):
-    return {"id": r["id"], "name": r["name"], "socks_host": r["socks_host"], "socks_port": r["socks_port"], "socks_user": r.get("socks_user", ""), "has_password": bool(r.get("socks_pass")), "status": r.get("status", "active"), "source": r.get("source", "manual"), "health": r.get("health", "unknown"), "last_check": r.get("last_check", ""), "created_at": r.get("created_at", "")}
-
-
-
-async def _set_region_status(region_id, status):
-    region = REGIONS.get(region_id)
-    if not region:
-        raise HTTPException(status_code=404, detail="Region not found")
-    region["status"] = status
-    await db_execute("UPDATE regions SET status = ? WHERE id = ?", "UPDATE regions SET status = $1 WHERE id = $2", (status, region_id))
-    return region
-
-
-
-@app.get("/api/regions")
-async def list_regions(_=Depends(require_auth)):
-    return {"regions": [_region_public(r) for r in REGIONS.values()], "presets": [{"code": c, "name": n} for c, n in REGION_PRESETS], "socks_range": REGION_SOCKS_RANGE, "socks_host": REGION_SOCKS_HOST, "notes": ["Each region is a SOCKS5 endpoint provided by the admin (host + port of a reachable SOCKS5 server).", "A link with an explicit region that is missing or inactive refuses new connections instead of silently falling back to direct."]}
-
-
-@app.post("/api/regions")
-async def create_region(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    code = str(body.get("code") or body.get("id") or "").strip().lower()
-    if not re.match(r"^[a-z0-9-]{2,16}$", code):
-        raise HTTPException(status_code=400, detail="Region code must be 2-16 lowercase letters, digits or dashes")
-    if code in REGIONS:
-        raise HTTPException(status_code=400, detail="Region already exists")
-    name = str(body.get("name") or code).strip()[:60]
-    host = str(body.get("socks_host") or body.get("host") or REGION_SOCKS_HOST).strip()
-    if not host:
-        raise HTTPException(status_code=400, detail="SOCKS host required")
-    port = body.get("socks_port") or body.get("port") or 0
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid SOCKS port")
-    if not port:
-        port = next_free_region_port()
-        if not port:
-            raise HTTPException(status_code=400, detail="No free port left in the configured SOCKS range")
-    if port < 1 or port > 65535:
-        raise HTTPException(status_code=400, detail="Invalid SOCKS port")
-    user = str(body.get("socks_user") or "").strip()
-    password = str(body.get("socks_pass") or "").strip()
-    now = datetime.now(UTC).isoformat()
-    enc_pass = encrypt_proxy_password(password) if password else ""
-    region = {"id": code, "name": name, "socks_host": host, "socks_port": port, "socks_user": user, "socks_pass": enc_pass, "status": "active", "source": str(body.get("source") or "manual"), "health": "unknown", "last_check": "", "created_at": now}
-    REGIONS[code] = region
-    await db_execute("INSERT INTO regions (id, name, socks_host, socks_port, socks_user, socks_pass, status, source, health, last_check, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "INSERT INTO regions (id, name, socks_host, socks_port, socks_user, socks_pass, status, source, health, last_check, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)", (code, name, host, port, user, enc_pass, "active", region["source"], "unknown", "", now))
-    return {"ok": True, "region": _region_public(region)}
-
-
-@app.patch("/api/regions/{region_id}")
-async def update_region(region_id: str, request: Request, _=Depends(require_auth)):
-    region = REGIONS.get(region_id)
-    if not region:
-        raise HTTPException(status_code=404, detail="Region not found")
-    body = await request.json()
-    updates = {}
-    if "name" in body:
-        updates["name"] = str(body["name"] or region["name"]).strip()[:60]
-    if "socks_host" in body:
-        updates["socks_host"] = str(body["socks_host"] or "").strip()
-    if "socks_port" in body:
-        try:
-            updates["socks_port"] = int(body["socks_port"])
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid SOCKS port")
-        if updates["socks_port"] < 1 or updates["socks_port"] > 65535:
-            raise HTTPException(status_code=400, detail="Invalid SOCKS port")
-    if "socks_user" in body:
-        updates["socks_user"] = str(body["socks_user"] or "").strip()
-    if "socks_pass" in body:
-        updates["socks_pass"] = encrypt_proxy_password(str(body["socks_pass"] or "")) if str(body["socks_pass"] or "") else ""
-    if "status" in body:
-        if body["status"] not in ("active", "inactive"):
-            raise HTTPException(status_code=400, detail="Invalid status")
-        updates["status"] = body["status"]
-    if not updates:
-        return {"ok": True, "region": _region_public(region)}
-    region.update(updates)
-    sets = ", ".join(k + " = ?" for k in updates)
-    sets_pg = ", ".join(k + " = $" + str(i + 1) for i, k in enumerate(updates))
-    await db_execute("UPDATE regions SET " + sets + " WHERE id = ?", "UPDATE regions SET " + sets_pg + " WHERE id = $" + str(len(updates) + 1), tuple(updates.values()) + (region_id,))
-    return {"ok": True, "region": _region_public(region)}
-
-
-@app.delete("/api/regions/{region_id}")
-async def delete_region(region_id: str, _=Depends(require_auth)):
-    if region_id not in REGIONS:
-        raise HTTPException(status_code=404, detail="Region not found")
-    REGIONS.pop(region_id, None)
-    await db_execute("DELETE FROM regions WHERE id = ?", "DELETE FROM regions WHERE id = $1", (region_id,))
-    await db_execute("DELETE FROM routing_rules WHERE region_id = ?", "DELETE FROM routing_rules WHERE region_id = $1", (region_id,))
-    for rid in list(ROUTING_RULES):
-        if ROUTING_RULES[rid].get("region_id") == region_id:
-            ROUTING_RULES.pop(rid, None)
-    async with LINKS_LOCK:
-        for l in LINKS.values():
-            if l.get("region_id") == region_id:
-                l["region_id"] = ""
-    await db_execute("UPDATE links SET region_id = '' WHERE region_id = ?", "UPDATE links SET region_id = '' WHERE region_id = $1", (region_id,))
-    return {"ok": True}
-
-
-@app.post("/api/regions/{region_id}/check")
-async def check_region(region_id: str, _=Depends(require_auth)):
-    region = REGIONS.get(region_id)
-    if not region:
-        raise HTTPException(status_code=404, detail="Region not found")
-    ok = await probe_socks5(region["socks_host"], int(region["socks_port"]))
-    region["health"] = "ok" if ok else "fail"
-    region["last_check"] = datetime.now(UTC).isoformat()
-    await db_execute("UPDATE regions SET health = ?, last_check = ? WHERE id = ?", "UPDATE regions SET health = $1, last_check = $2 WHERE id = $3", (region["health"], region["last_check"], region_id))
-    return {"ok": ok, "health": region["health"], "region": _region_public(region)}
-
-
-@app.post("/api/regions/{region_id}/start")
-async def start_region(region_id: str, _=Depends(require_auth)):
-    region = await _set_region_status(region_id, "active")
-    return {"ok": True, "region": _region_public(region)}
-
-
-@app.post("/api/regions/{region_id}/stop")
-async def stop_region(region_id: str, _=Depends(require_auth)):
-    region = await _set_region_status(region_id, "inactive")
-    return {"ok": True, "region": _region_public(region)}
-
-
-@app.post("/api/regions/probe")
-async def probe_regions(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    host = str(body.get("host") or REGION_SOCKS_HOST).strip() or "127.0.0.1"
-    rng = str(body.get("range") or REGION_SOCKS_RANGE).strip()
-    try:
-        lo, hi = rng.split("-")
-        lo = int(lo.strip())
-        hi = int(hi.strip())
-    except (ValueError, AttributeError):
-        raise HTTPException(status_code=400, detail="Invalid port range, use like 1024-1099")
-    if hi - lo > 500:
-        raise HTTPException(status_code=400, detail="Port range too wide (max 500 ports)")
-    live = []
-    for p in range(lo, hi + 1):
-        if await probe_socks5(host, p):
-            live.append(p)
-    return {"ok": True, "host": host, "range": rng, "live": live, "checked": hi - lo + 1}
-
-
-@app.get("/api/routing-rules")
-async def list_routing_rules(_=Depends(require_auth)):
-    return {"rules": [dict(r) for r in sorted(ROUTING_RULES.values(), key=lambda r: (int(r.get("priority") or 0), str(r.get("created_at") or "")))]}
-
-
-@app.post("/api/routing-rules")
-async def create_routing_rule(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    name = str(body.get("name") or "").strip()[:60]
-    match_type = str(body.get("match_type") or "").strip()
-    match_value = str(body.get("match_value") or "").strip()
-    region_id = str(body.get("region_id") or "").strip()
-    if match_type not in ("link", "label", "port", "user", "all"):
-        raise HTTPException(status_code=400, detail="Invalid match_type")
-    if match_type != "all" and not match_value:
-        raise HTTPException(status_code=400, detail="match_value required")
-    if match_type == "port":
-        try:
-            int(match_value)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="match_value must be a port number")
-    if region_id not in REGIONS:
-        raise HTTPException(status_code=400, detail="Unknown region")
-    try:
-        priority = int(body.get("priority") or 0)
-    except (TypeError, ValueError):
-        priority = 0
-    rule_id = str(uuid_lib.uuid4())
-    now = datetime.now(UTC).isoformat()
-    rule = {"id": rule_id, "name": name or (match_type + ":" + match_value + " -> " + region_id), "match_type": match_type, "match_value": match_value, "region_id": region_id, "priority": priority, "enabled": 1 if body.get("enabled", True) else 0, "created_at": now}
-    ROUTING_RULES[rule_id] = rule
-    await db_execute("INSERT INTO routing_rules (id, name, match_type, match_value, region_id, priority, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", "INSERT INTO routing_rules (id, name, match_type, match_value, region_id, priority, enabled, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", (rule_id, rule["name"], match_type, match_value, region_id, priority, rule["enabled"], now))
-    return {"ok": True, "rule": dict(rule)}
-
-
-@app.patch("/api/routing-rules/{rule_id}")
-async def update_routing_rule(rule_id: str, request: Request, _=Depends(require_auth)):
-    rule = ROUTING_RULES.get(rule_id)
-    if not rule:
-        raise HTTPException(status_code=404, detail="Rule not found")
-    body = await request.json()
-    updates = {}
-    if "name" in body:
-        updates["name"] = str(body["name"] or rule["name"]).strip()[:60]
-    if "match_type" in body:
-        if body["match_type"] not in ("link", "label", "port", "user", "all"):
-            raise HTTPException(status_code=400, detail="Invalid match_type")
-        updates["match_type"] = body["match_type"]
-    if "match_value" in body:
-        updates["match_value"] = str(body["match_value"] or "").strip()
-    if "region_id" in body:
-        if body["region_id"] not in REGIONS:
-            raise HTTPException(status_code=400, detail="Unknown region")
-        updates["region_id"] = body["region_id"]
-    if "priority" in body:
-        try:
-            updates["priority"] = int(body["priority"])
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid priority")
-    if "enabled" in body:
-        updates["enabled"] = 1 if body["enabled"] else 0
-    if not updates:
-        return {"ok": True, "rule": dict(rule)}
-    rule.update(updates)
-    sets = ", ".join(k + " = ?" for k in updates)
-    sets_pg = ", ".join(k + " = $" + str(i + 1) for i, k in enumerate(updates))
-    await db_execute("UPDATE routing_rules SET " + sets + " WHERE id = ?", "UPDATE routing_rules SET " + sets_pg + " WHERE id = $" + str(len(updates) + 1), tuple(updates.values()) + (rule_id,))
-    return {"ok": True, "rule": dict(rule)}
-
-
-@app.delete("/api/routing-rules/{rule_id}")
-async def delete_routing_rule(rule_id: str, _=Depends(require_auth)):
-    if rule_id not in ROUTING_RULES:
-        raise HTTPException(status_code=404, detail="Rule not found")
-    ROUTING_RULES.pop(rule_id, None)
-    await db_execute("DELETE FROM routing_rules WHERE id = ?", "DELETE FROM routing_rules WHERE id = $1", (rule_id,))
-    return {"ok": True}
-
-
 def active_sessions_snapshot():
     now = time.time()
     out = []
@@ -6010,7 +5934,7 @@ def active_sessions_snapshot():
             "inbound_tag": info.get("inbound_tag") or info.get("transport") or "",
             "transport": info.get("transport", ""),
             "protocol": info.get("protocol") or (link.get("protocol", "") if link else ""),
-            "region": region_name_for_link(link) if link else "",
+            "outbound_proxy": (link.get("outbound_proxy", "") if link else ""),
             "outbound_mode": link.get("outbound_mode", "auto") if link else "",
             "proxy_line_id": link.get("proxy_line_id") if link else None,
             "bytes_up": up,
@@ -6048,6 +5972,8 @@ def active_sessions_snapshot():
             proto = s.get("protocol", "")
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
+            flushed = int(s.get("bytes_flushed", 0) or 0)
+            used = used + max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - flushed)
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
@@ -6058,7 +5984,7 @@ def active_sessions_snapshot():
                 "inbound_tag": "socks5-in" if proto == "socks5" else ("http-proxy-in" if proto == "http-proxy" else "mtproxy-in"),
                 "transport": proto,
                 "protocol": proto,
-                "region": region_name_for_link(link) if link else "",
+                "outbound_proxy": (link.get("outbound_proxy", "") if link else ""),
                 "outbound_mode": link.get("outbound_mode", "auto") if link else "",
                 "proxy_line_id": link.get("proxy_line_id") if link else None,
                 "bytes_up": up,
@@ -6070,6 +5996,7 @@ def active_sessions_snapshot():
                 "quota_remaining": (limit - used) if limit > 0 else None,
                 "limit_bytes": limit,
                 "used_bytes": used,
+                "bytes_flushed": flushed,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
                 "link_sessions": _link_session_count(s.get("username", "")) + _proxy_session_count(s.get("username", "")),
             })
@@ -6095,6 +6022,8 @@ def active_sessions_snapshot():
             link = LINKS.get(s.get("username") or "")
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
+            flushed = int(s.get("bytes_flushed", 0) or 0)
+            used = used + max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - flushed)
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
@@ -6105,7 +6034,7 @@ def active_sessions_snapshot():
                 "inbound_tag": "webproxy-in",
                 "transport": "webproxy",
                 "protocol": "webproxy",
-                "region": region_name_for_link(link) if link else "",
+                "outbound_proxy": (link.get("outbound_proxy", "") if link else ""),
                 "outbound_mode": link.get("outbound_mode", "auto") if link else "",
                 "proxy_line_id": link.get("proxy_line_id") if link else None,
                 "bytes_up": up,
@@ -6117,6 +6046,7 @@ def active_sessions_snapshot():
                 "quota_remaining": (limit - used) if limit > 0 else None,
                 "limit_bytes": limit,
                 "used_bytes": used,
+                "bytes_flushed": flushed,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
                 "link_sessions": _link_session_count(s.get("username", "")) + _proxy_session_count(s.get("username", "")),
             })
@@ -6250,9 +6180,10 @@ async def import_links(request: Request, _=Depends(require_auth)):
             ss_method = "2022-blake3-aes-256-gcm"
         owner_user_id = item.get("owner_user_id", "")
         ss_psk = item.get("ss_psk", "")
-        region_id = item.get("region_id", "")
-        if region_id and region_id not in REGIONS:
-            region_id = ""
+        try:
+            outbound_proxy, outbound_proxy_pass = split_outbound_proxy_for_store(item.get("outbound_proxy") or "", item.get("outbound_proxy_pass") or "")
+        except ValueError:
+            outbound_proxy, outbound_proxy_pass = "", ""
         if protocol == "ss-ws" and not ss_psk:
             ss_psk = base64.b64encode(secrets.token_bytes(ss_key_len(ss_method))).decode()
 
@@ -6289,14 +6220,15 @@ async def import_links(request: Request, _=Depends(require_auth)):
                 "ss_method": ss_method,
                 "ss_psk": ss_psk,
                 "owner_user_id": owner_user_id,
-                "region_id": item.get("region_id", ""),
+                "outbound_proxy": outbound_proxy,
+                "outbound_proxy_pass": outbound_proxy_pass,
                 "mtproto_variant": item.get("mtproto_variant", "dd") or "dd",
                 "mtproto_domain": item.get("mtproto_domain", "www.google.com") or "www.google.com"
             }
         await db_execute(
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
-            (uid_input, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, item.get("proxy_line_id"), bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, item.get("outbound_mode", "auto"), item.get("gaming_profile", "balanced"), item.get("ss_method", "2022-blake3-aes-256-gcm"), item.get("ss_psk", ""), item.get("owner_user_id", ""), item.get("region_id", "")),
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
+            (uid_input, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, item.get("proxy_line_id"), bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, item.get("outbound_mode", "auto"), item.get("gaming_profile", "balanced"), item.get("ss_method", "2022-blake3-aes-256-gcm"), item.get("ss_psk", ""), item.get("owner_user_id", ""), outbound_proxy, outbound_proxy_pass),
         )
         await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2 WHERE uid = $3", (item.get("mtproto_variant", "dd") or "dd", item.get("mtproto_domain", "www.google.com") or "www.google.com", uid_input))
         if protocol == "mtproto" and tgproxy is not None:
@@ -6422,11 +6354,11 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         "ss_method": ("ss_method", str),
         "ss_psk": ("ss_psk", str),
         "owner_user_id": ("owner_user_id", str),
-        "region_id": ("region_id", str),
         "fingerprint": ("fingerprint", str),
         "alpn": ("alpn", str),
         "port": ("port", int),
         "proxy_line_id": ("proxy_line_id", lambda x: int(x) if x else None),
+        "outbound_proxy": ("outbound_proxy", str),
         "xray_dns_mode": ("xray_dns_mode", str),
         "xray_doh_url": ("xray_doh_url", str),
         "xray_allowed_domains": ("xray_allowed_domains", str),
@@ -6453,20 +6385,39 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         body["mtproto_domain"] = _dom
     if "protocol" in body and body["protocol"] == "webproxy" and "port" in body and int(body["port"] or 0) not in WEBPROXY_PORTS:
         raise HTTPException(status_code=400, detail="WEB proxy port must be one of 443, 2053, 2083, 2087, 2096, 8443")
+    _patch_proto = body.get("protocol") or link.get("protocol", "")
+    _patch_port = body.get("port") if "port" in body else link.get("port")
+    if _patch_proto == "webproxy" and _patch_port is not None and _webproxy_port_in_use(int(_patch_port), exclude_uid=link.get("uid", "")):
+        raise HTTPException(status_code=400, detail="WEB proxy port " + str(int(_patch_port)) + " is already used by another link. Each WEB proxy link needs its own port because the port selects its secret (443, 2053, 2083, 2087, 2096, 8443).")
     if "protocol" in body and body["protocol"] in ("socks5", "mtproto", "http-proxy"):
         body["port"] = _proxy_effective_port(body["protocol"])
+    _owner_sessions_updated = False
+    if "owner_name" in body:
+        body["owner_user_id"] = await _resolve_owner_name(body.get("owner_name"))
+    if "owner_max_sessions" in body:
+        _patch_owner_id = body.get("owner_user_id") or link.get("owner_user_id", "")
+        if _patch_owner_id:
+            await _set_owner_max_sessions(_patch_owner_id, body.get("owner_max_sessions"))
+            _owner_sessions_updated = True
     if "owner_user_id" in body and body["owner_user_id"]:
         owner_row = await db_fetchone("SELECT id FROM users WHERE id = ?", "SELECT id FROM users WHERE id = $1", (body["owner_user_id"],))
         if not owner_row:
             raise HTTPException(status_code=400, detail="Unknown owner user")
-    if "region_id" in body and body["region_id"] and body["region_id"] not in REGIONS:
-        raise HTTPException(status_code=400, detail="Unknown region")
     if "gaming_profile" in body:
         _preset = {"fragment_mode": body.get("fragment_mode", link.get("fragment_mode", "off")), "tfo": body.get("tfo", link.get("tfo", 0)), "smux_enabled": body.get("smux_enabled", link.get("smux_enabled", 0)), "udp_enabled": body.get("udp_enabled", link.get("udp_enabled", 1)), "fragment": body.get("fragment", link.get("fragment", ""))}
         _preset = apply_gaming_profile(_preset, body["gaming_profile"], set(body.keys()))
         for _k, _v in _preset.items():
             if _k not in body:
                 body[_k] = _v
+    if "outbound_proxy" in body:
+        try:
+            _oproxy, _opass = split_outbound_proxy_for_store(body.get("outbound_proxy") or "", link.get("outbound_proxy_pass", ""))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if str(body.get("outbound_proxy_pass") or "").strip():
+            _opass = encrypt_proxy_password(str(body.get("outbound_proxy_pass")).strip())
+        updates["outbound_proxy"] = _oproxy
+        updates["outbound_proxy_pass"] = _opass
     for key, mapping in field_map.items():
         if key not in body:
             continue
@@ -6506,6 +6457,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                 raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
 
     if not updates:
+        if _owner_sessions_updated:
+            return {"ok": True}
         return {"ok": True, "message": "no changes"}
 
     logger.info(f"Applying updates to {uid}: {updates}")
@@ -6576,13 +6529,18 @@ async def clone_link(uid: str, _=Depends(require_auth)):
             new_uid = str(uuid_lib.uuid4())
         new_link = dict(link)
         new_link["uid"] = new_uid
+        if new_link.get("protocol") == "webproxy":
+            _free_port = _next_free_webproxy_port()
+            if not _free_port:
+                raise HTTPException(status_code=400, detail="No free WEB proxy port left (443, 2053, 2083, 2087, 2096, 8443 are all in use). Each WEB proxy link needs its own port because the port selects its secret.")
+            new_link["port"] = _free_port
         new_link["used_bytes"] = 0
         new_link["created_at"] = datetime.now(UTC).isoformat()
         LINKS[new_uid] = new_link
         await db_execute(
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, region_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)",
-            (new_uid, new_link["label"], new_link["limit_bytes"], 0, new_link["max_connections"], new_link["created_at"], 1 if new_link.get("active") else 0, new_link.get("expires_at"), new_link.get("custom_path", ""), new_link.get("custom_sni", ""), new_link.get("custom_host", ""), new_link.get("custom_fp", "chrome"), new_link.get("color", "#39ff14"), new_link.get("flag", ""), new_link.get("fragment", ""), new_link.get("ip_profile_id", ""), new_link.get("naming_mode", "default"), new_link.get("tfo", 0), new_link.get("ech_enabled", 0), new_link.get("ech_sni", ""), new_link.get("ech_doh", ""), new_link.get("fragment_mode", "off"), new_link.get("fragment_length", "100-200"), new_link.get("fragment_interval", "10-20"), new_link.get("allow_insecure", 0), new_link.get("random_path", 0), new_link.get("enable_ipv6", 1), new_link.get("smux_enabled", 0), new_link.get("ip_limit", 0), new_link.get("protocol", "vless-ws"), new_link.get("fingerprint", "chrome"), new_link.get("alpn", ""), new_link.get("port", 443), new_link.get("proxy_line_id"), new_link.get("bypass_iran", 1), new_link.get("bypass_china", 0), new_link.get("bypass_russia", 0), new_link.get("xray_dns_mode", "doh"), new_link.get("xray_doh_url", ""), new_link.get("xray_allowed_domains", ""), new_link.get("udp_enabled", 1), new_link.get("outbound_mode", "auto"), new_link.get("gaming_profile", "balanced"), new_link.get("ss_method", "2022-blake3-aes-256-gcm"), new_link.get("ss_psk", ""), new_link.get("owner_user_id", ""), new_link.get("region_id", "")),
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
+            (new_uid, new_link["label"], new_link["limit_bytes"], 0, new_link["max_connections"], new_link["created_at"], 1 if new_link.get("active") else 0, new_link.get("expires_at"), new_link.get("custom_path", ""), new_link.get("custom_sni", ""), new_link.get("custom_host", ""), new_link.get("custom_fp", "chrome"), new_link.get("color", "#39ff14"), new_link.get("flag", ""), new_link.get("fragment", ""), new_link.get("ip_profile_id", ""), new_link.get("naming_mode", "default"), new_link.get("tfo", 0), new_link.get("ech_enabled", 0), new_link.get("ech_sni", ""), new_link.get("ech_doh", ""), new_link.get("fragment_mode", "off"), new_link.get("fragment_length", "100-200"), new_link.get("fragment_interval", "10-20"), new_link.get("allow_insecure", 0), new_link.get("random_path", 0), new_link.get("enable_ipv6", 1), new_link.get("smux_enabled", 0), new_link.get("ip_limit", 0), new_link.get("protocol", "vless-ws"), new_link.get("fingerprint", "chrome"), new_link.get("alpn", ""), new_link.get("port", 443), new_link.get("proxy_line_id"), new_link.get("bypass_iran", 1), new_link.get("bypass_china", 0), new_link.get("bypass_russia", 0), new_link.get("xray_dns_mode", "doh"), new_link.get("xray_doh_url", ""), new_link.get("xray_allowed_domains", ""), new_link.get("udp_enabled", 1), new_link.get("outbound_mode", "auto"), new_link.get("gaming_profile", "balanced"), new_link.get("ss_method", "2022-blake3-aes-256-gcm"), new_link.get("ss_psk", ""), new_link.get("owner_user_id", ""), new_link.get("outbound_proxy", ""), new_link.get("outbound_proxy_pass", "")),
         )
         await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2 WHERE uid = $3", (new_link.get("mtproto_variant", "dd") or "dd", new_link.get("mtproto_domain", "www.google.com") or "www.google.com", new_uid))
         if new_link.get("protocol") == "mtproto" and tgproxy is not None:
@@ -7274,8 +7232,14 @@ async def user_dashboard(uid: str, request: Request):
     limit = link["limit_bytes"]
     usage_percent = 0 if limit == 0 else min(100, round(used / limit * 100, 1))
     usage_bar_color = "#4ade80" if usage_percent < 80 else ("#fbbf24" if usage_percent < 95 else "#f87171")
+    remaining = (limit - used) if limit > 0 else None
+    remaining_str = "∞" if remaining is None else _fmt_bytes(max(0, remaining))
+    is_proxy_link = (link.get("protocol") or "") in PROXY_PROTOCOLS
+    copy_label_en = "Copy Proxy Link" if is_proxy_link else "Copy VLESS"
+    copy_label_fa = "کپی لینک پروکسی" if is_proxy_link else "کپی وی‌لس"
 
     domain = get_domain(request)
+    is_proxy = (link.get("protocol") or "") in PROXY_PROTOCOLS
 
     vless_link = generate_protocol_link(uid, remark=link["label"], extra=link, server_domain=domain)
     protocol_link = vless_link
@@ -7283,7 +7247,7 @@ async def user_dashboard(uid: str, request: Request):
     clash_url = f"https://{domain}/sub/{uid}/clash"
     singbox_url = f"https://{domain}/sub/{uid}/singbox"
 
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={quote(sub_url)}"
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={quote(protocol_link if is_proxy and protocol_link else sub_url)}"
     if status == "Quota Exceeded 🚫":
         vless_link = ""
         protocol_link = ""
@@ -7306,6 +7270,21 @@ async def user_dashboard(uid: str, request: Request):
     clash_url_esc = html.escape(clash_url)
     singbox_url_esc = html.escape(singbox_url)
     qr_url_esc = html.escape(qr_url)
+    if is_proxy:
+        if protocol_link:
+            actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('proxy_copied'))">📋 <span data-en="Copy Proxy Link" data-fa="کپی لینک پروکسی">Copy Proxy Link</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))">🔗 <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
+    <button class="btn btn-outline" onclick="toggleLinkText()">👁 <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
+        else:
+            actions_html = """<div style="color:#f87171;">Proxy listener is disabled on this host, so no working link exists for this inbound.</div>"""
+    else:
+        actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))">🔗 <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{clash_url_esc}', t('clash_copied'))">🐱 <span data-en="Copy Clash" data-fa="کپی کلش">Copy Clash</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{singbox_url_esc}', t('singbox_copied'))">🧩 <span data-en="Copy Sing‑Box" data-fa="کپی سینگ‌باکس">Copy Sing‑Box</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('vless_copied'))">📋 <span data-en="{copy_label_en}" data-fa="{copy_label_fa}">{copy_label_en}</span></button>
+    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'single')">⚙️ <span data-en="Xray Config" data-fa="کانفیگ Xray (تکی)">Xray Config</span></button>
+    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'balancer')">⚖️ <span data-en="Xray Balancer" data-fa="Xray بالانسر">Xray Balancer</span></button>
+    <button class="btn btn-outline" onclick="toggleLinkText()">👁 <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7313,7 +7292,7 @@ async def user_dashboard(uid: str, request: Request):
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Dashboard | {label_esc}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="/static/chart.umd.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 :root{{
@@ -7454,6 +7433,7 @@ h1{{color:var(--primary); font-size:1.8rem; font-weight:800; letter-spacing:-0.5
     <div class="row"><span class="label" data-en="Status" data-fa="وضعیت">Status</span><span class="value">{status_esc}</span></div>
     <div class="row"><span class="label" data-en="Expiration" data-fa="انقضا">Expiration</span><span class="value">{expiry_str_esc}</span></div>
     <div class="row" style="grid-column:span 2;"><span class="label" data-en="Data Usage" data-fa="مصرف داده">Data Usage</span><span class="value">{_fmt_bytes(used)} / {'∞' if limit == 0 else _fmt_bytes(limit)}</span></div>
+    <div class="row"><span class="label" data-en="Remaining" data-fa="باقی‌مانده">Remaining</span><span class="value">{remaining_str}</span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill"></div></div>
     <div class="progress-text" data-en="{usage_percent}% used" data-fa="{usage_percent}% مصرف">{usage_percent}% used</div>
     <div class="daily-chart" id="daily-chart"><canvas id="dailyCanvas"></canvas></div>
@@ -7462,22 +7442,19 @@ h1{{color:var(--primary); font-size:1.8rem; font-weight:800; letter-spacing:-0.5
     <img src="{qr_url_esc}" alt="Scan to Import" width="200" height="200">
   </div>
   <div class="actions-grid">
-    <button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))">🔗 <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{clash_url_esc}', t('clash_copied'))">🐱 <span data-en="Copy Clash" data-fa="کپی کلش">Copy Clash</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{singbox_url_esc}', t('singbox_copied'))">🧩 <span data-en="Copy Sing‑Box" data-fa="کپی سینگ‌باکس">Copy Sing‑Box</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('vless_copied'))">📋 <span data-en="Copy VLESS" data-fa="کپی وی‌لس">Copy VLESS</span></button>
-    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'single')">⚙️ <span data-en="Xray Config" data-fa="کانفیگ Xray (تکی)">Xray Config</span></button>
-    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'balancer')">⚖️ <span data-en="Xray Balancer" data-fa="Xray بالانسر">Xray Balancer</span></button>
+{actions_html}
 </div>
+  <div id="link-text-box" style="display:none;margin-top:12px;"><input id="link-text-input" readonly value="{vless_link_esc}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline" style="margin-top:8px;" onclick="copyToClip(document.getElementById('link-text-input').value, t('link_copied'))">Copy link text</button></div>
 </div>
 <div id="toast">Copied!</div>
 <script>
 var lang = localStorage.getItem('ll') || 'en';
 var i18n = {{
-  en:{{ sub_copied:'Subscription Link Copied!', clash_copied:'Clash Link Copied!', singbox_copied:'Sing‑Box Link Copied!', vless_copied:'VLESS Link Copied!', xray_copied:'Xray Config Link Copied!' }},
-  fa:{{ sub_copied:'لینک اشتراک کپی شد!', clash_copied:'لینک کلش کپی شد!', singbox_copied:'لینک سینگ‌باکس کپی شد!', vless_copied:'لینک VLESS کپی شد!', xray_copied:'لینک کانفیگ Xray کپی شد!' }}
+  en:{{ sub_copied:'Subscription Link Copied!', clash_copied:'Clash Link Copied!', singbox_copied:'Sing‑Box Link Copied!', vless_copied:'VLESS Link Copied!', xray_copied:'Xray Config Link Copied!', proxy_copied:'Proxy Link Copied!', link_copied:'Link Text Copied!' }},
+  fa:{{ sub_copied:'لینک اشتراک کپی شد!', clash_copied:'لینک کلش کپی شد!', singbox_copied:'لینک سینگ‌باکس کپی شد!', vless_copied:'لینک VLESS کپی شد!', xray_copied:'لینک کانفیگ Xray کپی شد!', proxy_copied:'لینک پروکسی کپی شد!', link_copied:'متن لینک کپی شد!' }}
 }};
 function t(key){{ return (i18n[lang] && i18n[lang][key]) || i18n['en'][key] || key; }}
+function toggleLinkText(){{ var b = document.getElementById('link-text-box'); if(!b) return; b.style.display = b.style.display === 'none' ? 'block' : 'none'; }}
 function setLang(l){{
   lang=l;
   document.querySelectorAll('.lang-btn').forEach(b=>b.classList.remove('active'));
@@ -7579,7 +7556,7 @@ function toast(msg, err) {{
 var dailyData = {json.dumps(daily_data)};
 if (dailyData.length > 0) {{
     var ctx = document.getElementById('dailyCanvas').getContext('2d');
-    new Chart(ctx, {{
+    if (typeof Chart !== 'undefined') new Chart(ctx, {{
         type: 'bar',
         data: {{
             labels: dailyData.map(d => d.day),
@@ -8409,6 +8386,15 @@ async def scanner_ws(websocket: WebSocket):
         await websocket.close(code=1008, reason="disabled")
         return
     token = websocket.query_params.get("token", "")
+    if not token:
+        cookie_name = await get_session_cookie_name()
+        token = websocket.cookies.get(cookie_name, "")
+    if not token:
+        for fallback_name in SESSION_COOKIE_NAMES:
+            if fallback_name != cookie_name:
+                token = websocket.cookies.get(fallback_name, "")
+                if token:
+                    break
     payload = decode_jwt_token(token) if token else None
     if not payload or await is_jwt_revoked(payload.get("jti", "")):
         await websocket.close(code=1008, reason="unauthorized")
@@ -8447,6 +8433,7 @@ async def scanner_ws(websocket: WebSocket):
         except (ValueError, TypeError):
             timeout = 4
         sem = asyncio.Semaphore(5)
+        tally = [0, 0]
         async def scan_one(item):
             async with _SCANNER_GLOBAL_SEM:
                 async with sem:
@@ -8499,11 +8486,14 @@ async def scanner_ws(websocket: WebSocket):
                             result = {"ip": host_str, "ok": True, "tcp_latency": latency, "https_latency": None}
                         except Exception:
                             result = {"ip": host_str, "ok": False, "latency": None}
+                    if result.get("ok"): tally[0] += 1
+                    else: tally[1] += 1
                     await websocket.send_json(result)
                     await asyncio.sleep(0.3)
         tasks = [asyncio.create_task(scan_one(item)) for item in items]
         await asyncio.gather(*tasks)
-        await websocket.send_json({"done": True})
+        all_failed = tally[0] == 0 and tally[1] > 0
+        await websocket.send_json({"done": True, "all_failed": all_failed})
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -9082,6 +9072,25 @@ async def consume_quota(uid: str, n: int) -> bool:
             log_event("Warning", f"Inbound {link['label']} ({uid}) has used over 80% of quota")
         return True
 
+async def consume_quota_partial(uid: str, n: int) -> int:
+    if n <= 0:
+        return 0
+    if await consume_quota(uid, n):
+        return n
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if not link or not link.get("active"):
+            return 0
+        limit = link.get("limit_bytes", 0)
+        if limit <= 0:
+            return 0
+        remaining = limit - link.get("used_bytes", 0)
+    if remaining <= 0:
+        return 0
+    if await consume_quota(uid, remaining):
+        return remaining
+    return 0
+
 async def notify_telegram_event(event: str, label: str, uid: str):
     notif_row = await db_fetchone("SELECT value FROM settings WHERE key='telegram_notify_enabled'", "SELECT value FROM settings WHERE key='telegram_notify_enabled'")
     if notif_row and notif_row["value"] != "1":
@@ -9288,9 +9297,9 @@ SUB_UPDATE_INTERVAL = 6
 
 
 async def refresh_stable_settings():
-    global WS_RATE_MAX, WS_RATE_WINDOW, SUB_UPDATE_INTERVAL, MAX_XHTTP_SESSIONS, REGION_SOCKS_RANGE, REGION_SOCKS_HOST
+    global WS_RATE_MAX, WS_RATE_WINDOW, SUB_UPDATE_INTERVAL, MAX_XHTTP_SESSIONS
     try:
-        rows = await db_fetchall("SELECT key, value FROM settings WHERE key IN ('ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions', 'region_socks_range', 'region_socks_host')", "SELECT key, value FROM settings WHERE key IN ('ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions', 'region_socks_range', 'region_socks_host')")
+        rows = await db_fetchall("SELECT key, value FROM settings WHERE key IN ('ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions')", "SELECT key, value FROM settings WHERE key IN ('ws_rate_max', 'ws_rate_window', 'sub_update_interval', 'max_xhttp_sessions')")
         vals = {r["key"]: r["value"] for r in rows} if rows else {}
         if vals.get("ws_rate_max"):
             WS_RATE_MAX = max(1, int(vals["ws_rate_max"]))
@@ -9300,10 +9309,6 @@ async def refresh_stable_settings():
             SUB_UPDATE_INTERVAL = max(1, int(vals["sub_update_interval"]))
         if vals.get("max_xhttp_sessions"):
             MAX_XHTTP_SESSIONS = max(10, int(vals["max_xhttp_sessions"]))
-        if vals.get("region_socks_range"):
-            REGION_SOCKS_RANGE = vals["region_socks_range"]
-        if vals.get("region_socks_host"):
-            REGION_SOCKS_HOST = vals["region_socks_host"]
     except Exception as exc:
         logger.error(f"refresh stable settings failed: {exc}")
 
@@ -9404,7 +9409,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, route: str = "ws-in"
             return
 
 
-        validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and link.get("proxy_line_id")))
+        validated, validated_ips = await validate_tunnel_target(address, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
         if not validated:
             await websocket.close(code=1008, reason="access to private network denied")
             log_event("Tunnel", f"Blocked SSRF attempt to {address} from {client_ip}", ip=client_ip)
@@ -9619,7 +9624,7 @@ async def xhttp_packet_up(session_id: str, seq: int, request: Request):
             raise HTTPException(status_code=403, detail="ip limit reached")
 
 
-        validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and link.get("proxy_line_id")))
+        validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
         if not validated:
             await _teardown_xhttp(session_id)
             raise HTTPException(status_code=403, detail="access to private network denied")
@@ -9734,7 +9739,7 @@ async def xhttp_stream_up(session_id: str, request: Request):
                 raise HTTPException(status_code=403, detail="ip limit reached")
 
 
-            validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and link.get("proxy_line_id")))
+            validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
             if not validated:
                 await _teardown_xhttp(session_id)
                 raise HTTPException(status_code=403, detail="access to private network denied")
@@ -9835,7 +9840,7 @@ async def xhttp_stream_one(base_path: str, request: Request):
         raise HTTPException(status_code=403, detail="ip limit reached")
 
 
-    validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and link.get("proxy_line_id")))
+    validated, validated_ips = await validate_tunnel_target(target_addr, via_proxy=bool(link and (link.get("proxy_line_id") or (link.get("outbound_proxy") or "").strip())))
     if not validated:
         raise HTTPException(status_code=403, detail="access to private network denied")
 
@@ -9925,6 +9930,2688 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
         await down_q.put(None)
         await _teardown_xhttp(session_id)
 
+CHARTJS_B64 = (
+    "IWZ1bmN0aW9uKHQsZSl7Im9iamVjdCI9PXR5cGVvZiBleHBvcnRzJiYidW5kZWZpbmVkIiE9dHlwZW9mIG1vZHVsZT9tb2R1bGUu"
+    "ZXhwb3J0cz1lKCk6ImZ1bmN0aW9uIj09dHlwZW9mIGRlZmluZSYmZGVmaW5lLmFtZD9kZWZpbmUoZSk6KHQ9InVuZGVmaW5lZCIh"
+    "PXR5cGVvZiBnbG9iYWxUaGlzP2dsb2JhbFRoaXM6dHx8c2VsZikuQ2hhcnQ9ZSgpfSh0aGlzLGZ1bmN0aW9uKCl7InVzZSBzdHJp"
+    "Y3QiO3ZhciBzPU9iamVjdC5mcmVlemUoe19fcHJvdG9fXzpudWxsLGdldCBDb2xvcnMoKXtyZXR1cm4gZG59LGdldCBEZWNpbWF0"
+    "aW9uKCl7cmV0dXJuIGZufSxnZXQgRmlsbGVyKCl7cmV0dXJuIERufSxnZXQgTGVnZW5kKCl7cmV0dXJuIFRufSxnZXQgU3ViVGl0"
+    "bGUoKXtyZXR1cm4gSW59LGdldCBUaXRsZSgpe3JldHVybiBFbn0sZ2V0IFRvb2x0aXAoKXtyZXR1cm4gVW59fSk7ZnVuY3Rpb24g"
+    "dCgpe31jb25zdCBGPSgoKT0+e2xldCB0PTA7cmV0dXJuKCk9PnQrK30pKCk7ZnVuY3Rpb24gUCh0KXtyZXR1cm4gbnVsbD09dH1m"
+    "dW5jdGlvbiBPKHQpe2lmKEFycmF5LmlzQXJyYXkmJkFycmF5LmlzQXJyYXkodCkpcmV0dXJuITA7Y29uc3QgZT1PYmplY3QucHJv"
+    "dG90eXBlLnRvU3RyaW5nLmNhbGwodCk7cmV0dXJuIltvYmplY3QiPT09ZS5zbGljZSgwLDcpJiYiQXJyYXldIj09PWUuc2xpY2Uo"
+    "LTYpfWZ1bmN0aW9uIEEodCl7cmV0dXJuIG51bGwhPT10JiYiW29iamVjdCBPYmplY3RdIj09PU9iamVjdC5wcm90b3R5cGUudG9T"
+    "dHJpbmcuY2FsbCh0KX1mdW5jdGlvbiBwKHQpe3JldHVybigibnVtYmVyIj09dHlwZW9mIHR8fHQgaW5zdGFuY2VvZiBOdW1iZXIp"
+    "JiZpc0Zpbml0ZSgrdCl9ZnVuY3Rpb24gZyh0LGUpe3JldHVybiBwKHQpP3Q6ZX1mdW5jdGlvbiBUKHQsZSl7cmV0dXJuIHZvaWQg"
+    "MD09PXQ/ZTp0fWNvbnN0IFY9KHQsZSk9PiJzdHJpbmciPT10eXBlb2YgdCYmdC5lbmRzV2l0aCgiJSIpP3BhcnNlRmxvYXQodCkv"
+    "MTAwOit0L2UsQj0odCxlKT0+InN0cmluZyI9PXR5cGVvZiB0JiZ0LmVuZHNXaXRoKCIlIik/cGFyc2VGbG9hdCh0KS8xMDAqZTor"
+    "dDtmdW5jdGlvbiBkKHQsZSxpKXtpZih0JiYiZnVuY3Rpb24iPT10eXBlb2YgdC5jYWxsKXJldHVybiB0LmFwcGx5KGksZSl9ZnVu"
+    "Y3Rpb24gayh0LGUsaSxzKXtsZXQgYSxuLG87aWYoTyh0KSlpZihuPXQubGVuZ3RoLHMpZm9yKGE9bi0xOzA8PWE7YS0tKWUuY2Fs"
+    "bChpLHRbYV0sYSk7ZWxzZSBmb3IoYT0wO2E8bjthKyspZS5jYWxsKGksdFthXSxhKTtlbHNlIGlmKEEodCkpZm9yKG89T2JqZWN0"
+    "LmtleXModCksbj1vLmxlbmd0aCxhPTA7YTxuO2ErKyllLmNhbGwoaSx0W29bYV1dLG9bYV0pfWZ1bmN0aW9uIFcodCxlKXtsZXQg"
+    "aSxzLGEsbjtpZighdHx8IWV8fHQubGVuZ3RoIT09ZS5sZW5ndGgpcmV0dXJuITE7Zm9yKGk9MCxzPXQubGVuZ3RoO2k8czsrK2kp"
+    "aWYoYT10W2ldLG49ZVtpXSxhLmRhdGFzZXRJbmRleCE9PW4uZGF0YXNldEluZGV4fHxhLmluZGV4IT09bi5pbmRleClyZXR1cm4h"
+    "MTtyZXR1cm4hMH1mdW5jdGlvbiBOKGUpe2lmKE8oZSkpcmV0dXJuIGUubWFwKE4pO2lmKEEoZSkpe2NvbnN0IGk9T2JqZWN0LmNy"
+    "ZWF0ZShudWxsKSxzPU9iamVjdC5rZXlzKGUpLGE9cy5sZW5ndGg7bGV0IHQ9MDtmb3IoO3Q8YTsrK3QpaVtzW3RdXT1OKGVbc1t0"
+    "XV0pO3JldHVybiBpfXJldHVybiBlfWZ1bmN0aW9uIEgodCl7cmV0dXJuLTE9PT1bIl9fcHJvdG9fXyIsInByb3RvdHlwZSIsImNv"
+    "bnN0cnVjdG9yIl0uaW5kZXhPZih0KX1mdW5jdGlvbiBqKHQsZSxpLHMpe3ZhciBhO0godCkmJihhPWVbdF0saT1pW3RdLEEoYSkm"
+    "JkEoaSk/WShhLGkscyk6ZVt0XT1OKGkpKX1mdW5jdGlvbiBZKGksdCxzKXt2YXIgYSxlPU8odCk/dDpbdF0sbj1lLmxlbmd0aDtp"
+    "ZighQShpKSlyZXR1cm4gaTtjb25zdCBvPShzPXN8fHt9KS5tZXJnZXJ8fGo7Zm9yKGxldCB0PTA7dDxuOysrdClpZihBKGE9ZVt0"
+    "XSkpe2NvbnN0IE89T2JqZWN0LmtleXMoYSk7Zm9yKGxldCB0PTAsZT1PLmxlbmd0aDt0PGU7Kyt0KW8oT1t0XSxpLGEscyl9cmV0"
+    "dXJuIGl9ZnVuY3Rpb24gJCh0LGUpe3JldHVybiBZKHQsZSx7bWVyZ2VyOlV9KX1mdW5jdGlvbiBVKHQsZSxpKXt2YXIgcztIKHQp"
+    "JiYocz1lW3RdLGk9aVt0XSxBKHMpJiZBKGkpPyQocyxpKTpPYmplY3QucHJvdG90eXBlLmhhc093blByb3BlcnR5LmNhbGwoZSx0"
+    "KXx8KGVbdF09TihpKSkpfWNvbnN0IFg9eyIiOnQ9PnQseDp0PT50LngseTp0PT50Lnl9O2Z1bmN0aW9uIHEodCl7Y29uc3QgZT10"
+    "LnNwbGl0KCIuIiksaT1bXTtsZXQgcz0iIjtmb3IoY29uc3QgdCBvZiBlKXMrPXQscz1zLmVuZHNXaXRoKCJcXCIpP3Muc2xpY2Uo"
+    "MCwtMSkrIi4iOihpLnB1c2gocyksIiIpO3JldHVybiBpfWZ1bmN0aW9uIG0odCxlKXtjb25zdCBpPVhbZV18fChYW2VdPWZ1bmN0"
+    "aW9uKCl7Y29uc3QgaT1xKGUpO3JldHVybiB0PT57Zm9yKGNvbnN0IGUgb2YgaSl7aWYoIiI9PT1lKWJyZWFrO3Q9dCYmdFtlXX1y"
+    "ZXR1cm4gdH19KCkpO3JldHVybiBpKHQpfWZ1bmN0aW9uIEsodCl7cmV0dXJuIHQuY2hhckF0KDApLnRvVXBwZXJDYXNlKCkrdC5z"
+    "bGljZSgxKX1jb25zdCBHPXQ9PnZvaWQgMCE9PXQsdT10PT4iZnVuY3Rpb24iPT10eXBlb2YgdCxaPSh0LGUpPT57aWYodC5zaXpl"
+    "IT09ZS5zaXplKXJldHVybiExO2Zvcihjb25zdCBpIG9mIHQpaWYoIWUuaGFzKGkpKXJldHVybiExO3JldHVybiEwfTtmdW5jdGlv"
+    "biBKKHQpe3JldHVybiJtb3VzZXVwIj09PXQudHlwZXx8ImNsaWNrIj09PXQudHlwZXx8ImNvbnRleHRtZW51Ij09PXQudHlwZX1j"
+    "b25zdCBTPU1hdGguUEksXz0yKlMsUT1fK1MsdHQ9TnVtYmVyLlBPU0lUSVZFX0lORklOSVRZLGV0PVMvMTgwLEQ9Uy8yLGl0PVMv"
+    "NCxzdD0yKlMvMyxyPU1hdGgubG9nMTAseT1NYXRoLnNpZ247ZnVuY3Rpb24gYXQodCxlLGkpe3JldHVybiBNYXRoLmFicyh0LWUp"
+    "PGl9ZnVuY3Rpb24gbnQodCl7dmFyIGU9TWF0aC5yb3VuZCh0KSxlPSh0PWF0KHQsZSx0LzFlMyk/ZTp0LE1hdGgucG93KDEwLE1h"
+    "dGguZmxvb3Iocih0KSkpKSx0PXQvZTtyZXR1cm4odDw9MT8xOnQ8PTI/Mjp0PD01PzU6MTApKmV9ZnVuY3Rpb24gb3QodCl7Y29u"
+    "c3QgZT1bXSxpPU1hdGguc3FydCh0KTtsZXQgcztmb3Iocz0xO3M8aTtzKyspdCVzPT0wJiYoZS5wdXNoKHMpLGUucHVzaCh0L3Mp"
+    "KTtyZXR1cm4gaT09PSgwfGkpJiZlLnB1c2goaSksZS5zb3J0KCh0LGUpPT50LWUpLnBvcCgpLGV9ZnVuY3Rpb24gcnQodCl7cmV0"
+    "dXJuIWlzTmFOKHBhcnNlRmxvYXQodCkpJiZpc0Zpbml0ZSh0KX1mdW5jdGlvbiBsdCh0LGUpe3ZhciBpPU1hdGgucm91bmQodCk7"
+    "cmV0dXJuIGktZTw9dCYmdDw9aStlfWZ1bmN0aW9uIGh0KHQsZSxpKXtsZXQgcyxhLG47Zm9yKHM9MCxhPXQubGVuZ3RoO3M8YTtz"
+    "Kyspbj10W3NdW2ldLGlzTmFOKG4pfHwoZS5taW49TWF0aC5taW4oZS5taW4sbiksZS5tYXg9TWF0aC5tYXgoZS5tYXgsbikpfWZ1"
+    "bmN0aW9uIEwodCl7cmV0dXJuIHQqKFMvMTgwKX1mdW5jdGlvbiBjdCh0KXtyZXR1cm4gdCooMTgwL1MpfWZ1bmN0aW9uIGR0KGkp"
+    "e2lmKHAoaSkpe2xldCB0PTEsZT0wO2Zvcig7TWF0aC5yb3VuZChpKnQpL3QhPT1pOyl0Kj0xMCxlKys7cmV0dXJuIGV9fWZ1bmN0"
+    "aW9uIHV0KHQsZSl7dmFyIGk9ZS54LXQueCxlPWUueS10LnksdD1NYXRoLnNxcnQoaSppK2UqZSk7bGV0IHM9TWF0aC5hdGFuMihl"
+    "LGkpO3JldHVybiBzPC0uNSpTJiYocys9Xykse2FuZ2xlOnMsZGlzdGFuY2U6dH19ZnVuY3Rpb24gZ3QodCxlKXtyZXR1cm4gTWF0"
+    "aC5zcXJ0KE1hdGgucG93KGUueC10LngsMikrTWF0aC5wb3coZS55LXQueSwyKSl9ZnVuY3Rpb24gZnQodCxlKXtyZXR1cm4odC1l"
+    "K1EpJV8tU31mdW5jdGlvbiB2KHQpe3JldHVybih0JV8rXyklX31mdW5jdGlvbiBwdCh0LGUsaSxzKXt2YXIgdD12KHQpLGU9dihl"
+    "KSxpPXYoaSksYT12KGUtdCksbj12KGktdCksbz12KHQtZSkscj12KHQtaSk7cmV0dXJuIHQ9PT1lfHx0PT09aXx8cyYmZT09PWl8"
+    "fG48YSYmbzxyfWZ1bmN0aW9uIEModCxlLGkpe3JldHVybiBNYXRoLm1heChlLE1hdGgubWluKGksdCkpfWZ1bmN0aW9uIG10KHQp"
+    "e3JldHVybiBDKHQsLTMyNzY4LDMyNzY3KX1mdW5jdGlvbiBjKHQsZSxpLHM9MWUtNil7cmV0dXJuIHQ+PU1hdGgubWluKGUsaSkt"
+    "cyYmdDw9TWF0aC5tYXgoZSxpKStzfWZ1bmN0aW9uIGJ0KGUsaSx0KXt0PXR8fCh0PT5lW3RdPGkpO2xldCBzLGE9ZS5sZW5ndGgt"
+    "MSxuPTA7Zm9yKDsxPGEtbjspdChzPW4rYT4+MSk/bj1zOmE9cztyZXR1cm57bG86bixoaTphfX1jb25zdCBmPShpLHMsYSx0KT0+"
+    "YnQoaSxhLHQ/dD0+e3ZhciBlPWlbdF1bc107cmV0dXJuIGU8YXx8ZT09PWEmJmlbdCsxXVtzXT09PWF9OnQ9PmlbdF1bc108YSks"
+    "eHQ9KGUsaSxzKT0+YnQoZSxzLHQ9PmVbdF1baV0+PXMpO2Z1bmN0aW9uIHZ0KHQsZSxpKXtsZXQgcz0wLGE9dC5sZW5ndGg7Zm9y"
+    "KDtzPGEmJnRbc108ZTspcysrO2Zvcig7YT5zJiZ0W2EtMV0+aTspYS0tO3JldHVybiAwPHN8fGE8dC5sZW5ndGg/dC5zbGljZShz"
+    "LGEpOnR9Y29uc3QgX3Q9WyJwdXNoIiwicG9wIiwic2hpZnQiLCJzcGxpY2UiLCJ1bnNoaWZ0Il07ZnVuY3Rpb24geXQoYSx0KXth"
+    "Ll9jaGFydGpzP2EuX2NoYXJ0anMubGlzdGVuZXJzLnB1c2godCk6KE9iamVjdC5kZWZpbmVQcm9wZXJ0eShhLCJfY2hhcnRqcyIs"
+    "e2NvbmZpZ3VyYWJsZTohMCxlbnVtZXJhYmxlOiExLHZhbHVlOntsaXN0ZW5lcnM6W3RdfX0pLF90LmZvckVhY2godD0+e2NvbnN0"
+    "IGk9Il9vbkRhdGEiK0sodCkscz1hW3RdO09iamVjdC5kZWZpbmVQcm9wZXJ0eShhLHQse2NvbmZpZ3VyYWJsZTohMCxlbnVtZXJh"
+    "YmxlOiExLHZhbHVlKC4uLmUpe3ZhciB0PXMuYXBwbHkodGhpcyxlKTtyZXR1cm4gYS5fY2hhcnRqcy5saXN0ZW5lcnMuZm9yRWFj"
+    "aCh0PT57ImZ1bmN0aW9uIj09dHlwZW9mIHRbaV0mJnRbaV0oLi4uZSl9KSx0fX0pfSkpfWZ1bmN0aW9uIE10KGUsdCl7dmFyIGk9"
+    "ZS5fY2hhcnRqcztpZihpKXtjb25zdCBzPWkubGlzdGVuZXJzLGE9cy5pbmRleE9mKHQpOy0xIT09YSYmcy5zcGxpY2UoYSwxKSww"
+    "PHMubGVuZ3RofHwoX3QuZm9yRWFjaCh0PT57ZGVsZXRlIGVbdF19KSxkZWxldGUgZS5fY2hhcnRqcyl9fWZ1bmN0aW9uIHd0KHQp"
+    "e3ZhciBlPW5ldyBTZXQodCk7cmV0dXJuIGUuc2l6ZT09PXQubGVuZ3RoP3Q6QXJyYXkuZnJvbShlKX1jb25zdCBrdD0idW5kZWZp"
+    "bmVkIj09dHlwZW9mIHdpbmRvdz9mdW5jdGlvbih0KXtyZXR1cm4gdCgpfTp3aW5kb3cucmVxdWVzdEFuaW1hdGlvbkZyYW1lO2Z1"
+    "bmN0aW9uIFN0KGUsaSl7bGV0IHMsYT0hMTtyZXR1cm4gZnVuY3Rpb24oLi4udCl7cz10LGF8fChhPSEwLGt0LmNhbGwod2luZG93"
+    "LCgpPT57YT0hMSxlLmFwcGx5KGkscyl9KSl9fWZ1bmN0aW9uIFB0KGUsaSl7bGV0IHM7cmV0dXJuIGZ1bmN0aW9uKC4uLnQpe3Jl"
+    "dHVybiBpPyhjbGVhclRpbWVvdXQocykscz1zZXRUaW1lb3V0KGUsaSx0KSk6ZS5hcHBseSh0aGlzLHQpLGl9fWNvbnN0IER0PXQ9"
+    "PiJzdGFydCI9PT10PyJsZWZ0IjoiZW5kIj09PXQ/InJpZ2h0IjoiY2VudGVyIixFPSh0LGUsaSk9PiJzdGFydCI9PT10P2U6ImVu"
+    "ZCI9PT10P2k6KGUraSkvMixDdD0odCxlLGkscyk9PnQ9PT0ocz8ibGVmdCI6InJpZ2h0Iik/aToiY2VudGVyIj09PXQ/KGUraSkv"
+    "MjplO2Z1bmN0aW9uIE90KHQsZSxpKXt2YXIgcz1lLmxlbmd0aDtsZXQgYT0wLG49cztpZih0Ll9zb3J0ZWQpe2NvbnN0e2lTY2Fs"
+    "ZTpvLF9wYXJzZWQ6cn09dCxsPW8uYXhpcyx7bWluOmgsbWF4OmMsbWluRGVmaW5lZDpkLG1heERlZmluZWQ6dX09by5nZXRVc2Vy"
+    "Qm91bmRzKCk7ZCYmKGE9QyhNYXRoLm1pbihmKHIsbCxoKS5sbyxpP3M6ZihlLGwsby5nZXRQaXhlbEZvclZhbHVlKGgpKS5sbyks"
+    "MCxzLTEpKSxuPXU/QyhNYXRoLm1heChmKHIsby5heGlzLGMsITApLmhpKzEsaT8wOmYoZSxsLG8uZ2V0UGl4ZWxGb3JWYWx1ZShj"
+    "KSwhMCkuaGkrMSksYSxzKS1hOnMtYX1yZXR1cm57c3RhcnQ6YSxjb3VudDpufX1mdW5jdGlvbiBBdCh0KXt2YXJ7eFNjYWxlOmUs"
+    "eVNjYWxlOmksX3NjYWxlUmFuZ2VzOnN9PXQsYT17eG1pbjplLm1pbix4bWF4OmUubWF4LHltaW46aS5taW4seW1heDppLm1heH07"
+    "aWYoIXMpcmV0dXJuIHQuX3NjYWxlUmFuZ2VzPWEsITA7dD1zLnhtaW4hPT1lLm1pbnx8cy54bWF4IT09ZS5tYXh8fHMueW1pbiE9"
+    "PWkubWlufHxzLnltYXghPT1pLm1heDtyZXR1cm4gT2JqZWN0LmFzc2lnbihzLGEpLHR9dmFyIGw9bmV3IGNsYXNze2NvbnN0cnVj"
+    "dG9yKCl7dGhpcy5fcmVxdWVzdD1udWxsLHRoaXMuX2NoYXJ0cz1uZXcgTWFwLHRoaXMuX3J1bm5pbmc9ITEsdGhpcy5fbGFzdERh"
+    "dGU9dm9pZCAwfV9ub3RpZnkoZSxpLHMsdCl7Y29uc3QgYT1pLmxpc3RlbmVyc1t0XSxuPWkuZHVyYXRpb247YS5mb3JFYWNoKHQ9"
+    "PnQoe2NoYXJ0OmUsaW5pdGlhbDppLmluaXRpYWwsbnVtU3RlcHM6bixjdXJyZW50U3RlcDpNYXRoLm1pbihzLWkuc3RhcnQsbil9"
+    "KSl9X3JlZnJlc2goKXt0aGlzLl9yZXF1ZXN0fHwodGhpcy5fcnVubmluZz0hMCx0aGlzLl9yZXF1ZXN0PWt0LmNhbGwod2luZG93"
+    "LCgpPT57dGhpcy5fdXBkYXRlKCksdGhpcy5fcmVxdWVzdD1udWxsLHRoaXMuX3J1bm5pbmcmJnRoaXMuX3JlZnJlc2goKX0pKX1f"
+    "dXBkYXRlKG89RGF0ZS5ub3coKSl7bGV0IHI9MDt0aGlzLl9jaGFydHMuZm9yRWFjaCgocyxhKT0+e2lmKHMucnVubmluZyYmcy5p"
+    "dGVtcy5sZW5ndGgpe2NvbnN0IG49cy5pdGVtcztsZXQgdCxlPW4ubGVuZ3RoLTEsaT0hMTtmb3IoOzA8PWU7LS1lKSh0PW5bZV0p"
+    "Ll9hY3RpdmU/KHQuX3RvdGFsPnMuZHVyYXRpb24mJihzLmR1cmF0aW9uPXQuX3RvdGFsKSx0LnRpY2sobyksaT0hMCk6KG5bZV09"
+    "bltuLmxlbmd0aC0xXSxuLnBvcCgpKTtpJiYoYS5kcmF3KCksdGhpcy5fbm90aWZ5KGEscyxvLCJwcm9ncmVzcyIpKSxuLmxlbmd0"
+    "aHx8KHMucnVubmluZz0hMSx0aGlzLl9ub3RpZnkoYSxzLG8sImNvbXBsZXRlIikscy5pbml0aWFsPSExKSxyKz1uLmxlbmd0aH19"
+    "KSx0aGlzLl9sYXN0RGF0ZT1vLDA9PT1yJiYodGhpcy5fcnVubmluZz0hMSl9X2dldEFuaW1zKHQpe2NvbnN0IGU9dGhpcy5fY2hh"
+    "cnRzO2xldCBpPWUuZ2V0KHQpO3JldHVybiBpfHwoaT17cnVubmluZzohMSxpbml0aWFsOiEwLGl0ZW1zOltdLGxpc3RlbmVyczp7"
+    "Y29tcGxldGU6W10scHJvZ3Jlc3M6W119fSxlLnNldCh0LGkpKSxpfWxpc3Rlbih0LGUsaSl7dGhpcy5fZ2V0QW5pbXModCkubGlz"
+    "dGVuZXJzW2VdLnB1c2goaSl9YWRkKHQsZSl7ZSYmZS5sZW5ndGgmJnRoaXMuX2dldEFuaW1zKHQpLml0ZW1zLnB1c2goLi4uZSl9"
+    "aGFzKHQpe3JldHVybiAwPHRoaXMuX2dldEFuaW1zKHQpLml0ZW1zLmxlbmd0aH1zdGFydCh0KXtjb25zdCBlPXRoaXMuX2NoYXJ0"
+    "cy5nZXQodCk7ZSYmKGUucnVubmluZz0hMCxlLnN0YXJ0PURhdGUubm93KCksZS5kdXJhdGlvbj1lLml0ZW1zLnJlZHVjZSgodCxl"
+    "KT0+TWF0aC5tYXgodCxlLl9kdXJhdGlvbiksMCksdGhpcy5fcmVmcmVzaCgpKX1ydW5uaW5nKHQpe2lmKCF0aGlzLl9ydW5uaW5n"
+    "KXJldHVybiExO3Q9dGhpcy5fY2hhcnRzLmdldCh0KTtyZXR1cm4hISh0JiZ0LnJ1bm5pbmcmJnQuaXRlbXMubGVuZ3RoKX1zdG9w"
+    "KGUpe2NvbnN0IGk9dGhpcy5fY2hhcnRzLmdldChlKTtpZihpJiZpLml0ZW1zLmxlbmd0aCl7Y29uc3Qgcz1pLml0ZW1zO2xldCB0"
+    "PXMubGVuZ3RoLTE7Zm9yKDswPD10Oy0tdClzW3RdLmNhbmNlbCgpO2kuaXRlbXM9W10sdGhpcy5fbm90aWZ5KGUsaSxEYXRlLm5v"
+    "dygpLCJjb21wbGV0ZSIpfX1yZW1vdmUodCl7cmV0dXJuIHRoaXMuX2NoYXJ0cy5kZWxldGUodCl9fTtmdW5jdGlvbiBUdCh0KXty"
+    "ZXR1cm4gdCsuNXwwfWNvbnN0IEx0PSh0LGUsaSk9Pk1hdGgubWF4KE1hdGgubWluKHQsaSksZSk7ZnVuY3Rpb24gRXQodCl7cmV0"
+    "dXJuIEx0KFR0KDIuNTUqdCksMCwyNTUpfWZ1bmN0aW9uIFJ0KHQpe3JldHVybiBMdChUdCgyNTUqdCksMCwyNTUpfWZ1bmN0aW9u"
+    "IG8odCl7cmV0dXJuIEx0KFR0KHQvMi41NSkvMTAwLDAsMSl9ZnVuY3Rpb24gSXQodCl7cmV0dXJuIEx0KFR0KDEwMCp0KSwwLDEw"
+    "MCl9Y29uc3Qgbj17MDowLDE6MSwyOjIsMzozLDQ6NCw1OjUsNjo2LDc6Nyw4OjgsOTo5LEE6MTAsQjoxMSxDOjEyLEQ6MTMsRTox"
+    "NCxGOjE1LGE6MTAsYjoxMSxjOjEyLGQ6MTMsZToxNCxmOjE1fSx6dD1bLi4uIjAxMjM0NTY3ODlBQkNERUYiXSxGdD10PT56dFsx"
+    "NSZ0XSxWdD10PT56dFsoMjQwJnQpPj40XSt6dFsxNSZ0XSxCdD10PT4oMjQwJnQpPj40PT0oMTUmdCk7Y29uc3QgV3Q9L14oaHNs"
+    "YT98aHdifGhzdilcKFxzKihbLSsuZVxkXSspKD86ZGVnKT9bXHMsXSsoWy0rLmVcZF0rKSVbXHMsXSsoWy0rLmVcZF0rKSUoPzpb"
+    "XHMsXSsoWy0rLmVcZF0rKSglKT8pP1xzKlwpJC87ZnVuY3Rpb24gTnQoaSx0LHMpe2NvbnN0IGE9dCpNYXRoLm1pbihzLDEtcyks"
+    "ZT0odCxlPSh0K2kvMzApJTEyKT0+cy1hKk1hdGgubWF4KE1hdGgubWluKGUtMyw5LWUsMSksLTEpO3JldHVybltlKDApLGUoOCks"
+    "ZSg0KV19ZnVuY3Rpb24gSHQoaSxzLGEpe2k9KHQsZT0odCtpLzYwKSU2KT0+YS1hKnMqTWF0aC5tYXgoTWF0aC5taW4oZSw0LWUs"
+    "MSksMCk7cmV0dXJuW2koNSksaSgzKSxpKDEpXX1mdW5jdGlvbiBqdCh0LGUsaSl7Y29uc3Qgcz1OdCh0LDEsLjUpO2xldCBhO2Zv"
+    "cigxPGUraSYmKGUqPWE9MS8oZStpKSxpKj1hKSxhPTA7YTwzO2ErKylzW2FdKj0xLWUtaSxzW2FdKz1lO3JldHVybiBzfWZ1bmN0"
+    "aW9uIFl0KHQpe3ZhciBlPXQuci8yNTUsaT10LmcvMjU1LHQ9dC5iLzI1NSxzPU1hdGgubWF4KGUsaSx0KSxhPU1hdGgubWluKGUs"
+    "aSx0KSxuPShzK2EpLzI7bGV0IG8scixsO3JldHVybiBzIT09YSYmKGw9cy1hLHI9LjU8bj9sLygyLXMtYSk6bC8ocythKSxvPTYw"
+    "KihvPShhPWksaT10LCh0PWUpPT09cz8oYS1pKS9sKyhhPGk/NjowKTphPT09cz8oaS10KS9sKzI6KHQtYSkvbCs0KSkrLjUpLFsw"
+    "fG8scnx8MCxuXX1mdW5jdGlvbiAkdCh0LGUsaSxzKXtyZXR1cm4oQXJyYXkuaXNBcnJheShlKT90KGVbMF0sZVsxXSxlWzJdKTp0"
+    "KGUsaSxzKSkubWFwKFJ0KX1mdW5jdGlvbiBVdCh0LGUsaSl7cmV0dXJuICR0KE50LHQsZSxpKX1mdW5jdGlvbiBYdCh0KXtyZXR1"
+    "cm4odCUzNjArMzYwKSUzNjB9Y29uc3QgcXQ9e3g6ImRhcmsiLFo6ImxpZ2h0IixZOiJyZSIsWDoiYmx1IixXOiJnciIsVjoibWVk"
+    "aXVtIixVOiJzbGF0ZSIsQToiZWUiLFQ6Im9sIixTOiJvciIsQjoicmEiLEM6ImxhdGVnIixEOiJpZ2h0cyIsUjoiaW4iLFE6InR1"
+    "cnF1b2lzIixFOiJoaSIsUDoicm8iLE86ImFsIixOOiJsZSIsTToiZGUiLEw6InllbGxvIixGOiJlbiIsSzoiY2giLEc6ImFya3Mi"
+    "LEg6ImVhIixJOiJpZ2h0ZyIsSjoid2gifSxLdD17T2ljZVhlOiJmMGY4ZmYiLGFudGlxdWV3RXRlOiJmYWViZDciLGFxdWE6ImZm"
+    "ZmYiLGFxdWFtYXJSZToiN2ZmZmQ0IixhenVZOiJmMGZmZmYiLGJlaWdlOiJmNWY1ZGMiLGJpc3F1ZToiZmZlNGM0IixibGFjazoi"
+    "MCIsYmxhbktlZE9tb25kOiJmZmViY2QiLFhlOiJmZiIsWGV2aVRldDoiOGEyYmUyIixiUHduOiJhNTJhMmEiLGJ1cmx5d29vZDoi"
+    "ZGViODg3IixjYU10WGU6IjVmOWVhMCIsS2FydFl1c2U6IjdmZmYwMCIsS29jVGF0ZToiZDI2OTFlIixjU086ImZmN2Y1MCIsY1Nu"
+    "Zmxvd2VyWGU6IjY0OTVlZCIsY1Nuc2lsazoiZmZmOGRjIixjcmltc29uOiJkYzE0M2MiLGN5YW46ImZmZmYiLHhYZToiOGIiLHhj"
+    "eWFuOiI4YjhiIix4Z1RNblBkOiJiODg2MGIiLHhXYXk6ImE5YTlhOSIseGdZRjoiNjQwMCIseGdZeToiYTlhOWE5Iix4a2hha2k6"
+    "ImJkYjc2YiIseG1hZ0Z0YToiOGIwMDhiIix4VGl2ZWdZRjoiNTU2YjJmIix4U2FuZ2U6ImZmOGMwMCIseFNjRWQ6Ijk5MzJjYyIs"
+    "eFlkOiI4YjAwMDAiLHhzT21vbjoiZTk5NjdhIix4c0hnWUY6IjhmYmM4ZiIseFVYZToiNDgzZDhiIix4VVdheToiMmY0ZjRmIix4"
+    "VWdZeToiMmY0ZjRmIix4UWU6ImNlZDEiLHh2aVRldDoiOTQwMGQzIixkQXBwUms6ImZmMTQ5MyIsZEFwc2t5WGU6ImJmZmYiLGRp"
+    "bVdheToiNjk2OTY5IixkaW1nWXk6IjY5Njk2OSIsZG9kZ2VyWGU6IjFlOTBmZiIsZmlZYnJpY2s6ImIyMjIyMiIsZmxTT3dFdGU6"
+    "ImZmZmFmMCIsZm9Zc3RXQW46IjIyOGIyMiIsZnVLc2lhOiJmZjAwZmYiLGdhUnNiU286ImRjZGNkYyIsZ2hvc3R3RXRlOiJmOGY4"
+    "ZmYiLGdUZDoiZmZkNzAwIixnVE1uUGQ6ImRhYTUyMCIsV2F5OiI4MDgwODAiLGdZRjoiODAwMCIsZ1lGTHc6ImFkZmYyZiIsZ1l5"
+    "OiI4MDgwODAiLGhvbmV5TXc6ImYwZmZmMCIsaG90cFJrOiJmZjY5YjQiLFJkaWFuWWQ6ImNkNWM1YyIsUmRpZ286IjRiMDA4MiIs"
+    "aXZTeToiZmZmZmYwIixraGFraToiZjBlNjhjIixsYXZGTXI6ImU2ZTZmYSIsbGF2Rk1yWHNoOiJmZmYwZjUiLGxhd25nWUY6Ijdj"
+    "ZmMwMCIsTm1vbmNFZmZvbjoiZmZmYWNkIixaWGU6ImFkZDhlNiIsWmNTTzoiZjA4MDgwIixaY3lhbjoiZTBmZmZmIixaZ1RNblBk"
+    "THc6ImZhZmFkMiIsWldheToiZDNkM2QzIixaZ1lGOiI5MGVlOTAiLFpnWXk6ImQzZDNkMyIsWnBSazoiZmZiNmMxIixac09tb246"
+    "ImZmYTA3YSIsWnNIZ1lGOiIyMGIyYWEiLFpza3lYZToiODdjZWZhIixaVVdheToiNzc4ODk5IixaVWdZeToiNzc4ODk5Iixac3RB"
+    "bFhlOiJiMGM0ZGUiLFpMdzoiZmZmZmUwIixsaW1lOiJmZjAwIixsaW1lZ1lGOiIzMmNkMzIiLGxSRjoiZmFmMGU2IixtYWdGdGE6"
+    "ImZmMDBmZiIsbWFQb246IjgwMDAwMCIsVmFxdWFtYXJSZToiNjZjZGFhIixWWGU6ImNkIixWU2NFZDoiYmE1NWQzIixWcHVycE46"
+    "IjkzNzBkYiIsVnNIZ1lGOiIzY2IzNzEiLFZVWGU6IjdiNjhlZSIsVnNwclJnZ1lGOiJmYTlhIixWUWU6IjQ4ZDFjYyIsVnZpVGV0"
+    "WWQ6ImM3MTU4NSIsbWlkbmlnaHRYZToiMTkxOTcwIixtUnRjWWFtOiJmNWZmZmEiLG1pc3R5UHNlOiJmZmU0ZTEiLG1vY2Nhc1I6"
+    "ImZmZTRiNSIsbmF2YWpvd0V0ZToiZmZkZWFkIixuYXZ5OiI4MCIsVGRsYWNlOiJmZGY1ZTYiLFRpdmU6IjgwODAwMCIsVGl2ZWRC"
+    "YjoiNmI4ZTIzIixTYW5nZToiZmZhNTAwIixTYW5nZVlkOiJmZjQ1MDAiLFNjRWQ6ImRhNzBkNiIscE9lZ1RNblBkOiJlZWU4YWEi"
+    "LHBPZWdZRjoiOThmYjk4IixwT2VRZToiYWZlZWVlIixwT2V2aVRldFlkOiJkYjcwOTMiLHBhcGF5YXdFcDoiZmZlZmQ1IixwSEtw"
+    "dWZmOiJmZmRhYjkiLHBlcnU6ImNkODUzZiIscFJrOiJmZmMwY2IiLHBsdW06ImRkYTBkZCIscG93TXJYZToiYjBlMGU2IixwdXJw"
+    "TjoiODAwMDgwIixZYmVjY2FwdXJwTjoiNjYzMzk5IixZZDoiZmYwMDAwIixQc3licm93bjoiYmM4ZjhmIixQeU9YZToiNDE2OWUx"
+    "IixzYWRkTmJQd246IjhiNDUxMyIsc09tb246ImZhODA3MiIsc2FuZHliUHduOiJmNGE0NjAiLHNIZ1lGOiIyZThiNTciLHNIc2hl"
+    "bGw6ImZmZjVlZSIsc2lGbmE6ImEwNTIyZCIsc2lsdmVyOiJjMGMwYzAiLHNreVhlOiI4N2NlZWIiLFVYZToiNmE1YWNkIixVV2F5"
+    "OiI3MDgwOTAiLFVnWXk6IjcwODA5MCIsc25vdzoiZmZmYWZhIixzcHJSZ2dZRjoiZmY3ZiIsc3RBbFhlOiI0NjgyYjQiLHRhbjoi"
+    "ZDJiNDhjIix0ZU86IjgwODAiLHRFc3ROOiJkOGJmZDgiLHRvbWF0bzoiZmY2MzQ3IixRZToiNDBlMGQwIix2aVRldDoiZWU4MmVl"
+    "IixKSHQ6ImY1ZGViMyIsd0V0ZToiZmZmZmZmIix3RXRlc21va2U6ImY1ZjVmNSIsTHc6ImZmZmYwMCIsTHdnWUY6IjlhY2QzMiJ9"
+    "O2xldCBHdDtjb25zdCBadD0vXnJnYmE/XChccyooWy0rLlxkXSspKCUpP1tccyxdKyhbLSsuZVxkXSspKCUpP1tccyxdKyhbLSsu"
+    "ZVxkXSspKCUpPyg/OltccywvXSsoWy0rLmVcZF0rKSglKT8pP1xzKlwpJC8sSnQ9dD0+dDw9LjAwMzEzMDg/MTIuOTIqdDoxLjA1"
+    "NSpNYXRoLnBvdyh0LDEvMi40KS0uMDU1LFF0PXQ9PnQ8PS4wNDA0NT90LzEyLjkyOk1hdGgucG93KCh0Ky4wNTUpLzEuMDU1LDIu"
+    "NCk7ZnVuY3Rpb24gdGUoZSxpLHMpe2lmKGUpe2xldCB0PVl0KGUpO3RbaV09TWF0aC5tYXgoMCxNYXRoLm1pbih0W2ldK3RbaV0q"
+    "cywwPT09aT8zNjA6MSkpLHQ9VXQodCksZS5yPXRbMF0sZS5nPXRbMV0sZS5iPXRbMl19fWZ1bmN0aW9uIGVlKHQsZSl7cmV0dXJu"
+    "IHQmJk9iamVjdC5hc3NpZ24oZXx8e30sdCl9ZnVuY3Rpb24gaWUodCl7dmFyIGU9e3I6MCxnOjAsYjowLGE6MjU1fTtyZXR1cm4g"
+    "QXJyYXkuaXNBcnJheSh0KT8zPD10Lmxlbmd0aCYmKGU9e3I6dFswXSxnOnRbMV0sYjp0WzJdLGE6MjU1fSwzPHQubGVuZ3RoJiYo"
+    "ZS5hPVJ0KHRbM10pKSk6KGU9ZWUodCx7cjowLGc6MCxiOjAsYToxfSkpLmE9UnQoZS5hKSxlfWZ1bmN0aW9uIHNlKHQpe3JldHVy"
+    "bigiciI9PT10LmNoYXJBdCgwKT9mdW5jdGlvbih0KXt2YXIgZT1adC5leGVjKHQpO2xldCBpLHMsYSxuPTI1NTtpZihlKXtpZihl"
+    "WzddIT09aSl7Y29uc3QgdD0rZVs3XTtuPWVbOF0/RXQodCk6THQoMjU1KnQsMCwyNTUpfXJldHVybiBpPStlWzFdLHM9K2VbM10s"
+    "YT0rZVs1XSxpPTI1NSYoZVsyXT9FdChpKTpMdChpLDAsMjU1KSkscz0yNTUmKGVbNF0/RXQocyk6THQocywwLDI1NSkpLGE9MjU1"
+    "JihlWzZdP0V0KGEpOkx0KGEsMCwyNTUpKSx7cjppLGc6cyxiOmEsYTpufX19OmZ1bmN0aW9uKHQpe3ZhciBlLGkscyx0PVd0LmV4"
+    "ZWModCk7bGV0IGEsbj0yNTU7aWYodClyZXR1cm4gdm9pZCAwIT09dFs1XSYmKG49KHRbNl0/RXQ6UnQpKCt0WzVdKSksZT1YdCgr"
+    "dFsyXSksaT0rdFszXS8xMDAscz0rdFs0XS8xMDAse3I6KGE9Imh3YiI9PT10WzFdPyR0KGp0LGUsaSxzKToiaHN2Ij09PXRbMV0/"
+    "JHQoSHQsZSxpLHMpOlV0KGUsaSxzKSlbMF0sZzphWzFdLGI6YVsyXSxhOm59fSkodCl9Y2xhc3MgYWV7Y29uc3RydWN0b3IodCl7"
+    "aWYodCBpbnN0YW5jZW9mIGFlKXJldHVybiB0O3ZhciBlLGkscz10eXBlb2YgdDtsZXQgYTsib2JqZWN0Ij09cz9hPWllKHQpOiJz"
+    "dHJpbmciPT1zJiYoaT0ocz10KS5sZW5ndGgsIiMiPT09c1swXSYmKDQ9PT1pfHw1PT09aT9lPXtyOjI1NSYxNypuW3NbMV1dLGc6"
+    "MjU1JjE3Km5bc1syXV0sYjoyNTUmMTcqbltzWzNdXSxhOjU9PT1pPzE3Km5bc1s0XV06MjU1fTo3IT09aSYmOSE9PWl8fChlPXty"
+    "Om5bc1sxXV08PDR8bltzWzJdXSxnOm5bc1szXV08PDR8bltzWzRdXSxiOm5bc1s1XV08PDR8bltzWzZdXSxhOjk9PT1pP25bc1s3"
+    "XV08PDR8bltzWzhdXToyNTV9KSksYT1lfHwoaT10LEd0fHwoKEd0PWZ1bmN0aW9uKCl7Y29uc3QgdD17fSxlPU9iamVjdC5rZXlz"
+    "KEt0KSxpPU9iamVjdC5rZXlzKHF0KTtsZXQgcyxhLG4sbyxyO2ZvcihzPTA7czxlLmxlbmd0aDtzKyspe2ZvcihvPXI9ZVtzXSxh"
+    "PTA7YTxpLmxlbmd0aDthKyspbj1pW2FdLHI9ci5yZXBsYWNlKG4scXRbbl0pO249cGFyc2VJbnQoS3Rbb10sMTYpLHRbcl09W24+"
+    "PjE2JjI1NSxuPj44JjI1NSwyNTUmbl19cmV0dXJuIHR9KCkpLnRyYW5zcGFyZW50PVswLDAsMCwwXSksKGk9R3RbaS50b0xvd2Vy"
+    "Q2FzZSgpXSkmJntyOmlbMF0sZzppWzFdLGI6aVsyXSxhOjQ9PT1pLmxlbmd0aD9pWzNdOjI1NX0pfHxzZSh0KSksdGhpcy5fcmdi"
+    "PWEsdGhpcy5fdmFsaWQ9ISFhfWdldCB2YWxpZCgpe3JldHVybiB0aGlzLl92YWxpZH1nZXQgcmdiKCl7dmFyIHQ9ZWUodGhpcy5f"
+    "cmdiKTtyZXR1cm4gdCYmKHQuYT1vKHQuYSkpLHR9c2V0IHJnYih0KXt0aGlzLl9yZ2I9aWUodCl9cmdiU3RyaW5nKCl7cmV0dXJu"
+    "IHRoaXMuX3ZhbGlkPyh0PXRoaXMuX3JnYikmJih0LmE8MjU1P2ByZ2JhKCR7dC5yfSwgJHt0Lmd9LCAke3QuYn0sICR7byh0LmEp"
+    "fSlgOmByZ2IoJHt0LnJ9LCAke3QuZ30sICR7dC5ifSlgKTp2b2lkIDA7dmFyIHR9aGV4U3RyaW5nKCl7cmV0dXJuIHRoaXMuX3Zh"
+    "bGlkPyh0PXRoaXMuX3JnYixlPXQsZT1CdChlLnIpJiZCdChlLmcpJiZCdChlLmIpJiZCdChlLmEpP0Z0OlZ0LHQ/IiMiK2UodC5y"
+    "KStlKHQuZykrZSh0LmIpKygodD10LmEpPDI1NT9lKHQpOiIiKTp2b2lkIDApOnZvaWQgMDt2YXIgdCxlfWhzbFN0cmluZygpe2lm"
+    "KHRoaXMuX3ZhbGlkKXt2YXIgdCxlLGkscz10aGlzLl9yZ2I7aWYocylyZXR1cm4gaT1ZdChzKSx0PWlbMF0sZT1JdChpWzFdKSxp"
+    "PUl0KGlbMl0pLHMuYTwyNTU/YGhzbGEoJHt0fSwgJHtlfSUsICR7aX0lLCAke28ocy5hKX0pYDpgaHNsKCR7dH0sICR7ZX0lLCAk"
+    "e2l9JSlgfX1taXgodCxlKXtpZih0KXtjb25zdCBzPXRoaXMucmdiLGE9dC5yZ2I7dmFyIHQ9dm9pZCAwPT09ZT8uNTplLGU9Mip0"
+    "LTEsaT1zLmEtYS5hLGU9KDErKGUqaT09LTE/ZTooZStpKS8oMStlKmkpKSkvMixpPTEtZTtzLnI9MjU1JmUqcy5yK2kqYS5yKy41"
+    "LHMuZz0yNTUmZSpzLmcraSphLmcrLjUscy5iPTI1NSZlKnMuYitpKmEuYisuNSxzLmE9dCpzLmErKDEtdCkqYS5hLHRoaXMucmdi"
+    "PXN9cmV0dXJuIHRoaXN9aW50ZXJwb2xhdGUodCxlKXtyZXR1cm4gdCYmKHRoaXMuX3JnYj0oaT10aGlzLl9yZ2IsdD10Ll9yZ2Is"
+    "ZT1lLHM9UXQobyhpLnIpKSxhPVF0KG8oaS5nKSksbj1RdChvKGkuYikpLHtyOlJ0KEp0KHMrZSooUXQobyh0LnIpKS1zKSkpLGc6"
+    "UnQoSnQoYStlKihRdChvKHQuZykpLWEpKSksYjpSdChKdChuK2UqKFF0KG8odC5iKSktbikpKSxhOmkuYStlKih0LmEtaS5hKX0p"
+    "KSx0aGlzO3ZhciBpLHMsYSxufWNsb25lKCl7cmV0dXJuIG5ldyBhZSh0aGlzLnJnYil9YWxwaGEodCl7cmV0dXJuIHRoaXMuX3Jn"
+    "Yi5hPVJ0KHQpLHRoaXN9Y2xlYXJlcih0KXtyZXR1cm4gdGhpcy5fcmdiLmEqPTEtdCx0aGlzfWdyZXlzY2FsZSgpe2NvbnN0IHQ9"
+    "dGhpcy5fcmdiLGU9VHQoLjMqdC5yKy41OSp0LmcrLjExKnQuYik7cmV0dXJuIHQucj10Lmc9dC5iPWUsdGhpc31vcGFxdWVyKHQp"
+    "e3JldHVybiB0aGlzLl9yZ2IuYSo9MSt0LHRoaXN9bmVnYXRlKCl7Y29uc3QgdD10aGlzLl9yZ2I7cmV0dXJuIHQucj0yNTUtdC5y"
+    "LHQuZz0yNTUtdC5nLHQuYj0yNTUtdC5iLHRoaXN9bGlnaHRlbih0KXtyZXR1cm4gdGUodGhpcy5fcmdiLDIsdCksdGhpc31kYXJr"
+    "ZW4odCl7cmV0dXJuIHRlKHRoaXMuX3JnYiwyLC10KSx0aGlzfXNhdHVyYXRlKHQpe3JldHVybiB0ZSh0aGlzLl9yZ2IsMSx0KSx0"
+    "aGlzfWRlc2F0dXJhdGUodCl7cmV0dXJuIHRlKHRoaXMuX3JnYiwxLC10KSx0aGlzfXJvdGF0ZSh0KXtyZXR1cm4gZT10aGlzLl9y"
+    "Z2IsdD10LChpPVl0KGUpKVswXT1YdChpWzBdK3QpLGk9VXQoaSksZS5yPWlbMF0sZS5nPWlbMV0sZS5iPWlbMl0sdGhpczt2YXIg"
+    "ZSxpfX1mdW5jdGlvbiBuZSh0KXtyZXR1cm4hKCF0fHwib2JqZWN0IiE9dHlwZW9mIHQpJiYoIltvYmplY3QgQ2FudmFzUGF0dGVy"
+    "bl0iPT09KHQ9dC50b1N0cmluZygpKXx8IltvYmplY3QgQ2FudmFzR3JhZGllbnRdIj09PXQpfWZ1bmN0aW9uIG9lKHQpe3JldHVy"
+    "biBuZSh0KT90Om5ldyBhZSh0KX1mdW5jdGlvbiByZSh0KXtyZXR1cm4gbmUodCk/dDpuZXcgYWUodCkuc2F0dXJhdGUoLjUpLmRh"
+    "cmtlbiguMSkuaGV4U3RyaW5nKCl9Y29uc3QgbGU9WyJ4IiwieSIsImJvcmRlcldpZHRoIiwicmFkaXVzIiwidGVuc2lvbiJdLGhl"
+    "PVsiY29sb3IiLCJib3JkZXJDb2xvciIsImJhY2tncm91bmRDb2xvciJdLGNlPW5ldyBNYXA7ZnVuY3Rpb24gZGUodCxlLGEpe3Jl"
+    "dHVybiBmdW5jdGlvbih0LGUpe2U9YXx8e307dmFyIGk9dCtKU09OLnN0cmluZ2lmeShlKTtsZXQgcz1jZS5nZXQoaSk7cmV0dXJu"
+    "IHN8fChzPW5ldyBJbnRsLk51bWJlckZvcm1hdCh0LGUpLGNlLnNldChpLHMpKSxzfShlKS5mb3JtYXQodCl9Y29uc3QgdWU9e3Zh"
+    "bHVlczp0PT5PKHQpP3Q6IiIrdCxudW1lcmljKHQsZSxpKXtpZigwPT09dClyZXR1cm4iMCI7dmFyIHM9dGhpcy5jaGFydC5vcHRp"
+    "b25zLmxvY2FsZTtsZXQgYSxuPXQ7aWYoMTxpLmxlbmd0aCl7Y29uc3QgZT1NYXRoLm1heChNYXRoLmFicyhpWzBdLnZhbHVlKSxN"
+    "YXRoLmFicyhpW2kubGVuZ3RoLTFdLnZhbHVlKSk7KGU8MWUtNHx8MWUxNTxlKSYmKGE9InNjaWVudGlmaWMiKSxuPWZ1bmN0aW9u"
+    "KHQpe2xldCBlPTM8aS5sZW5ndGg/aVsyXS52YWx1ZS1pWzFdLnZhbHVlOmlbMV0udmFsdWUtaVswXS52YWx1ZTtyZXR1cm4gZT0x"
+    "PD1NYXRoLmFicyhlKSYmdCE9PU1hdGguZmxvb3IodCk/dC1NYXRoLmZsb29yKHQpOmV9KHQpfXZhciBvPXIoTWF0aC5hYnMobikp"
+    "LG89aXNOYU4obyk/MTpNYXRoLm1heChNYXRoLm1pbigtMSpNYXRoLmZsb29yKG8pLDIwKSwwKSxvPXtub3RhdGlvbjphLG1pbmlt"
+    "dW1GcmFjdGlvbkRpZ2l0czpvLG1heGltdW1GcmFjdGlvbkRpZ2l0czpvfTtyZXR1cm4gT2JqZWN0LmFzc2lnbihvLHRoaXMub3B0"
+    "aW9ucy50aWNrcy5mb3JtYXQpLGRlKHQscyxvKX0sbG9nYXJpdGhtaWModCxlLGkpe2lmKDA9PT10KXJldHVybiIwIjt2YXIgcz1p"
+    "W2VdLnNpZ25pZmljYW5kfHx0L01hdGgucG93KDEwLE1hdGguZmxvb3Iocih0KSkpO3JldHVyblsxLDIsMyw1LDEwLDE1XS5pbmNs"
+    "dWRlcyhzKXx8ZT4uOCppLmxlbmd0aD91ZS5udW1lcmljLmNhbGwodGhpcyx0LGUsaSk6IiJ9fTt2YXIgZ2U9e2Zvcm1hdHRlcnM6"
+    "dWV9O2NvbnN0IGZlPU9iamVjdC5jcmVhdGUobnVsbCkscGU9T2JqZWN0LmNyZWF0ZShudWxsKTtmdW5jdGlvbiBtZShpLHQpe2lm"
+    "KCF0KXJldHVybiBpO3ZhciBzPXQuc3BsaXQoIi4iKTtmb3IobGV0IHQ9MCxlPXMubGVuZ3RoO3Q8ZTsrK3Qpe3ZhciBhPXNbdF07"
+    "aT1pW2FdfHwoaVthXT1PYmplY3QuY3JlYXRlKG51bGwpKX1yZXR1cm4gaX1mdW5jdGlvbiBiZSh0LGUsaSl7cmV0dXJuInN0cmlu"
+    "ZyI9PXR5cGVvZiBlP1kobWUodCxlKSxpKTpZKG1lKHQsIiIpLGUpfXZhciBSPW5ldyBjbGFzc3tjb25zdHJ1Y3Rvcih0LGUpe3Ro"
+    "aXMuYW5pbWF0aW9uPXZvaWQgMCx0aGlzLmJhY2tncm91bmRDb2xvcj0icmdiYSgwLDAsMCwwLjEpIix0aGlzLmJvcmRlckNvbG9y"
+    "PSJyZ2JhKDAsMCwwLDAuMSkiLHRoaXMuY29sb3I9IiM2NjYiLHRoaXMuZGF0YXNldHM9e30sdGhpcy5kZXZpY2VQaXhlbFJhdGlv"
+    "PXQ9PnQuY2hhcnQucGxhdGZvcm0uZ2V0RGV2aWNlUGl4ZWxSYXRpbygpLHRoaXMuZWxlbWVudHM9e30sdGhpcy5ldmVudHM9WyJt"
+    "b3VzZW1vdmUiLCJtb3VzZW91dCIsImNsaWNrIiwidG91Y2hzdGFydCIsInRvdWNobW92ZSJdLHRoaXMuZm9udD17ZmFtaWx5OiIn"
+    "SGVsdmV0aWNhIE5ldWUnLCAnSGVsdmV0aWNhJywgJ0FyaWFsJywgc2Fucy1zZXJpZiIsc2l6ZToxMixzdHlsZToibm9ybWFsIixs"
+    "aW5lSGVpZ2h0OjEuMix3ZWlnaHQ6bnVsbH0sdGhpcy5ob3Zlcj17fSx0aGlzLmhvdmVyQmFja2dyb3VuZENvbG9yPSh0LGUpPT5y"
+    "ZShlLmJhY2tncm91bmRDb2xvciksdGhpcy5ob3ZlckJvcmRlckNvbG9yPSh0LGUpPT5yZShlLmJvcmRlckNvbG9yKSx0aGlzLmhv"
+    "dmVyQ29sb3I9KHQsZSk9PnJlKGUuY29sb3IpLHRoaXMuaW5kZXhBeGlzPSJ4Iix0aGlzLmludGVyYWN0aW9uPXttb2RlOiJuZWFy"
+    "ZXN0IixpbnRlcnNlY3Q6ITAsaW5jbHVkZUludmlzaWJsZTohMX0sdGhpcy5tYWludGFpbkFzcGVjdFJhdGlvPSEwLHRoaXMub25I"
+    "b3Zlcj1udWxsLHRoaXMub25DbGljaz1udWxsLHRoaXMucGFyc2luZz0hMCx0aGlzLnBsdWdpbnM9e30sdGhpcy5yZXNwb25zaXZl"
+    "PSEwLHRoaXMuc2NhbGU9dm9pZCAwLHRoaXMuc2NhbGVzPXt9LHRoaXMuc2hvd0xpbmU9ITAsdGhpcy5kcmF3QWN0aXZlRWxlbWVu"
+    "dHNPblRvcD0hMCx0aGlzLmRlc2NyaWJlKHQpLHRoaXMuYXBwbHkoZSl9c2V0KHQsZSl7cmV0dXJuIGJlKHRoaXMsdCxlKX1nZXQo"
+    "dCl7cmV0dXJuIG1lKHRoaXMsdCl9ZGVzY3JpYmUodCxlKXtyZXR1cm4gYmUocGUsdCxlKX1vdmVycmlkZSh0LGUpe3JldHVybiBi"
+    "ZShmZSx0LGUpfXJvdXRlKHQsZSxpLHMpe2NvbnN0IGE9bWUodGhpcyx0KSxuPW1lKHRoaXMsaSksbz0iXyIrZTtPYmplY3QuZGVm"
+    "aW5lUHJvcGVydGllcyhhLHtbb106e3ZhbHVlOmFbZV0sd3JpdGFibGU6ITB9LFtlXTp7ZW51bWVyYWJsZTohMCxnZXQoKXt2YXIg"
+    "dD10aGlzW29dLGU9bltzXTtyZXR1cm4gQSh0KT9PYmplY3QuYXNzaWduKHt9LGUsdCk6VCh0LGUpfSxzZXQodCl7dGhpc1tvXT10"
+    "fX19KX1hcHBseSh0KXt0LmZvckVhY2godD0+dCh0aGlzKSl9fSh7X3NjcmlwdGFibGU6dD0+IXQuc3RhcnRzV2l0aCgib24iKSxf"
+    "aW5kZXhhYmxlOnQ9PiJldmVudHMiIT09dCxob3Zlcjp7X2ZhbGxiYWNrOiJpbnRlcmFjdGlvbiJ9LGludGVyYWN0aW9uOntfc2Ny"
+    "aXB0YWJsZTohMSxfaW5kZXhhYmxlOiExfX0sW2Z1bmN0aW9uKHQpe3Quc2V0KCJhbmltYXRpb24iLHtkZWxheTp2b2lkIDAsZHVy"
+    "YXRpb246MWUzLGVhc2luZzoiZWFzZU91dFF1YXJ0Iixmbjp2b2lkIDAsZnJvbTp2b2lkIDAsbG9vcDp2b2lkIDAsdG86dm9pZCAw"
+    "LHR5cGU6dm9pZCAwfSksdC5kZXNjcmliZSgiYW5pbWF0aW9uIix7X2ZhbGxiYWNrOiExLF9pbmRleGFibGU6ITEsX3NjcmlwdGFi"
+    "bGU6dD0+Im9uUHJvZ3Jlc3MiIT09dCYmIm9uQ29tcGxldGUiIT09dCYmImZuIiE9PXR9KSx0LnNldCgiYW5pbWF0aW9ucyIse2Nv"
+    "bG9yczp7dHlwZToiY29sb3IiLHByb3BlcnRpZXM6aGV9LG51bWJlcnM6e3R5cGU6Im51bWJlciIscHJvcGVydGllczpsZX19KSx0"
+    "LmRlc2NyaWJlKCJhbmltYXRpb25zIix7X2ZhbGxiYWNrOiJhbmltYXRpb24ifSksdC5zZXQoInRyYW5zaXRpb25zIix7YWN0aXZl"
+    "OnthbmltYXRpb246e2R1cmF0aW9uOjQwMH19LHJlc2l6ZTp7YW5pbWF0aW9uOntkdXJhdGlvbjowfX0sc2hvdzp7YW5pbWF0aW9u"
+    "czp7Y29sb3JzOntmcm9tOiJ0cmFuc3BhcmVudCJ9LHZpc2libGU6e3R5cGU6ImJvb2xlYW4iLGR1cmF0aW9uOjB9fX0saGlkZTp7"
+    "YW5pbWF0aW9uczp7Y29sb3JzOnt0bzoidHJhbnNwYXJlbnQifSx2aXNpYmxlOnt0eXBlOiJib29sZWFuIixlYXNpbmc6ImxpbmVh"
+    "ciIsZm46dD0+MHx0fX19fSl9LGZ1bmN0aW9uKHQpe3Quc2V0KCJsYXlvdXQiLHthdXRvUGFkZGluZzohMCxwYWRkaW5nOnt0b3A6"
+    "MCxyaWdodDowLGJvdHRvbTowLGxlZnQ6MH19KX0sZnVuY3Rpb24odCl7dC5zZXQoInNjYWxlIix7ZGlzcGxheTohMCxvZmZzZXQ6"
+    "ITEscmV2ZXJzZTohMSxiZWdpbkF0WmVybzohMSxib3VuZHM6InRpY2tzIixjbGlwOiEwLGdyYWNlOjAsZ3JpZDp7ZGlzcGxheToh"
+    "MCxsaW5lV2lkdGg6MSxkcmF3T25DaGFydEFyZWE6ITAsZHJhd1RpY2tzOiEwLHRpY2tMZW5ndGg6OCx0aWNrV2lkdGg6KHQsZSk9"
+    "PmUubGluZVdpZHRoLHRpY2tDb2xvcjoodCxlKT0+ZS5jb2xvcixvZmZzZXQ6ITF9LGJvcmRlcjp7ZGlzcGxheTohMCxkYXNoOltd"
+    "LGRhc2hPZmZzZXQ6MCx3aWR0aDoxfSx0aXRsZTp7ZGlzcGxheTohMSx0ZXh0OiIiLHBhZGRpbmc6e3RvcDo0LGJvdHRvbTo0fX0s"
+    "dGlja3M6e21pblJvdGF0aW9uOjAsbWF4Um90YXRpb246NTAsbWlycm9yOiExLHRleHRTdHJva2VXaWR0aDowLHRleHRTdHJva2VD"
+    "b2xvcjoiIixwYWRkaW5nOjMsZGlzcGxheTohMCxhdXRvU2tpcDohMCxhdXRvU2tpcFBhZGRpbmc6MyxsYWJlbE9mZnNldDowLGNh"
+    "bGxiYWNrOmdlLmZvcm1hdHRlcnMudmFsdWVzLG1pbm9yOnt9LG1ham9yOnt9LGFsaWduOiJjZW50ZXIiLGNyb3NzQWxpZ246Im5l"
+    "YXIiLHNob3dMYWJlbEJhY2tkcm9wOiExLGJhY2tkcm9wQ29sb3I6InJnYmEoMjU1LCAyNTUsIDI1NSwgMC43NSkiLGJhY2tkcm9w"
+    "UGFkZGluZzoyfX0pLHQucm91dGUoInNjYWxlLnRpY2tzIiwiY29sb3IiLCIiLCJjb2xvciIpLHQucm91dGUoInNjYWxlLmdyaWQi"
+    "LCJjb2xvciIsIiIsImJvcmRlckNvbG9yIiksdC5yb3V0ZSgic2NhbGUuYm9yZGVyIiwiY29sb3IiLCIiLCJib3JkZXJDb2xvciIp"
+    "LHQucm91dGUoInNjYWxlLnRpdGxlIiwiY29sb3IiLCIiLCJjb2xvciIpLHQuZGVzY3JpYmUoInNjYWxlIix7X2ZhbGxiYWNrOiEx"
+    "LF9zY3JpcHRhYmxlOnQ9PiF0LnN0YXJ0c1dpdGgoImJlZm9yZSIpJiYhdC5zdGFydHNXaXRoKCJhZnRlciIpJiYiY2FsbGJhY2si"
+    "IT09dCYmInBhcnNlciIhPT10LF9pbmRleGFibGU6dD0+ImJvcmRlckRhc2giIT09dCYmInRpY2tCb3JkZXJEYXNoIiE9PXQmJiJk"
+    "YXNoIiE9PXR9KSx0LmRlc2NyaWJlKCJzY2FsZXMiLHtfZmFsbGJhY2s6InNjYWxlIn0pLHQuZGVzY3JpYmUoInNjYWxlLnRpY2tz"
+    "Iix7X3NjcmlwdGFibGU6dD0+ImJhY2tkcm9wUGFkZGluZyIhPT10JiYiY2FsbGJhY2siIT09dCxfaW5kZXhhYmxlOnQ9PiJiYWNr"
+    "ZHJvcFBhZGRpbmciIT09dH0pfV0pO2Z1bmN0aW9uIHhlKCl7cmV0dXJuInVuZGVmaW5lZCIhPXR5cGVvZiB3aW5kb3cmJiJ1bmRl"
+    "ZmluZWQiIT10eXBlb2YgZG9jdW1lbnR9ZnVuY3Rpb24gdmUodCl7bGV0IGU9dC5wYXJlbnROb2RlO3JldHVybiBlPWUmJiJbb2Jq"
+    "ZWN0IFNoYWRvd1Jvb3RdIj09PWUudG9TdHJpbmcoKT9lLmhvc3Q6ZX1mdW5jdGlvbiBfZSh0LGUsaSl7bGV0IHM7cmV0dXJuInN0"
+    "cmluZyI9PXR5cGVvZiB0PyhzPXBhcnNlSW50KHQsMTApLC0xIT09dC5pbmRleE9mKCIlIikmJihzPXMvMTAwKmUucGFyZW50Tm9k"
+    "ZVtpXSkpOnM9dCxzfWNvbnN0IHllPXQ9PnQub3duZXJEb2N1bWVudC5kZWZhdWx0Vmlldy5nZXRDb21wdXRlZFN0eWxlKHQsbnVs"
+    "bCk7ZnVuY3Rpb24gTWUodCxlKXtyZXR1cm4geWUodCkuZ2V0UHJvcGVydHlWYWx1ZShlKX1jb25zdCB3ZT1bInRvcCIsInJpZ2h0"
+    "IiwiYm90dG9tIiwibGVmdCJdO2Z1bmN0aW9uIGtlKGUsaSxzKXtjb25zdCBhPXt9O3M9cz8iLSIrczoiIjtmb3IobGV0IHQ9MDt0"
+    "PDQ7dCsrKXt2YXIgbj13ZVt0XTthW25dPXBhcnNlRmxvYXQoZVtpKyItIituK3NdKXx8MH1yZXR1cm4gYS53aWR0aD1hLmxlZnQr"
+    "YS5yaWdodCxhLmhlaWdodD1hLnRvcCthLmJvdHRvbSxhfWZ1bmN0aW9uIFNlKHQsZSl7aWYoIm5hdGl2ZSJpbiB0KXJldHVybiB0"
+    "O3ZhcntjYW52YXM6aSxjdXJyZW50RGV2aWNlUGl4ZWxSYXRpbzpzfT1lLGE9eWUoaSksbj0iYm9yZGVyLWJveCI9PT1hLmJveFNp"
+    "emluZyxvPWtlKGEsInBhZGRpbmciKSxhPWtlKGEsImJvcmRlciIsIndpZHRoIikse3g6dCx5OnIsYm94Omx9PWZ1bmN0aW9uKHQs"
+    "ZSl7dmFyIGkscz10LnRvdWNoZXMscz1zJiZzLmxlbmd0aD9zWzBdOnQse29mZnNldFg6YSxvZmZzZXRZOm59PXM7bGV0IG8scixs"
+    "PSExO2lmKGk9bix0PXQudGFyZ2V0LCEoMDxhfHwwPGkpfHx0JiZ0LnNoYWRvd1Jvb3Qpe2NvbnN0IHQ9ZS5nZXRCb3VuZGluZ0Ns"
+    "aWVudFJlY3QoKTtvPXMuY2xpZW50WC10LmxlZnQscj1zLmNsaWVudFktdC50b3AsbD0hMH1lbHNlIG89YSxyPW47cmV0dXJue3g6"
+    "byx5OnIsYm94Omx9fSh0LGkpLGg9by5sZWZ0KyhsJiZhLmxlZnQpLGw9by50b3ArKGwmJmEudG9wKTtsZXR7d2lkdGg6YyxoZWln"
+    "aHQ6ZH09ZTtyZXR1cm4gbiYmKGMtPW8ud2lkdGgrYS53aWR0aCxkLT1vLmhlaWdodCthLmhlaWdodCkse3g6TWF0aC5yb3VuZCgo"
+    "dC1oKS9jKmkud2lkdGgvcykseTpNYXRoLnJvdW5kKChyLWwpL2QqaS5oZWlnaHQvcyl9fWNvbnN0IFBlPXQ9Pk1hdGgucm91bmQo"
+    "MTAqdCkvMTA7ZnVuY3Rpb24gRGUodCxlLGkscyl7dmFyIGE9eWUodCksbj1rZShhLCJtYXJnaW4iKSxvPV9lKGEubWF4V2lkdGgs"
+    "dCwiY2xpZW50V2lkdGgiKXx8dHQscj1fZShhLm1heEhlaWdodCx0LCJjbGllbnRIZWlnaHQiKXx8dHQsdD1mdW5jdGlvbih0LGUs"
+    "aSl7bGV0IHMsYTtpZih2b2lkIDA9PT1lfHx2b2lkIDA9PT1pKXtjb25zdCBuPXZlKHQpO2lmKG4pe2NvbnN0IHQ9bi5nZXRCb3Vu"
+    "ZGluZ0NsaWVudFJlY3QoKSxvPXllKG4pLHI9a2UobywiYm9yZGVyIiwid2lkdGgiKSxsPWtlKG8sInBhZGRpbmciKTtlPXQud2lk"
+    "dGgtbC53aWR0aC1yLndpZHRoLGk9dC5oZWlnaHQtbC5oZWlnaHQtci5oZWlnaHQscz1fZShvLm1heFdpZHRoLG4sImNsaWVudFdp"
+    "ZHRoIiksYT1fZShvLm1heEhlaWdodCxuLCJjbGllbnRIZWlnaHQiKX1lbHNlIGU9dC5jbGllbnRXaWR0aCxpPXQuY2xpZW50SGVp"
+    "Z2h0fXJldHVybnt3aWR0aDplLGhlaWdodDppLG1heFdpZHRoOnN8fHR0LG1heEhlaWdodDphfHx0dH19KHQsZSxpKTtsZXR7d2lk"
+    "dGg6bCxoZWlnaHQ6aH09dDtpZigiY29udGVudC1ib3giPT09YS5ib3hTaXppbmcpe2NvbnN0IHQ9a2UoYSwiYm9yZGVyIiwid2lk"
+    "dGgiKSxlPWtlKGEsInBhZGRpbmciKTtsLT1lLndpZHRoK3Qud2lkdGgsaC09ZS5oZWlnaHQrdC5oZWlnaHR9cmV0dXJuIGw9TWF0"
+    "aC5tYXgoMCxsLW4ud2lkdGgpLGg9TWF0aC5tYXgoMCxzP2wvczpoLW4uaGVpZ2h0KSxsPVBlKE1hdGgubWluKGwsbyx0Lm1heFdp"
+    "ZHRoKSksaD1QZShNYXRoLm1pbihoLHIsdC5tYXhIZWlnaHQpKSxsJiYhaCYmKGg9UGUobC8yKSksKHZvaWQgMCE9PWV8fHZvaWQg"
+    "MCE9PWkpJiZzJiZ0LmhlaWdodCYmaD50LmhlaWdodCYmKGg9dC5oZWlnaHQsbD1QZShNYXRoLmZsb29yKGgqcykpKSx7d2lkdGg6"
+    "bCxoZWlnaHQ6aH19ZnVuY3Rpb24gQ2UodCxlLGkpe3ZhciBlPWV8fDEscz1NYXRoLmZsb29yKHQuaGVpZ2h0KmUpLGE9TWF0aC5m"
+    "bG9vcih0LndpZHRoKmUpO3QuaGVpZ2h0PU1hdGguZmxvb3IodC5oZWlnaHQpLHQud2lkdGg9TWF0aC5mbG9vcih0LndpZHRoKTtj"
+    "b25zdCBuPXQuY2FudmFzO3JldHVybiBuLnN0eWxlJiYoaXx8IW4uc3R5bGUuaGVpZ2h0JiYhbi5zdHlsZS53aWR0aCkmJihuLnN0"
+    "eWxlLmhlaWdodD10LmhlaWdodCsicHgiLG4uc3R5bGUud2lkdGg9dC53aWR0aCsicHgiKSwodC5jdXJyZW50RGV2aWNlUGl4ZWxS"
+    "YXRpbyE9PWV8fG4uaGVpZ2h0IT09c3x8bi53aWR0aCE9PWEpJiYodC5jdXJyZW50RGV2aWNlUGl4ZWxSYXRpbz1lLG4uaGVpZ2h0"
+    "PXMsbi53aWR0aD1hLHQuY3R4LnNldFRyYW5zZm9ybShlLDAsMCxlLDAsMCksITApfXZhciBPZT1mdW5jdGlvbigpe2xldCB0PSEx"
+    "O3RyeXt2YXIgZT17Z2V0IHBhc3NpdmUoKXtyZXR1cm4hKHQ9ITApfX07eGUoKSYmKHdpbmRvdy5hZGRFdmVudExpc3RlbmVyKCJ0"
+    "ZXN0IixudWxsLGUpLHdpbmRvdy5yZW1vdmVFdmVudExpc3RlbmVyKCJ0ZXN0IixudWxsLGUpKX1jYXRjaCh0KXt9cmV0dXJuIHR9"
+    "KCk7ZnVuY3Rpb24gQWUodCxlKXtjb25zdCBpPU1lKHQsZSkscz1pJiZpLm1hdGNoKC9eKFxkKykoXC5cZCspP3B4JC8pO3JldHVy"
+    "biBzPytzWzFdOnZvaWQgMH1mdW5jdGlvbiBUZSh0KXtyZXR1cm4hdHx8UCh0LnNpemUpfHxQKHQuZmFtaWx5KT9udWxsOih0LnN0"
+    "eWxlP3Quc3R5bGUrIiAiOiIiKSsodC53ZWlnaHQ/dC53ZWlnaHQrIiAiOiIiKSt0LnNpemUrInB4ICIrdC5mYW1pbHl9ZnVuY3Rp"
+    "b24gTGUodCxlLGkscyxhKXtsZXQgbj1lW2FdO3JldHVybiBufHwobj1lW2FdPXQubWVhc3VyZVRleHQoYSkud2lkdGgsaS5wdXNo"
+    "KGEpKSxzPW4+cz9uOnN9ZnVuY3Rpb24gRWUodCxlLGkscyl7bGV0IGE9KHM9c3x8e30pLmRhdGE9cy5kYXRhfHx7fSxuPXMuZ2Fy"
+    "YmFnZUNvbGxlY3Q9cy5nYXJiYWdlQ29sbGVjdHx8W10sbz0ocy5mb250IT09ZSYmKGE9cy5kYXRhPXt9LG49cy5nYXJiYWdlQ29s"
+    "bGVjdD1bXSxzLmZvbnQ9ZSksdC5zYXZlKCksdC5mb250PWUsMCk7dmFyIHI9aS5sZW5ndGg7bGV0IGwsaCxjLGQsdTtmb3IobD0w"
+    "O2w8cjtsKyspaWYobnVsbD09KGQ9aVtsXSl8fE8oZCkpe2lmKE8oZCkpZm9yKGg9MCxjPWQubGVuZ3RoO2g8YztoKyspbnVsbD09"
+    "KHU9ZFtoXSl8fE8odSl8fChvPUxlKHQsYSxuLG8sdSkpfWVsc2Ugbz1MZSh0LGEsbixvLGQpO3QucmVzdG9yZSgpO3ZhciBnPW4u"
+    "bGVuZ3RoLzI7aWYoZz5pLmxlbmd0aCl7Zm9yKGw9MDtsPGc7bCsrKWRlbGV0ZSBhW25bbF1dO24uc3BsaWNlKDAsZyl9cmV0dXJu"
+    "IG99ZnVuY3Rpb24gUmUodCxlLGkpe3Q9dC5jdXJyZW50RGV2aWNlUGl4ZWxSYXRpbyxpPTAhPT1pP01hdGgubWF4KGkvMiwuNSk6"
+    "MDtyZXR1cm4gTWF0aC5yb3VuZCgoZS1pKSp0KS90K2l9ZnVuY3Rpb24gSWUodCxlKXsoZT1lfHx0LmdldENvbnRleHQoIjJkIikp"
+    "LnNhdmUoKSxlLnJlc2V0VHJhbnNmb3JtKCksZS5jbGVhclJlY3QoMCwwLHQud2lkdGgsdC5oZWlnaHQpLGUucmVzdG9yZSgpfWZ1"
+    "bmN0aW9uIHplKHQsZSxpLHMpe0ZlKHQsZSxpLHMsbnVsbCl9ZnVuY3Rpb24gRmUodCxlLGkscyxhKXtsZXQgbixvLHIsbCxoLGMs"
+    "ZCx1O2NvbnN0IGc9ZS5wb2ludFN0eWxlLGY9ZS5yb3RhdGlvbixwPWUucmFkaXVzO2xldCBtPShmfHwwKSpldDtpZihnJiYib2Jq"
+    "ZWN0Ij09dHlwZW9mIGcmJigiW29iamVjdCBIVE1MSW1hZ2VFbGVtZW50XSI9PT0obj1nLnRvU3RyaW5nKCkpfHwiW29iamVjdCBI"
+    "VE1MQ2FudmFzRWxlbWVudF0iPT09bikpcmV0dXJuIHQuc2F2ZSgpLHQudHJhbnNsYXRlKGkscyksdC5yb3RhdGUobSksdC5kcmF3"
+    "SW1hZ2UoZywtZy53aWR0aC8yLC1nLmhlaWdodC8yLGcud2lkdGgsZy5oZWlnaHQpLHZvaWQgdC5yZXN0b3JlKCk7aWYoIShpc05h"
+    "TihwKXx8cDw9MCkpe3N3aXRjaCh0LmJlZ2luUGF0aCgpLGcpe2RlZmF1bHQ6YT90LmVsbGlwc2UoaSxzLGEvMixwLDAsMCxfKTp0"
+    "LmFyYyhpLHMscCwwLF8pLHQuY2xvc2VQYXRoKCk7YnJlYWs7Y2FzZSJ0cmlhbmdsZSI6Yz1hP2EvMjpwLHQubW92ZVRvKGkrTWF0"
+    "aC5zaW4obSkqYyxzLU1hdGguY29zKG0pKnApLG0rPXN0LHQubGluZVRvKGkrTWF0aC5zaW4obSkqYyxzLU1hdGguY29zKG0pKnAp"
+    "LG0rPXN0LHQubGluZVRvKGkrTWF0aC5zaW4obSkqYyxzLU1hdGguY29zKG0pKnApLHQuY2xvc2VQYXRoKCk7YnJlYWs7Y2FzZSJy"
+    "ZWN0Um91bmRlZCI6aD0uNTE2KnAsbD1wLWgsbz1NYXRoLmNvcyhtK2l0KSpsLGQ9TWF0aC5jb3MobStpdCkqKGE/YS8yLWg6bCks"
+    "cj1NYXRoLnNpbihtK2l0KSpsLHU9TWF0aC5zaW4obStpdCkqKGE/YS8yLWg6bCksdC5hcmMoaS1kLHMtcixoLG0tUyxtLUQpLHQu"
+    "YXJjKGkrdSxzLW8saCxtLUQsbSksdC5hcmMoaStkLHMrcixoLG0sbStEKSx0LmFyYyhpLXUscytvLGgsbStELG0rUyksdC5jbG9z"
+    "ZVBhdGgoKTticmVhaztjYXNlInJlY3QiOmlmKCFmKXtsPU1hdGguU1FSVDFfMipwLGM9YT9hLzI6bCx0LnJlY3QoaS1jLHMtbCwy"
+    "KmMsMipsKTticmVha31tKz1pdDtjYXNlInJlY3RSb3QiOmQ9TWF0aC5jb3MobSkqKGE/YS8yOnApLG89TWF0aC5jb3MobSkqcCxy"
+    "PU1hdGguc2luKG0pKnAsdT1NYXRoLnNpbihtKSooYT9hLzI6cCksdC5tb3ZlVG8oaS1kLHMtciksdC5saW5lVG8oaSt1LHMtbyks"
+    "dC5saW5lVG8oaStkLHMrciksdC5saW5lVG8oaS11LHMrbyksdC5jbG9zZVBhdGgoKTticmVhaztjYXNlImNyb3NzUm90IjptKz1p"
+    "dDtjYXNlImNyb3NzIjpkPU1hdGguY29zKG0pKihhP2EvMjpwKSxvPU1hdGguY29zKG0pKnAscj1NYXRoLnNpbihtKSpwLHU9TWF0"
+    "aC5zaW4obSkqKGE/YS8yOnApLHQubW92ZVRvKGktZCxzLXIpLHQubGluZVRvKGkrZCxzK3IpLHQubW92ZVRvKGkrdSxzLW8pLHQu"
+    "bGluZVRvKGktdSxzK28pO2JyZWFrO2Nhc2Uic3RhciI6ZD1NYXRoLmNvcyhtKSooYT9hLzI6cCksbz1NYXRoLmNvcyhtKSpwLHI9"
+    "TWF0aC5zaW4obSkqcCx1PU1hdGguc2luKG0pKihhP2EvMjpwKSx0Lm1vdmVUbyhpLWQscy1yKSx0LmxpbmVUbyhpK2QscytyKSx0"
+    "Lm1vdmVUbyhpK3Uscy1vKSx0LmxpbmVUbyhpLXUscytvKSxtKz1pdCxkPU1hdGguY29zKG0pKihhP2EvMjpwKSxvPU1hdGguY29z"
+    "KG0pKnAscj1NYXRoLnNpbihtKSpwLHU9TWF0aC5zaW4obSkqKGE/YS8yOnApLHQubW92ZVRvKGktZCxzLXIpLHQubGluZVRvKGkr"
+    "ZCxzK3IpLHQubW92ZVRvKGkrdSxzLW8pLHQubGluZVRvKGktdSxzK28pO2JyZWFrO2Nhc2UibGluZSI6bz1hP2EvMjpNYXRoLmNv"
+    "cyhtKSpwLHI9TWF0aC5zaW4obSkqcCx0Lm1vdmVUbyhpLW8scy1yKSx0LmxpbmVUbyhpK28scytyKTticmVhaztjYXNlImRhc2gi"
+    "OnQubW92ZVRvKGkscyksdC5saW5lVG8oaStNYXRoLmNvcyhtKSooYT9hLzI6cCkscytNYXRoLnNpbihtKSpwKTticmVhaztjYXNl"
+    "ITE6dC5jbG9zZVBhdGgoKX10LmZpbGwoKSwwPGUuYm9yZGVyV2lkdGgmJnQuc3Ryb2tlKCl9fWZ1bmN0aW9uIE0odCxlLGkpe3Jl"
+    "dHVybiBpPWl8fC41LCFlfHx0JiZ0Lng+ZS5sZWZ0LWkmJnQueDxlLnJpZ2h0K2kmJnQueT5lLnRvcC1pJiZ0Lnk8ZS5ib3R0b20r"
+    "aX1mdW5jdGlvbiBWZSh0LGUpe3Quc2F2ZSgpLHQuYmVnaW5QYXRoKCksdC5yZWN0KGUubGVmdCxlLnRvcCxlLnJpZ2h0LWUubGVm"
+    "dCxlLmJvdHRvbS1lLnRvcCksdC5jbGlwKCl9ZnVuY3Rpb24gQmUodCl7dC5yZXN0b3JlKCl9ZnVuY3Rpb24gV2UodCxlLGkscyxh"
+    "KXtpZighZSlyZXR1cm4gdC5saW5lVG8oaS54LGkueSk7aWYoIm1pZGRsZSI9PT1hKXtjb25zdCBzPShlLngraS54KS8yO3QubGlu"
+    "ZVRvKHMsZS55KSx0LmxpbmVUbyhzLGkueSl9ZWxzZSJhZnRlciI9PT1hIT0hIXM/dC5saW5lVG8oZS54LGkueSk6dC5saW5lVG8o"
+    "aS54LGUueSk7dC5saW5lVG8oaS54LGkueSl9ZnVuY3Rpb24gTmUodCxlLGkscyl7aWYoIWUpcmV0dXJuIHQubGluZVRvKGkueCxp"
+    "LnkpO3QuYmV6aWVyQ3VydmVUbyhzP2UuY3AxeDplLmNwMngscz9lLmNwMXk6ZS5jcDJ5LHM/aS5jcDJ4OmkuY3AxeCxzP2kuY3Ay"
+    "eTppLmNwMXksaS54LGkueSl9ZnVuY3Rpb24gSGUodCxlLGkscyxhLG49e30pe3ZhciBvLHIsbCxoLGMsZCx1LGcsZj1PKGUpP2U6"
+    "W2VdLHA9MDxuLnN0cm9rZVdpZHRoJiYiIiE9PW4uc3Ryb2tlQ29sb3I7bGV0IG0sYjtmb3IodC5zYXZlKCksdC5mb250PWEuc3Ry"
+    "aW5nLGU9dCwoZz1uKS50cmFuc2xhdGlvbiYmZS50cmFuc2xhdGUoZy50cmFuc2xhdGlvblswXSxnLnRyYW5zbGF0aW9uWzFdKSxQ"
+    "KGcucm90YXRpb24pfHxlLnJvdGF0ZShnLnJvdGF0aW9uKSxnLmNvbG9yJiYoZS5maWxsU3R5bGU9Zy5jb2xvciksZy50ZXh0QWxp"
+    "Z24mJihlLnRleHRBbGlnbj1nLnRleHRBbGlnbiksZy50ZXh0QmFzZWxpbmUmJihlLnRleHRCYXNlbGluZT1nLnRleHRCYXNlbGlu"
+    "ZSksbT0wO208Zi5sZW5ndGg7KyttKWI9ZlttXSxuLmJhY2tkcm9wJiYoYz10LGQ9bi5iYWNrZHJvcCx1PXZvaWQgMCx1PWMuZmls"
+    "bFN0eWxlLGMuZmlsbFN0eWxlPWQuY29sb3IsYy5maWxsUmVjdChkLmxlZnQsZC50b3AsZC53aWR0aCxkLmhlaWdodCksYy5maWxs"
+    "U3R5bGU9dSkscCYmKG4uc3Ryb2tlQ29sb3ImJih0LnN0cm9rZVN0eWxlPW4uc3Ryb2tlQ29sb3IpLFAobi5zdHJva2VXaWR0aCl8"
+    "fCh0LmxpbmVXaWR0aD1uLnN0cm9rZVdpZHRoKSx0LnN0cm9rZVRleHQoYixpLHMsbi5tYXhXaWR0aCkpLHQuZmlsbFRleHQoYixp"
+    "LHMsbi5tYXhXaWR0aCksZD10LGM9aSx1PXMsbz1iLGg9bD12b2lkIDAsKChyPW4pLnN0cmlrZXRocm91Z2h8fHIudW5kZXJsaW5l"
+    "KSYmKGw9Yy0obz1kLm1lYXN1cmVUZXh0KG8pKS5hY3R1YWxCb3VuZGluZ0JveExlZnQsYz1jK28uYWN0dWFsQm91bmRpbmdCb3hS"
+    "aWdodCxoPXUtby5hY3R1YWxCb3VuZGluZ0JveEFzY2VudCx1PXUrby5hY3R1YWxCb3VuZGluZ0JveERlc2NlbnQsbz1yLnN0cmlr"
+    "ZXRocm91Z2g/KGgrdSkvMjp1LGQuc3Ryb2tlU3R5bGU9ZC5maWxsU3R5bGUsZC5iZWdpblBhdGgoKSxkLmxpbmVXaWR0aD1yLmRl"
+    "Y29yYXRpb25XaWR0aHx8MixkLm1vdmVUbyhsLG8pLGQubGluZVRvKGMsbyksZC5zdHJva2UoKSkscys9TnVtYmVyKGEubGluZUhl"
+    "aWdodCk7dC5yZXN0b3JlKCl9ZnVuY3Rpb24gamUodCxlKXt2YXJ7eDplLHk6aSx3OnMsaDphLHJhZGl1czpufT1lO3QuYXJjKGUr"
+    "bi50b3BMZWZ0LGkrbi50b3BMZWZ0LG4udG9wTGVmdCwxLjUqUyxTLCEwKSx0LmxpbmVUbyhlLGkrYS1uLmJvdHRvbUxlZnQpLHQu"
+    "YXJjKGUrbi5ib3R0b21MZWZ0LGkrYS1uLmJvdHRvbUxlZnQsbi5ib3R0b21MZWZ0LFMsRCwhMCksdC5saW5lVG8oZStzLW4uYm90"
+    "dG9tUmlnaHQsaSthKSx0LmFyYyhlK3Mtbi5ib3R0b21SaWdodCxpK2Etbi5ib3R0b21SaWdodCxuLmJvdHRvbVJpZ2h0LEQsMCwh"
+    "MCksdC5saW5lVG8oZStzLGkrbi50b3BSaWdodCksdC5hcmMoZStzLW4udG9wUmlnaHQsaStuLnRvcFJpZ2h0LG4udG9wUmlnaHQs"
+    "MCwtRCwhMCksdC5saW5lVG8oZStuLnRvcExlZnQsaSl9ZnVuY3Rpb24gWWUocixsPVsiIl0sdCxlLGE9KCk9PnJbMF0pe2NvbnN0"
+    "IGk9dHx8cjt2b2lkIDA9PT1lJiYoZT10aSgiX2ZhbGxiYWNrIixyKSk7dD17W1N5bWJvbC50b1N0cmluZ1RhZ106Ik9iamVjdCIs"
+    "X2NhY2hlYWJsZTohMCxfc2NvcGVzOnIsX3Jvb3RTY29wZXM6aSxfZmFsbGJhY2s6ZSxfZ2V0VGFyZ2V0OmEsb3ZlcnJpZGU6dD0+"
+    "WWUoW3QsLi4ucl0sbCxpLGUpfTtyZXR1cm4gbmV3IFByb3h5KHQse2RlbGV0ZVByb3BlcnR5Oih0LGUpPT4oZGVsZXRlIHRbZV0s"
+    "ZGVsZXRlIHQuX2tleXMsZGVsZXRlIHJbMF1bZV0sITApLGdldDoobixvKT0+S2UobixvLCgpPT57dmFyIHQsZT1vLGk9cixzPW47"
+    "Zm9yKGNvbnN0IGEgb2YgbClpZih0PXRpKFhlKGEsZSksaSksdm9pZCAwIT09dClyZXR1cm4gcWUoZSx0KT9KZShpLHMsZSx0KTp0"
+    "fSksZ2V0T3duUHJvcGVydHlEZXNjcmlwdG9yOih0LGUpPT5SZWZsZWN0LmdldE93blByb3BlcnR5RGVzY3JpcHRvcih0Ll9zY29w"
+    "ZXNbMF0sZSksZ2V0UHJvdG90eXBlT2Y6KCk9PlJlZmxlY3QuZ2V0UHJvdG90eXBlT2YoclswXSksaGFzOih0LGUpPT5laSh0KS5p"
+    "bmNsdWRlcyhlKSxvd25LZXlzOnQ9PmVpKHQpLHNldCh0LGUsaSl7Y29uc3Qgcz10Ll9zdG9yYWdlfHwodC5fc3RvcmFnZT1hKCkp"
+    "O3JldHVybiB0W2VdPXNbZV09aSxkZWxldGUgdC5fa2V5cywhMH19KX1mdW5jdGlvbiAkZShzLGUsaSxhKXt2YXIgdD17X2NhY2hl"
+    "YWJsZTohMSxfcHJveHk6cyxfY29udGV4dDplLF9zdWJQcm94eTppLF9zdGFjazpuZXcgU2V0LF9kZXNjcmlwdG9yczpVZShzLGEp"
+    "LHNldENvbnRleHQ6dD0+JGUocyx0LGksYSksb3ZlcnJpZGU6dD0+JGUocy5vdmVycmlkZSh0KSxlLGksYSl9O3JldHVybiBuZXcg"
+    "UHJveHkodCx7ZGVsZXRlUHJvcGVydHk6KHQsZSk9PihkZWxldGUgdFtlXSxkZWxldGUgc1tlXSwhMCksZ2V0OihyLGgsYyk9Pktl"
+    "KHIsaCwoKT0+e3t2YXIgbD1yLGU9aCxpPWM7Y29uc3R7X3Byb3h5OnMsX2NvbnRleHQ6YSxfc3ViUHJveHk6bixfZGVzY3JpcHRv"
+    "cnM6b309bDtsZXQgdD1zW2VdO3JldHVybiBPKHQ9dSh0KSYmby5pc1NjcmlwdGFibGUoZSk/ZnVuY3Rpb24odCxlLGkpe2NvbnN0"
+    "e19wcm94eTpzLF9jb250ZXh0OmEsX3N1YlByb3h5Om4sX3N0YWNrOm99PWw7aWYoby5oYXModCkpdGhyb3cgbmV3IEVycm9yKCJS"
+    "ZWN1cnNpb24gZGV0ZWN0ZWQ6ICIrQXJyYXkuZnJvbShvKS5qb2luKCItPiIpKyItPiIrdCk7by5hZGQodCk7bGV0IHI9ZShhLG58"
+    "fGkpO3JldHVybiBvLmRlbGV0ZSh0KSxyPXFlKHQscik/SmUocy5fc2NvcGVzLHMsdCxyKTpyfShlLHQsaSk6dCkmJnQubGVuZ3Ro"
+    "JiYodD1mdW5jdGlvbih0LGUsaSxzKXtjb25zdHtfcHJveHk6YSxfY29udGV4dDpuLF9zdWJQcm94eTpvLF9kZXNjcmlwdG9yczpy"
+    "fT1pO2lmKHZvaWQgMCE9PW4uaW5kZXgmJnModCkpcmV0dXJuIGVbbi5pbmRleCVlLmxlbmd0aF07aWYoQShlWzBdKSl7Y29uc3Qg"
+    "aT1lLHM9YS5fc2NvcGVzLmZpbHRlcih0PT50IT09aSk7ZT1bXTtmb3IoY29uc3QgQSBvZiBpKXtjb25zdCBpPUplKHMsYSx0LEEp"
+    "O2UucHVzaCgkZShpLG4sbyYmb1t0XSxyKSl9fXJldHVybiBlfShlLHQsbCxvLmlzSW5kZXhhYmxlKSksdD1xZShlLHQpPyRlKHQs"
+    "YSxuJiZuW2VdLG8pOnR9fSksZ2V0T3duUHJvcGVydHlEZXNjcmlwdG9yOih0LGUpPT50Ll9kZXNjcmlwdG9ycy5hbGxLZXlzP1Jl"
+    "ZmxlY3QuaGFzKHMsZSk/e2VudW1lcmFibGU6ITAsY29uZmlndXJhYmxlOiEwfTp2b2lkIDA6UmVmbGVjdC5nZXRPd25Qcm9wZXJ0"
+    "eURlc2NyaXB0b3IocyxlKSxnZXRQcm90b3R5cGVPZjooKT0+UmVmbGVjdC5nZXRQcm90b3R5cGVPZihzKSxoYXM6KHQsZSk9PlJl"
+    "ZmxlY3QuaGFzKHMsZSksb3duS2V5czooKT0+UmVmbGVjdC5vd25LZXlzKHMpLHNldDoodCxlLGkpPT4oc1tlXT1pLGRlbGV0ZSB0"
+    "W2VdLCEwKX0pfWZ1bmN0aW9uIFVlKHQsZT17c2NyaXB0YWJsZTohMCxpbmRleGFibGU6ITB9KXtjb25zdHtfc2NyaXB0YWJsZTpp"
+    "PWUuc2NyaXB0YWJsZSxfaW5kZXhhYmxlOnM9ZS5pbmRleGFibGUsX2FsbEtleXM6YT1lLmFsbEtleXN9PXQ7cmV0dXJue2FsbEtl"
+    "eXM6YSxzY3JpcHRhYmxlOmksaW5kZXhhYmxlOnMsaXNTY3JpcHRhYmxlOnUoaSk/aTooKT0+aSxpc0luZGV4YWJsZTp1KHMpP3M6"
+    "KCk9PnN9fWNvbnN0IFhlPSh0LGUpPT50P3QrSyhlKTplLHFlPSh0LGUpPT5BKGUpJiYiYWRhcHRlcnMiIT09dCYmKG51bGw9PT1P"
+    "YmplY3QuZ2V0UHJvdG90eXBlT2YoZSl8fGUuY29uc3RydWN0b3I9PT1PYmplY3QpO2Z1bmN0aW9uIEtlKHQsZSxpKXtpZihPYmpl"
+    "Y3QucHJvdG90eXBlLmhhc093blByb3BlcnR5LmNhbGwodCxlKSlyZXR1cm4gdFtlXTtpPWkoKTtyZXR1cm4gdFtlXT1pfWZ1bmN0"
+    "aW9uIEdlKHQsZSxpKXtyZXR1cm4gdSh0KT90KGUsaSk6dH1mdW5jdGlvbiBaZSh0LGUsaSxzLGEpe2Zvcihjb25zdCByIG9mIGUp"
+    "e249aSxvPXI7Y29uc3QgZT0hMD09PW4/bzoic3RyaW5nIj09dHlwZW9mIG4/bShvLG4pOnZvaWQgMDtpZihlKXt0LmFkZChlKTtv"
+    "PUdlKGUuX2ZhbGxiYWNrLGksYSk7aWYodm9pZCAwIT09byYmbyE9PWkmJm8hPT1zKXJldHVybiBvfWVsc2UgaWYoITE9PT1lJiZ2"
+    "b2lkIDAhPT1zJiZpIT09cylyZXR1cm4gbnVsbH12YXIgbixvO3JldHVybiExfWZ1bmN0aW9uIEplKHQscyxhLG4pe2NvbnN0IGU9"
+    "cy5fcm9vdFNjb3BlcyxpPUdlKHMuX2ZhbGxiYWNrLGEsbiksbz1bLi4udCwuLi5lXSxyPW5ldyBTZXQ7ci5hZGQobik7dD1RZShy"
+    "LG8sYSxpfHxhLG4pO3JldHVybiBudWxsIT09dCYmKHZvaWQgMD09PWl8fGk9PT1hfHxudWxsIT09UWUocixvLGksdCxuKSkmJlll"
+    "KEFycmF5LmZyb20ociksWyIiXSxlLGksKCk9Pnt7dmFyIHQ9YSxlPW47Y29uc3QgaT1zLl9nZXRUYXJnZXQoKTtyZXR1cm4gdCBp"
+    "biBpfHwoaVt0XT17fSksTyh0PWlbdF0pJiZBKGUpP2U6dHx8e319fSl9ZnVuY3Rpb24gUWUodCxlLGkscyxhKXtmb3IoO2k7KWk9"
+    "WmUodCxlLGkscyxhKTtyZXR1cm4gaX1mdW5jdGlvbiB0aSh0LGUpe2Zvcihjb25zdCBpIG9mIGUpaWYoaSl7Y29uc3QgZT1pW3Rd"
+    "O2lmKHZvaWQgMCE9PWUpcmV0dXJuIGV9fWZ1bmN0aW9uIGVpKHQpe2xldCBlPXQuX2tleXM7cmV0dXJuIGU9ZXx8KHQuX2tleXM9"
+    "ZnVuY3Rpb24odCl7Y29uc3QgZT1uZXcgU2V0O2Zvcihjb25zdCBpIG9mIHQpZm9yKGNvbnN0IHQgb2YgT2JqZWN0LmtleXMoaSku"
+    "ZmlsdGVyKHQ9PiF0LnN0YXJ0c1dpdGgoIl8iKSkpZS5hZGQodCk7cmV0dXJuIEFycmF5LmZyb20oZSl9KHQuX3Njb3BlcykpfWZ1"
+    "bmN0aW9uIGlpKHQsZSxpLHMpe2NvbnN0IGE9dFsiaVNjYWxlIl0se2tleTpuPSJyIn09dGhpcy5fcGFyc2luZyxvPW5ldyBBcnJh"
+    "eShzKTtsZXQgcixsLGgsYztmb3Iocj0wLGw9cztyPGw7KytyKWM9ZVtoPXIraV0sb1tyXT17cjphLnBhcnNlKG0oYyxuKSxoKX07"
+    "cmV0dXJuIG99Y29uc3Qgc2k9TnVtYmVyLkVQU0lMT058fDFlLTE0LGFpPSh0LGUpPT5lPHQubGVuZ3RoJiYhdFtlXS5za2lwJiZ0"
+    "W2VdLG5pPXQ9PiJ4Ij09PXQ/InkiOiJ4IjtmdW5jdGlvbiBvaSh0LGUsaSxzKXt2YXIgdD10LnNraXA/ZTp0LGE9ZSxlPWkuc2tp"
+    "cD9lOmksaT1ndChhLHQpLG49Z3QoZSxhKTtsZXQgbz1pLyhpK24pLHI9bi8oaStuKTtvPWlzTmFOKG8pPzA6byxyPWlzTmFOKHIp"
+    "PzA6cjtpPXMqbyxuPXMqcjtyZXR1cm57cHJldmlvdXM6e3g6YS54LWkqKGUueC10LngpLHk6YS55LWkqKGUueS10LnkpfSxuZXh0"
+    "Ont4OmEueCtuKihlLngtdC54KSx5OmEueStuKihlLnktdC55KX19fWZ1bmN0aW9uIHJpKHQsbj0ieCIpe2NvbnN0IGU9bmkobiks"
+    "aT10Lmxlbmd0aCxyPUFycmF5KGkpLmZpbGwoMCksbD1BcnJheShpKTtsZXQgcyxhLG8saD1haSh0LDApO2ZvcihzPTA7czxpOysr"
+    "cylpZihhPW8sbz1oLGg9YWkodCxzKzEpLG8pe2lmKGgpe2NvbnN0IHQ9aFtuXS1vW25dO3Jbc109MCE9dD8oaFtlXS1vW2VdKS90"
+    "OjB9bFtzXT1hP2g/eShyW3MtMV0pIT09eShyW3NdKT8wOihyW3MtMV0rcltzXSkvMjpyW3MtMV06cltzXX17dmFyIGM9dCxkPXIs"
+    "dT1sLGc9Yy5sZW5ndGg7bGV0IGUsaSxzLGEsbixvPWFpKGMsMCk7Zm9yKGxldCB0PTA7dDxnLTE7Kyt0KW49byxvPWFpKGMsdCsx"
+    "KSxuJiZvJiYoYXQoZFt0XSwwLHNpKT91W3RdPXVbdCsxXT0wOihlPXVbdF0vZFt0XSxpPXVbdCsxXS9kW3RdLChhPU1hdGgucG93"
+    "KGUsMikrTWF0aC5wb3coaSwyKSk8PTl8fChzPTMvTWF0aC5zcXJ0KGEpLHVbdF09ZSpzKmRbdF0sdVt0KzFdPWkqcypkW3RdKSkp"
+    "fXt2YXJbZixwLG09IngiXT1bdCxsLG5dO2NvbnN0IGI9bmkobSkseD1mLmxlbmd0aDtsZXQgZSxpLHMsYT1haShmLDApO2Zvcihs"
+    "ZXQgdD0wO3Q8eDsrK3QpaWYoaT1zLHM9YSxhPWFpKGYsdCsxKSxzKXtjb25zdCB4PXNbbV0sdj1zW2JdO2kmJihlPSh4LWlbbV0p"
+    "LzMsc1siY3AxIittXT14LWUsc1siY3AxIitiXT12LWUqcFt0XSksYSYmKGU9KGFbbV0teCkvMyxzWyJjcDIiK21dPXgrZSxzWyJj"
+    "cDIiK2JdPXYrZSpwW3RdKX1yZXR1cm59fWZ1bmN0aW9uIGxpKHQsZSxpKXtyZXR1cm4gTWF0aC5tYXgoTWF0aC5taW4odCxpKSxl"
+    "KX1mdW5jdGlvbiBoaShvLGUscixpLHQpe2xldCBzLGEsbixsO2lmKGUuc3BhbkdhcHMmJihvPW8uZmlsdGVyKHQ9PiF0LnNraXAp"
+    "KSwibW9ub3RvbmUiPT09ZS5jdWJpY0ludGVycG9sYXRpb25Nb2RlKXJpKG8sdCk7ZWxzZXtsZXQgdD1pP29bby5sZW5ndGgtMV06"
+    "b1swXTtmb3Iocz0wLGE9by5sZW5ndGg7czxhOysrcyluPW9bc10sbD1vaSh0LG4sb1tNYXRoLm1pbihzKzEsYS0oaT8wOjEpKSVh"
+    "XSxlLnRlbnNpb24pLG4uY3AxeD1sLnByZXZpb3VzLngsbi5jcDF5PWwucHJldmlvdXMueSxuLmNwMng9bC5uZXh0Lngsbi5jcDJ5"
+    "PWwubmV4dC55LHQ9bn1pZihlLmNhcEJlemllclBvaW50cyl7dmFyIGg9byxjPXI7bGV0IHQsZSxpLHMsYSxuPU0oaFswXSxjKTtm"
+    "b3IodD0wLGU9aC5sZW5ndGg7dDxlOysrdClhPXMscz1uLG49dDxlLTEmJk0oaFt0KzFdLGMpLHMmJihpPWhbdF0sYSYmKGkuY3Ax"
+    "eD1saShpLmNwMXgsYy5sZWZ0LGMucmlnaHQpLGkuY3AxeT1saShpLmNwMXksYy50b3AsYy5ib3R0b20pKSxuJiYoaS5jcDJ4PWxp"
+    "KGkuY3AyeCxjLmxlZnQsYy5yaWdodCksaS5jcDJ5PWxpKGkuY3AyeSxjLnRvcCxjLmJvdHRvbSkpKX19Y29uc3QgY2k9dD0+MD09"
+    "PXR8fDE9PT10LGRpPSh0LGUsaSk9Pi1NYXRoLnBvdygyLDEwKi0tdCkqTWF0aC5zaW4oKHQtZSkqXy9pKSx1aT0odCxlLGkpPT5N"
+    "YXRoLnBvdygyLC0xMCp0KSpNYXRoLnNpbigodC1lKSpfL2kpKzEsZ2k9e2xpbmVhcjp0PT50LGVhc2VJblF1YWQ6dD0+dCp0LGVh"
+    "c2VPdXRRdWFkOnQ9Pi10Kih0LTIpLGVhc2VJbk91dFF1YWQ6dD0+KHQvPS41KTwxPy41KnQqdDotLjUqKC0tdCoodC0yKS0xKSxl"
+    "YXNlSW5DdWJpYzp0PT50KnQqdCxlYXNlT3V0Q3ViaWM6dD0+LS10KnQqdCsxLGVhc2VJbk91dEN1YmljOnQ9Pih0Lz0uNSk8MT8u"
+    "NSp0KnQqdDouNSooKHQtPTIpKnQqdCsyKSxlYXNlSW5RdWFydDp0PT50KnQqdCp0LGVhc2VPdXRRdWFydDp0PT4tKC0tdCp0KnQq"
+    "dC0xKSxlYXNlSW5PdXRRdWFydDp0PT4odC89LjUpPDE/LjUqdCp0KnQqdDotLjUqKCh0LT0yKSp0KnQqdC0yKSxlYXNlSW5RdWlu"
+    "dDp0PT50KnQqdCp0KnQsZWFzZU91dFF1aW50OnQ9Pi0tdCp0KnQqdCp0KzEsZWFzZUluT3V0UXVpbnQ6dD0+KHQvPS41KTwxPy41"
+    "KnQqdCp0KnQqdDouNSooKHQtPTIpKnQqdCp0KnQrMiksZWFzZUluU2luZTp0PT4xLU1hdGguY29zKHQqRCksZWFzZU91dFNpbmU6"
+    "dD0+TWF0aC5zaW4odCpEKSxlYXNlSW5PdXRTaW5lOnQ9Pi0uNSooTWF0aC5jb3MoUyp0KS0xKSxlYXNlSW5FeHBvOnQ9PjA9PT10"
+    "PzA6TWF0aC5wb3coMiwxMCoodC0xKSksZWFzZU91dEV4cG86dD0+MT09PXQ/MToxLU1hdGgucG93KDIsLTEwKnQpLGVhc2VJbk91"
+    "dEV4cG86dD0+Y2kodCk/dDp0PC41Py41Kk1hdGgucG93KDIsMTAqKDIqdC0xKSk6LjUqKDItTWF0aC5wb3coMiwtMTAqKDIqdC0x"
+    "KSkpLGVhc2VJbkNpcmM6dD0+MTw9dD90Oi0oTWF0aC5zcXJ0KDEtdCp0KS0xKSxlYXNlT3V0Q2lyYzp0PT5NYXRoLnNxcnQoMS0g"
+    "LS10KnQpLGVhc2VJbk91dENpcmM6dD0+KHQvPS41KTwxPy0uNSooTWF0aC5zcXJ0KDEtdCp0KS0xKTouNSooTWF0aC5zcXJ0KDEt"
+    "KHQtPTIpKnQpKzEpLGVhc2VJbkVsYXN0aWM6dD0+Y2kodCk/dDpkaSh0LC4wNzUsLjMpLGVhc2VPdXRFbGFzdGljOnQ9PmNpKHQp"
+    "P3Q6dWkodCwuMDc1LC4zKSxlYXNlSW5PdXRFbGFzdGljKHQpe3JldHVybiBjaSh0KT90OnQ8LjU/LjUqZGkoMip0LC4xMTI1LC40"
+    "NSk6LjUrLjUqdWkoMip0LTEsLjExMjUsLjQ1KX0sZWFzZUluQmFjayh0KXtyZXR1cm4gdCp0KigyLjcwMTU4KnQtMS43MDE1OCl9"
+    "LGVhc2VPdXRCYWNrKHQpe3JldHVybi0tdCp0KigyLjcwMTU4KnQrMS43MDE1OCkrMX0sZWFzZUluT3V0QmFjayh0KXtsZXQgZT0x"
+    "LjcwMTU4O3JldHVybih0Lz0uNSk8MT90KnQqKCgxKyhlKj0xLjUyNSkpKnQtZSkqLjU6LjUqKCh0LT0yKSp0KigoMSsoZSo9MS41"
+    "MjUpKSp0K2UpKzIpfSxlYXNlSW5Cb3VuY2U6dD0+MS1naS5lYXNlT3V0Qm91bmNlKDEtdCksZWFzZU91dEJvdW5jZSh0KXt2YXIg"
+    "ZT03LjU2MjUsaT0yLjc1O3JldHVybiB0PDEvaT9lKnQqdDp0PDIvaT9lKih0LT0xLjUvaSkqdCsuNzU6dDwyLjUvaT9lKih0LT0y"
+    "LjI1L2kpKnQrLjkzNzU6ZSoodC09Mi42MjUvaSkqdCsuOTg0Mzc1fSxlYXNlSW5PdXRCb3VuY2U6dD0+dDwuNT8uNSpnaS5lYXNl"
+    "SW5Cb3VuY2UoMip0KTouNSpnaS5lYXNlT3V0Qm91bmNlKDIqdC0xKSsuNX07ZnVuY3Rpb24gZmkodCxlLGkscyl7cmV0dXJue3g6"
+    "dC54K2kqKGUueC10LngpLHk6dC55K2kqKGUueS10LnkpfX1mdW5jdGlvbiBwaSh0LGUsaSxzKXtyZXR1cm57eDp0LngraSooZS54"
+    "LXQueCkseTooIm1pZGRsZSI9PT1zP2k8LjU/dDplOiJhZnRlciI9PT1zP2k8MT90OmU6MDxpP2U6dCkueX19ZnVuY3Rpb24gbWko"
+    "dCxlLGkscyl7dmFyIGE9e3g6dC5jcDJ4LHk6dC5jcDJ5fSxuPXt4OmUuY3AxeCx5OmUuY3AxeX0sdD1maSh0LGEsaSksYT1maShh"
+    "LG4saSksbj1maShuLGUsaSksZT1maSh0LGEsaSksdD1maShhLG4saSk7cmV0dXJuIGZpKGUsdCxpKX1jb25zdCBiaT0vXihub3Jt"
+    "YWx8KFxkKyg/OlwuXGQrKT8pKHB4fGVtfCUpPykkLyx4aT0vXihub3JtYWx8aXRhbGljfGluaXRpYWx8aW5oZXJpdHx1bnNldHwo"
+    "b2JsaXF1ZSggLT9bMC05XT9bMC05XWRlZyk/KSkkLztmdW5jdGlvbiB2aSh0LGUpe3ZhciBpPSgiIit0KS5tYXRjaChiaSk7aWYo"
+    "IWl8fCJub3JtYWwiPT09aVsxXSlyZXR1cm4gMS4yKmU7c3dpdGNoKHQ9K2lbMl0saVszXSl7Y2FzZSJweCI6cmV0dXJuIHQ7Y2Fz"
+    "ZSIlIjp0Lz0xMDB9cmV0dXJuIGUqdH1jb25zdCBfaT10PT4rdHx8MDtmdW5jdGlvbiB5aShlLGkpe2NvbnN0IHQ9e30scz1BKGkp"
+    "LGE9cz9PYmplY3Qua2V5cyhpKTppLG49QShlKT9zP3Q9PlQoZVt0XSxlW2lbdF1dKTp0PT5lW3RdOigpPT5lO2Zvcihjb25zdCBl"
+    "IG9mIGEpdFtlXT1faShuKGUpKTtyZXR1cm4gdH1mdW5jdGlvbiBNaSh0KXtyZXR1cm4geWkodCx7dG9wOiJ5IixyaWdodDoieCIs"
+    "Ym90dG9tOiJ5IixsZWZ0OiJ4In0pfWZ1bmN0aW9uIHdpKHQpe3JldHVybiB5aSh0LFsidG9wTGVmdCIsInRvcFJpZ2h0IiwiYm90"
+    "dG9tTGVmdCIsImJvdHRvbVJpZ2h0Il0pfWZ1bmN0aW9uIEkodCl7Y29uc3QgZT1NaSh0KTtyZXR1cm4gZS53aWR0aD1lLmxlZnQr"
+    "ZS5yaWdodCxlLmhlaWdodD1lLnRvcCtlLmJvdHRvbSxlfWZ1bmN0aW9uIHoodCxlKXtlPWV8fFIuZm9udDtsZXQgaT1UKCh0PXR8"
+    "fHt9KS5zaXplLGUuc2l6ZSkscz0oInN0cmluZyI9PXR5cGVvZiBpJiYoaT1wYXJzZUludChpLDEwKSksVCh0LnN0eWxlLGUuc3R5"
+    "bGUpKTtzJiYhKCIiK3MpLm1hdGNoKHhpKSYmKGNvbnNvbGUud2FybignSW52YWxpZCBmb250IHN0eWxlIHNwZWNpZmllZDogIicr"
+    "cysnIicpLHM9dm9pZCAwKTtjb25zdCBhPXtmYW1pbHk6VCh0LmZhbWlseSxlLmZhbWlseSksbGluZUhlaWdodDp2aShUKHQubGlu"
+    "ZUhlaWdodCxlLmxpbmVIZWlnaHQpLGkpLHNpemU6aSxzdHlsZTpzLHdlaWdodDpUKHQud2VpZ2h0LGUud2VpZ2h0KSxzdHJpbmc6"
+    "IiJ9O3JldHVybiBhLnN0cmluZz1UZShhKSxhfWZ1bmN0aW9uIGtpKHQsZSxpLHMpe2xldCBhLG4sbyxyPSEwO2ZvcihhPTAsbj10"
+    "Lmxlbmd0aDthPG47KythKWlmKHZvaWQgMCE9PShvPXRbYV0pJiYodm9pZCAwIT09ZSYmImZ1bmN0aW9uIj09dHlwZW9mIG8mJihv"
+    "PW8oZSkscj0hMSksdm9pZCAwIT09aSYmTyhvKSYmKG89b1tpJW8ubGVuZ3RoXSxyPSExKSx2b2lkIDAhPT1vKSlyZXR1cm4gcyYm"
+    "IXImJihzLmNhY2hlYWJsZT0hMSksb31mdW5jdGlvbiBTaSh0LGUsaSl7dmFye21pbjp0LG1heDpzfT10LGU9QihlLChzLXQpLzIp"
+    "LGE9KHQsZSk9PmkmJjA9PT10PzA6dCtlO3JldHVybnttaW46YSh0LC1NYXRoLmFicyhlKSksbWF4OmEocyxlKX19ZnVuY3Rpb24g"
+    "UGkodCxlKXtyZXR1cm4gT2JqZWN0LmFzc2lnbihPYmplY3QuY3JlYXRlKHQpLGUpfWZ1bmN0aW9uIERpKHQsZSxpKXtyZXR1cm4g"
+    "dD8ocz1lLGE9aSx7eDp0PT5zK3MrYS10LHNldFdpZHRoKHQpe2E9dH0sdGV4dEFsaWduOnQ9PiJjZW50ZXIiPT09dD90OiJyaWdo"
+    "dCI9PT10PyJsZWZ0IjoicmlnaHQiLHhQbHVzOih0LGUpPT50LWUsbGVmdEZvckx0cjoodCxlKT0+dC1lfSk6e3g6dD0+dCxzZXRX"
+    "aWR0aCh0KXt9LHRleHRBbGlnbjp0PT50LHhQbHVzOih0LGUpPT50K2UsbGVmdEZvckx0cjoodCxlKT0+dH07dmFyIHMsYX1mdW5j"
+    "dGlvbiBDaSh0LGUpe2xldCBpLHM7Imx0ciIhPT1lJiYicnRsIiE9PWV8fChzPVsoaT10LmNhbnZhcy5zdHlsZSkuZ2V0UHJvcGVy"
+    "dHlWYWx1ZSgiZGlyZWN0aW9uIiksaS5nZXRQcm9wZXJ0eVByaW9yaXR5KCJkaXJlY3Rpb24iKV0saS5zZXRQcm9wZXJ0eSgiZGly"
+    "ZWN0aW9uIixlLCJpbXBvcnRhbnQiKSx0LnByZXZUZXh0RGlyZWN0aW9uPXMpfWZ1bmN0aW9uIE9pKHQsZSl7dm9pZCAwIT09ZSYm"
+    "KGRlbGV0ZSB0LnByZXZUZXh0RGlyZWN0aW9uLHQuY2FudmFzLnN0eWxlLnNldFByb3BlcnR5KCJkaXJlY3Rpb24iLGVbMF0sZVsx"
+    "XSkpfWZ1bmN0aW9uIEFpKHQpe3JldHVybiJhbmdsZSI9PT10P3tiZXR3ZWVuOnB0LGNvbXBhcmU6ZnQsbm9ybWFsaXplOnZ9Onti"
+    "ZXR3ZWVuOmMsY29tcGFyZToodCxlKT0+dC1lLG5vcm1hbGl6ZTp0PT50fX1mdW5jdGlvbiBUaSh7c3RhcnQ6dCxlbmQ6ZSxjb3Vu"
+    "dDppLGxvb3A6cyxzdHlsZTphfSl7cmV0dXJue3N0YXJ0OnQlaSxlbmQ6ZSVpLGxvb3A6cyYmKGUtdCsxKSVpPT0wLHN0eWxlOmF9"
+    "fWZ1bmN0aW9uIExpKHQsaSxnKXtpZighZylyZXR1cm5bdF07Y29uc3R7cHJvcGVydHk6cyxzdGFydDphLGVuZDpufT1nLG89aS5s"
+    "ZW5ndGgse2NvbXBhcmU6cixiZXR3ZWVuOmwsbm9ybWFsaXplOmh9PUFpKHMpLHtzdGFydDpjLGVuZDpkLGxvb3A6dSxzdHlsZTpm"
+    "fT1mdW5jdGlvbih0LGUpe2NvbnN0e3Byb3BlcnR5Omksc3RhcnQ6cyxlbmQ6YX09Zyx7YmV0d2VlbjpuLG5vcm1hbGl6ZTpvfT1B"
+    "aShpKSxyPWUubGVuZ3RoO2xldCBsLGgse3N0YXJ0OmMsZW5kOmQsbG9vcDp1fT10O2lmKHUpe2ZvcihjKz1yLGQrPXIsbD0wLGg9"
+    "cjtsPGgmJm4obyhlW2Mlcl1baV0pLHMsYSk7KytsKWMtLSxkLS07YyU9cixkJT1yfXJldHVybiBkPGMmJihkKz1yKSx7c3RhcnQ6"
+    "YyxlbmQ6ZCxsb29wOnUsc3R5bGU6dC5zdHlsZX19KHQsaSkscD1bXTtsZXQgbSxiLHgsdixfPW51bGw7Zm9yKGxldCB0PWMsZT1j"
+    "O3Q8PWQ7Kyt0KShiPWlbdCVvXSkuc2tpcHx8KG09aChiW3NdKSkhPT14JiYodj1sKG0sYSxuKSxudWxsPT09KF89bnVsbD09PV8m"
+    "Jih2fHxsKGEseCxtKSYmMCE9PXIoYSx4KSk/MD09PXIobSxhKT90OmU6Xyl8fHYmJjAhPT1yKG4sbSkmJiFsKG4seCxtKXx8KHAu"
+    "cHVzaChUaSh7c3RhcnQ6XyxlbmQ6dCxsb29wOnUsY291bnQ6byxzdHlsZTpmfSkpLF89bnVsbCksZT10LHg9bSk7cmV0dXJuIG51"
+    "bGwhPT1fJiZwLnB1c2goVGkoe3N0YXJ0Ol8sZW5kOmQsbG9vcDp1LGNvdW50Om8sc3R5bGU6Zn0pKSxwfWZ1bmN0aW9uIEVpKGUs"
+    "aSl7Y29uc3Qgcz1bXSxhPWUuc2VnbWVudHM7Zm9yKGxldCB0PTA7dDxhLmxlbmd0aDt0Kyspe3ZhciBuPUxpKGFbdF0sZS5wb2lu"
+    "dHMsaSk7bi5sZW5ndGgmJnMucHVzaCguLi5uKX1yZXR1cm4gc31mdW5jdGlvbiBSaSh0LGUpe3ZhciBpPXQucG9pbnRzLG49dC5v"
+    "cHRpb25zLnNwYW5HYXBzLHM9aS5sZW5ndGg7aWYoIXMpcmV0dXJuW107dmFyIGE9ISF0Ll9sb29wLHtzdGFydDpvLGVuZDpyfT1m"
+    "dW5jdGlvbih0LGUsaSl7bGV0IHM9MCxhPWUtMTtpZihpJiYhbilmb3IoO3M8ZSYmIXRbc10uc2tpcDspcysrO2Zvcig7czxlJiZ0"
+    "W3NdLnNraXA7KXMrKztmb3IocyU9ZSxpJiYoYSs9cyk7YT5zJiZ0W2ElZV0uc2tpcDspYS0tO3JldHVybiBhJT1lLHtzdGFydDpz"
+    "LGVuZDphfX0oaSxzLGEpO3JldHVybiBJaSh0LCEwPT09bj9be3N0YXJ0Om8sZW5kOnIsbG9vcDphfV06ZnVuY3Rpb24odCxlLGks"
+    "cyl7Y29uc3QgYT10Lmxlbmd0aCxuPVtdO2xldCBvLHI9ZSxsPXRbZV07Zm9yKG89ZSsxO288PWk7KytvKXtjb25zdCBpPXRbbyVh"
+    "XTtpLnNraXB8fGkuc3RvcD9sLnNraXB8fChzPSExLG4ucHVzaCh7c3RhcnQ6ZSVhLGVuZDooby0xKSVhLGxvb3A6c30pLGU9cj1p"
+    "LnN0b3A/bzpudWxsKToocj1vLGwuc2tpcCYmKGU9bykpLGw9aX1yZXR1cm4gbnVsbCE9PXImJm4ucHVzaCh7c3RhcnQ6ZSVhLGVu"
+    "ZDpyJWEsbG9vcDpzfSksbn0oaSxvLHI8bz9yK3M6ciwhIXQuX2Z1bGxMb29wJiYwPT09byYmcj09PXMtMSksaSxlKX1mdW5jdGlv"
+    "biBJaSh0LGUscyxhKXtpZihhJiZhLnNldENvbnRleHQmJnMpe3ZhciByPXQsdD1lLGw9cyxoPWE7Y29uc3QgZD1yLl9jaGFydC5n"
+    "ZXRDb250ZXh0KCksdT16aShyLm9wdGlvbnMpLHtfZGF0YXNldEluZGV4Omcsb3B0aW9uczp7c3BhbkdhcHM6Zn19PXIscD1sLmxl"
+    "bmd0aCxtPVtdO2xldCBuPXUsbz10WzBdLnN0YXJ0LGk9bztmdW5jdGlvbiBjKHQsZSxpLHMpe3ZhciBhPWY/LTE6MTtpZih0IT09"
+    "ZSl7Zm9yKHQrPXA7bFt0JXBdLnNraXA7KXQtPWE7Zm9yKDtsW2UlcF0uc2tpcDspZSs9YTt0JXAhPWUlcCYmKG0ucHVzaCh7c3Rh"
+    "cnQ6dCVwLGVuZDplJXAsbG9vcDppLHN0eWxlOnN9KSxuPXMsbz1lJXApfX1mb3IoY29uc3QgciBvZiB0KXtvPWY/bzpyLnN0YXJ0"
+    "O2xldCB0LGU9bFtvJXBdO2ZvcihpPW8rMTtpPD1yLmVuZDtpKyspe2NvbnN0IGY9bFtpJXBdOyhmdW5jdGlvbih0LGUpe2lmKCFl"
+    "KXJldHVybjtmdW5jdGlvbiBpKHQsZSl7cmV0dXJuIG5lKGUpPyhzLmluY2x1ZGVzKGUpfHxzLnB1c2goZSkscy5pbmRleE9mKGUp"
+    "KTplfWNvbnN0IHM9W107cmV0dXJuIEpTT04uc3RyaW5naWZ5KHQsaSkhPT1KU09OLnN0cmluZ2lmeShlLGkpfSkodD16aShoLnNl"
+    "dENvbnRleHQoUGkoZCx7dHlwZToic2VnbWVudCIscDA6ZSxwMTpmLHAwRGF0YUluZGV4OihpLTEpJXAscDFEYXRhSW5kZXg6aSVw"
+    "LGRhdGFzZXRJbmRleDpnfSkpKSxuKSYmYyhvLGktMSxyLmxvb3AsbiksZT1mLG49dH1vPGktMSYmYyhvLGktMSxyLmxvb3Asbil9"
+    "cmV0dXJuIG19cmV0dXJuIGV9ZnVuY3Rpb24gemkodCl7cmV0dXJue2JhY2tncm91bmRDb2xvcjp0LmJhY2tncm91bmRDb2xvcixi"
+    "b3JkZXJDYXBTdHlsZTp0LmJvcmRlckNhcFN0eWxlLGJvcmRlckRhc2g6dC5ib3JkZXJEYXNoLGJvcmRlckRhc2hPZmZzZXQ6dC5i"
+    "b3JkZXJEYXNoT2Zmc2V0LGJvcmRlckpvaW5TdHlsZTp0LmJvcmRlckpvaW5TdHlsZSxib3JkZXJXaWR0aDp0LmJvcmRlcldpZHRo"
+    "LGJvcmRlckNvbG9yOnQuYm9yZGVyQ29sb3J9fXZhciBGaT1PYmplY3QuZnJlZXplKHtfX3Byb3RvX186bnVsbCxIQUxGX1BJOkQs"
+    "SU5GSU5JVFk6dHQsUEk6UyxQSVRBVTpRLFFVQVJURVJfUEk6aXQsUkFEX1BFUl9ERUc6ZXQsVEFVOl8sVFdPX1RISVJEU19QSTpz"
+    "dCxfYWRkR3JhY2U6U2ksX2FsaWduUGl4ZWw6UmUsX2FsaWduU3RhcnRFbmQ6RSxfYW5nbGVCZXR3ZWVuOnB0LF9hbmdsZURpZmY6"
+    "ZnQsX2FycmF5VW5pcXVlOnd0LF9hdHRhY2hDb250ZXh0OiRlLF9iZXppZXJDdXJ2ZVRvOk5lLF9iZXppZXJJbnRlcnBvbGF0aW9u"
+    "Om1pLF9ib3VuZFNlZ21lbnQ6TGksX2JvdW5kU2VnbWVudHM6RWksX2NhcGl0YWxpemU6SyxfY29tcHV0ZVNlZ21lbnRzOlJpLF9j"
+    "cmVhdGVSZXNvbHZlcjpZZSxfZGVjaW1hbFBsYWNlczpkdCxfZGVwcmVjYXRlZDpmdW5jdGlvbih0LGUsaSxzKXt2b2lkIDAhPT1l"
+    "JiZjb25zb2xlLndhcm4odCsnOiAiJytpKyciIGlzIGRlcHJlY2F0ZWQuIFBsZWFzZSB1c2UgIicrcysnIiBpbnN0ZWFkJyl9LF9k"
+    "ZXNjcmlwdG9yczpVZSxfZWxlbWVudHNFcXVhbDpXLF9mYWN0b3JpemU6b3QsX2ZpbHRlckJldHdlZW46dnQsX2dldFBhcmVudE5v"
+    "ZGU6dmUsX2dldFN0YXJ0QW5kQ291bnRPZlZpc2libGVQb2ludHM6T3QsX2ludDE2UmFuZ2U6bXQsX2lzQmV0d2VlbjpjLF9pc0Ns"
+    "aWNrRXZlbnQ6SixfaXNEb21TdXBwb3J0ZWQ6eGUsX2lzUG9pbnRJbkFyZWE6TSxfbGltaXRWYWx1ZTpDLF9sb25nZXN0VGV4dDpF"
+    "ZSxfbG9va3VwOmJ0LF9sb29rdXBCeUtleTpmLF9tZWFzdXJlVGV4dDpMZSxfbWVyZ2VyOmosX21lcmdlcklmOlUsX25vcm1hbGl6"
+    "ZUFuZ2xlOnYsX3BhcnNlT2JqZWN0RGF0YVJhZGlhbFNjYWxlOmlpLF9wb2ludEluTGluZTpmaSxfcmVhZFZhbHVlVG9Qcm9wczp5"
+    "aSxfcmxvb2t1cEJ5S2V5Onh0LF9zY2FsZVJhbmdlc0NoYW5nZWQ6QXQsX3NldE1pbkFuZE1heEJ5S2V5Omh0LF9zcGxpdEtleTpx"
+    "LF9zdGVwcGVkSW50ZXJwb2xhdGlvbjpwaSxfc3RlcHBlZExpbmVUbzpXZSxfdGV4dFg6Q3QsX3RvTGVmdFJpZ2h0Q2VudGVyOkR0"
+    "LF91cGRhdGVCZXppZXJDb250cm9sUG9pbnRzOmhpLGFkZFJvdW5kZWRSZWN0UGF0aDpqZSxhbG1vc3RFcXVhbHM6YXQsYWxtb3N0"
+    "V2hvbGU6bHQsY2FsbGJhY2s6ZCxjbGVhckNhbnZhczpJZSxjbGlwQXJlYTpWZSxjbG9uZTpOLGNvbG9yOm9lLGNyZWF0ZUNvbnRl"
+    "eHQ6UGksZGVib3VuY2U6UHQsZGVmaW5lZDpHLGRpc3RhbmNlQmV0d2VlblBvaW50czpndCxkcmF3UG9pbnQ6emUsZHJhd1BvaW50"
+    "TGVnZW5kOkZlLGVhY2g6ayxlYXNpbmdFZmZlY3RzOmdpLGZpbml0ZU9yRGVmYXVsdDpnLGZvbnRTdHJpbmc6ZnVuY3Rpb24odCxl"
+    "LGkpe3JldHVybiBlKyIgIit0KyJweCAiK2l9LGZvcm1hdE51bWJlcjpkZSxnZXRBbmdsZUZyb21Qb2ludDp1dCxnZXRIb3ZlckNv"
+    "bG9yOnJlLGdldE1heGltdW1TaXplOkRlLGdldFJlbGF0aXZlUG9zaXRpb246U2UsZ2V0UnRsQWRhcHRlcjpEaSxnZXRTdHlsZTpN"
+    "ZSxpc0FycmF5Ok8saXNGaW5pdGU6cCxpc0Z1bmN0aW9uOnUsaXNOdWxsT3JVbmRlZjpQLGlzTnVtYmVyOnJ0LGlzT2JqZWN0OkEs"
+    "aXNQYXR0ZXJuT3JHcmFkaWVudDpuZSxsaXN0ZW5BcnJheUV2ZW50czp5dCxsb2cxMDpyLG1lcmdlOlksbWVyZ2VJZjokLG5pY2VO"
+    "dW06bnQsbm9vcDp0LG92ZXJyaWRlVGV4dERpcmVjdGlvbjpDaSxyZWFkVXNlZFNpemU6QWUscmVuZGVyVGV4dDpIZSxyZXF1ZXN0"
+    "QW5pbUZyYW1lOmt0LHJlc29sdmU6a2kscmVzb2x2ZU9iamVjdEtleTptLHJlc3RvcmVUZXh0RGlyZWN0aW9uOk9pLHJldGluYVNj"
+    "YWxlOkNlLHNldHNFcXVhbDpaLHNpZ246eSxzcGxpbmVDdXJ2ZTpvaSxzcGxpbmVDdXJ2ZU1vbm90b25lOnJpLHN1cHBvcnRzRXZl"
+    "bnRMaXN0ZW5lck9wdGlvbnM6T2UsdGhyb3R0bGVkOlN0LHRvRGVncmVlczpjdCx0b0RpbWVuc2lvbjpCLHRvRm9udDp6LHRvRm9u"
+    "dFN0cmluZzpUZSx0b0xpbmVIZWlnaHQ6dmksdG9QYWRkaW5nOkksdG9QZXJjZW50YWdlOlYsdG9SYWRpYW5zOkwsdG9UUkJMOk1p"
+    "LHRvVFJCTENvcm5lcnM6d2ksdWlkOkYsdW5jbGlwQXJlYTpCZSx1bmxpc3RlbkFycmF5RXZlbnRzOk10LHZhbHVlT3JEZWZhdWx0"
+    "OlR9KTtmdW5jdGlvbiBWaSh0LGkscyxhLG4pe3ZhciBvPXQuZ2V0U29ydGVkVmlzaWJsZURhdGFzZXRNZXRhcygpLHI9c1tpXTtm"
+    "b3IobGV0IHQ9MCxlPW8ubGVuZ3RoO3Q8ZTsrK3Qpe2NvbnN0e2luZGV4OnMsZGF0YTpsfT1vW3RdLHtsbzpoLGhpOmN9PWZ1bmN0"
+    "aW9uKHQsZSxpLHMpe2NvbnN0e2NvbnRyb2xsZXI6YSxkYXRhOm4sX3NvcnRlZDpvfT10LHI9YS5fY2FjaGVkTWV0YS5pU2NhbGU7"
+    "aWYociYmZT09PXIuYXhpcyYmInIiIT09ZSYmbyYmbi5sZW5ndGgpe2NvbnN0IHQ9ci5fcmV2ZXJzZVBpeGVscz94dDpmO2lmKCFz"
+    "KXJldHVybiB0KG4sZSxpKTtpZihhLl9zaGFyZWRPcHRpb25zKXtjb25zdCBzPW5bMF0sYT0iZnVuY3Rpb24iPT10eXBlb2Ygcy5n"
+    "ZXRSYW5nZSYmcy5nZXRSYW5nZShlKTtpZihhKXtjb25zdCBzPXQobixlLGktYSksbz10KG4sZSxpK2EpO3JldHVybntsbzpzLmxv"
+    "LGhpOm8uaGl9fX19cmV0dXJue2xvOjAsaGk6bi5sZW5ndGgtMX19KG9bdF0saSxyLG4pO2ZvcihsZXQgdD1oO3Q8PWM7Kyt0KXtj"
+    "b25zdCBpPWxbdF07aS5za2lwfHxhKGkscyx0KX19fWZ1bmN0aW9uIEJpKHMsYSx0LG4sbyl7Y29uc3Qgcj1bXTtyZXR1cm4ob3x8"
+    "cy5pc1BvaW50SW5BcmVhKGEpKSYmVmkocyx0LGEsZnVuY3Rpb24odCxlLGkpeyhvfHxNKHQscy5jaGFydEFyZWEsMCkpJiZ0Lmlu"
+    "UmFuZ2UoYS54LGEueSxuKSYmci5wdXNoKHtlbGVtZW50OnQsZGF0YXNldEluZGV4OmUsaW5kZXg6aX0pfSwhMCkscn1mdW5jdGlv"
+    "biBXaSh0LGUsaSxzLGEscil7e2lmKHJ8fHQuaXNQb2ludEluQXJlYShlKSl7aWYoInIiIT09aXx8cyl7dmFyIGw9dCxoPWUsYz1p"
+    "LGQ9cyx1PWEsZz1yO2xldCBuPVtdO2NvbnN0IG09ZnVuY3Rpb24odCl7Y29uc3Qgcz0tMSE9PXQuaW5kZXhPZigieCIpLGE9LTEh"
+    "PT10LmluZGV4T2YoInkiKTtyZXR1cm4gZnVuY3Rpb24odCxlKXt2YXIgaT1zP01hdGguYWJzKHQueC1lLngpOjAsdD1hP01hdGgu"
+    "YWJzKHQueS1lLnkpOjA7cmV0dXJuIE1hdGguc3FydChNYXRoLnBvdyhpLDIpK01hdGgucG93KHQsMikpfX0oYyk7bGV0IG89TnVt"
+    "YmVyLlBPU0lUSVZFX0lORklOSVRZO3JldHVybiBWaShsLGMsaCxmdW5jdGlvbih0LGUsaSl7dmFyIHMsYT10LmluUmFuZ2UoaC54"
+    "LGgueSx1KTtkJiYhYXx8KHM9dC5nZXRDZW50ZXJQb2ludCh1KSwoZ3x8bC5pc1BvaW50SW5BcmVhKHMpfHxhKSYmKChhPW0oaCxz"
+    "KSk8bz8obj1be2VsZW1lbnQ6dCxkYXRhc2V0SW5kZXg6ZSxpbmRleDppfV0sbz1hKTphPT09byYmbi5wdXNoKHtlbGVtZW50OnQs"
+    "ZGF0YXNldEluZGV4OmUsaW5kZXg6aX0pKSl9KSxufXt2YXIgZj1lLHA9YTtsZXQgbz1bXTtyZXR1cm4gVmkodCxpLGYsZnVuY3Rp"
+    "b24odCxlLGkpe3ZhcntzdGFydEFuZ2xlOnMsZW5kQW5nbGU6YX09dC5nZXRQcm9wcyhbInN0YXJ0QW5nbGUiLCJlbmRBbmdsZSJd"
+    "LHApLG49dXQodCx7eDpmLngseTpmLnl9KVsiYW5nbGUiXTtwdChuLHMsYSkmJm8ucHVzaCh7ZWxlbWVudDp0LGRhdGFzZXRJbmRl"
+    "eDplLGluZGV4Oml9KX0pLG99fXJldHVybltdfX1mdW5jdGlvbiBOaSh0LHMsYSxlLG4pe2NvbnN0IG89W10scj0ieCI9PT1hPyJp"
+    "blhSYW5nZSI6ImluWVJhbmdlIjtsZXQgbD0hMTtyZXR1cm4gVmkodCxhLHMsKHQsZSxpKT0+e3Rbcl0oc1thXSxuKSYmKG8ucHVz"
+    "aCh7ZWxlbWVudDp0LGRhdGFzZXRJbmRleDplLGluZGV4Oml9KSxsPWx8fHQuaW5SYW5nZShzLngscy55LG4pKX0pLGUmJiFsP1td"
+    "Om99dmFyIEhpPXtldmFsdWF0ZUludGVyYWN0aW9uSXRlbXM6VmksbW9kZXM6e2luZGV4KHQsZSxpLHMpe2NvbnN0IGE9U2UoZSx0"
+    "KSxuPWkuYXhpc3x8IngiLG89aS5pbmNsdWRlSW52aXNpYmxlfHwhMSxyPWkuaW50ZXJzZWN0P0JpKHQsYSxuLHMsbyk6V2kodCxh"
+    "LG4sITEscyxvKSxsPVtdO3JldHVybiByLmxlbmd0aD8odC5nZXRTb3J0ZWRWaXNpYmxlRGF0YXNldE1ldGFzKCkuZm9yRWFjaCh0"
+    "PT57dmFyIGU9clswXS5pbmRleCxpPXQuZGF0YVtlXTtpJiYhaS5za2lwJiZsLnB1c2goe2VsZW1lbnQ6aSxkYXRhc2V0SW5kZXg6"
+    "dC5pbmRleCxpbmRleDplfSl9KSxsKTpbXX0sZGF0YXNldCh0LGUsaSxzKXt2YXIgZT1TZShlLHQpLGE9aS5heGlzfHwieHkiLG49"
+    "aS5pbmNsdWRlSW52aXNpYmxlfHwhMTtsZXQgbz1pLmludGVyc2VjdD9CaSh0LGUsYSxzLG4pOldpKHQsZSxhLCExLHMsbik7aWYo"
+    "MDxvLmxlbmd0aCl7Y29uc3QgZT1vWzBdLmRhdGFzZXRJbmRleCxpPXQuZ2V0RGF0YXNldE1ldGEoZSkuZGF0YTtvPVtdO2Zvcihs"
+    "ZXQgdD0wO3Q8aS5sZW5ndGg7Kyt0KW8ucHVzaCh7ZWxlbWVudDppW3RdLGRhdGFzZXRJbmRleDplLGluZGV4OnR9KX1yZXR1cm4g"
+    "b30scG9pbnQ6KHQsZSxpLHMpPT5CaSh0LFNlKGUsdCksaS5heGlzfHwieHkiLHMsaS5pbmNsdWRlSW52aXNpYmxlfHwhMSksbmVh"
+    "cmVzdCh0LGUsaSxzKXt2YXIgZT1TZShlLHQpLGE9aS5heGlzfHwieHkiLG49aS5pbmNsdWRlSW52aXNpYmxlfHwhMTtyZXR1cm4g"
+    "V2kodCxlLGEsaS5pbnRlcnNlY3QscyxuKX0seDoodCxlLGkscyk9Pk5pKHQsU2UoZSx0KSwieCIsaS5pbnRlcnNlY3QscykseToo"
+    "dCxlLGkscyk9Pk5pKHQsU2UoZSx0KSwieSIsaS5pbnRlcnNlY3Qscyl9fTtjb25zdCBqaT1bImxlZnQiLCJ0b3AiLCJyaWdodCIs"
+    "ImJvdHRvbSJdO2Z1bmN0aW9uIFlpKHQsZSl7cmV0dXJuIHQuZmlsdGVyKHQ9PnQucG9zPT09ZSl9ZnVuY3Rpb24gJGkodCxlKXty"
+    "ZXR1cm4gdC5maWx0ZXIodD0+LTE9PT1qaS5pbmRleE9mKHQucG9zKSYmdC5ib3guYXhpcz09PWUpfWZ1bmN0aW9uIFVpKHQscyl7"
+    "cmV0dXJuIHQuc29ydCgodCxlKT0+e3ZhciBpPXM/ZTp0LHQ9cz90OmU7cmV0dXJuIGkud2VpZ2h0PT09dC53ZWlnaHQ/aS5pbmRl"
+    "eC10LmluZGV4Omkud2VpZ2h0LXQud2VpZ2h0fSl9ZnVuY3Rpb24gWGkodCxlLGkscyl7cmV0dXJuIE1hdGgubWF4KHRbaV0sZVtp"
+    "XSkrTWF0aC5tYXgodFtzXSxlW3NdKX1mdW5jdGlvbiBxaSh0LGUpe3QudG9wPU1hdGgubWF4KHQudG9wLGUudG9wKSx0LmxlZnQ9"
+    "TWF0aC5tYXgodC5sZWZ0LGUubGVmdCksdC5ib3R0b209TWF0aC5tYXgodC5ib3R0b20sZS5ib3R0b20pLHQucmlnaHQ9TWF0aC5t"
+    "YXgodC5yaWdodCxlLnJpZ2h0KX1mdW5jdGlvbiBLaSh0LGUsaSxzKXtjb25zdCBhPVtdO2xldCBuLG8scixsLGgsYztmb3Iobj0w"
+    "LG89dC5sZW5ndGgsaD0wO248bzsrK24pe3I9dFtuXSwobD1yLmJveCkudXBkYXRlKHIud2lkdGh8fGUudyxyLmhlaWdodHx8ZS5o"
+    "LGZ1bmN0aW9uKHQsZSl7Y29uc3QgaT1lLm1heFBhZGRpbmc7e2NvbnN0IHM9e2xlZnQ6MCx0b3A6MCxyaWdodDowLGJvdHRvbTow"
+    "fTtyZXR1cm4odD10P1sibGVmdCIsInJpZ2h0Il06WyJ0b3AiLCJib3R0b20iXSkuZm9yRWFjaCh0PT57c1t0XT1NYXRoLm1heChl"
+    "W3RdLGlbdF0pfSksc319KHIuaG9yaXpvbnRhbCxlKSk7Y29uc3R7c2FtZTpvLG90aGVyOmR9PWZ1bmN0aW9uKHQsZSxpLHMpe2Nv"
+    "bnN0e3BvczphLGJveDpufT1pLG89dC5tYXhQYWRkaW5nO2lmKCFBKGEpKXtpLnNpemUmJih0W2FdLT1pLnNpemUpO2NvbnN0IGU9"
+    "c1tpLnN0YWNrXXx8e3NpemU6MCxjb3VudDoxfTtlLnNpemU9TWF0aC5tYXgoZS5zaXplLGkuaG9yaXpvbnRhbD9uLmhlaWdodDpu"
+    "LndpZHRoKSxpLnNpemU9ZS5zaXplL2UuY291bnQsdFthXSs9aS5zaXplfW4uZ2V0UGFkZGluZyYmcWkobyxuLmdldFBhZGRpbmco"
+    "KSk7dmFyIHM9TWF0aC5tYXgoMCxlLm91dGVyV2lkdGgtWGkobyx0LCJsZWZ0IiwicmlnaHQiKSksZT1NYXRoLm1heCgwLGUub3V0"
+    "ZXJIZWlnaHQtWGkobyx0LCJ0b3AiLCJib3R0b20iKSkscj1zIT09dC53LGw9ZSE9PXQuaDtyZXR1cm4gdC53PXMsdC5oPWUsaS5o"
+    "b3Jpem9udGFsP3tzYW1lOnIsb3RoZXI6bH06e3NhbWU6bCxvdGhlcjpyfX0oZSxpLHIscyk7aHw9byYmYS5sZW5ndGgsYz1jfHxk"
+    "LGwuZnVsbFNpemV8fGEucHVzaChyKX1yZXR1cm4gaCYmS2koYSxlLGkscyl8fGN9ZnVuY3Rpb24gR2kodCxlLGkscyxhKXt0LnRv"
+    "cD1pLHQubGVmdD1lLHQucmlnaHQ9ZStzLHQuYm90dG9tPWkrYSx0LndpZHRoPXMsdC5oZWlnaHQ9YX1mdW5jdGlvbiBaaSh0LGUs"
+    "aSxzKXt2YXIgYT1pLnBhZGRpbmc7bGV0e3g6bix5Om99PWU7Zm9yKGNvbnN0IHIgb2YgdCl7Y29uc3QgdD1yLmJveCxsPXNbci5z"
+    "dGFja118fHtjb3VudDoxLHBsYWNlZDowLHdlaWdodDoxfSxoPXIuc3RhY2tXZWlnaHQvbC53ZWlnaHR8fDE7aWYoci5ob3Jpem9u"
+    "dGFsKXtjb25zdCBzPWUudypoLG49bC5zaXplfHx0LmhlaWdodDtHKGwuc3RhcnQpJiYobz1sLnN0YXJ0KSx0LmZ1bGxTaXplP0dp"
+    "KHQsYS5sZWZ0LG8saS5vdXRlcldpZHRoLWEucmlnaHQtYS5sZWZ0LG4pOkdpKHQsZS5sZWZ0K2wucGxhY2VkLG8scyxuKSxsLnN0"
+    "YXJ0PW8sbC5wbGFjZWQrPXMsbz10LmJvdHRvbX1lbHNle2NvbnN0IHM9ZS5oKmgsbz1sLnNpemV8fHQud2lkdGg7RyhsLnN0YXJ0"
+    "KSYmKG49bC5zdGFydCksdC5mdWxsU2l6ZT9HaSh0LG4sYS50b3AsbyxpLm91dGVySGVpZ2h0LWEuYm90dG9tLWEudG9wKTpHaSh0"
+    "LG4sZS50b3ArbC5wbGFjZWQsbyxzKSxsLnN0YXJ0PW4sbC5wbGFjZWQrPXMsbj10LnJpZ2h0fX1lLng9bixlLnk9b312YXIgYT17"
+    "YWRkQm94KHQsZSl7dC5ib3hlc3x8KHQuYm94ZXM9W10pLGUuZnVsbFNpemU9ZS5mdWxsU2l6ZXx8ITEsZS5wb3NpdGlvbj1lLnBv"
+    "c2l0aW9ufHwidG9wIixlLndlaWdodD1lLndlaWdodHx8MCxlLl9sYXllcnM9ZS5fbGF5ZXJzfHxmdW5jdGlvbigpe3JldHVyblt7"
+    "ejowLGRyYXcodCl7ZS5kcmF3KHQpfX1dfSx0LmJveGVzLnB1c2goZSl9LHJlbW92ZUJveCh0LGUpe2U9dC5ib3hlcz90LmJveGVz"
+    "LmluZGV4T2YoZSk6LTE7LTEhPT1lJiZ0LmJveGVzLnNwbGljZShlLDEpfSxjb25maWd1cmUodCxlLGkpe2UuZnVsbFNpemU9aS5m"
+    "dWxsU2l6ZSxlLnBvc2l0aW9uPWkucG9zaXRpb24sZS53ZWlnaHQ9aS53ZWlnaHR9LHVwZGF0ZShsLHQsZSxpKXtpZihsKXtjb25z"
+    "dCBvPUkobC5vcHRpb25zLmxheW91dC5wYWRkaW5nKSxyPU1hdGgubWF4KHQtby53aWR0aCwwKSxoPU1hdGgubWF4KGUtby5oZWln"
+    "aHQsMCksYz1mdW5jdGlvbigpe2NvbnN0IHQ9ZnVuY3Rpb24odCl7Y29uc3QgZT1bXTtsZXQgaSxzLGEsbixvLHI7Zm9yKGk9MCxz"
+    "PSh0fHxbXSkubGVuZ3RoO2k8czsrK2kpKHtwb3NpdGlvbjpuLG9wdGlvbnM6e3N0YWNrOm8sc3RhY2tXZWlnaHQ6cj0xfX09YT10"
+    "W2ldKSxlLnB1c2goe2luZGV4OmksYm94OmEscG9zOm4saG9yaXpvbnRhbDphLmlzSG9yaXpvbnRhbCgpLHdlaWdodDphLndlaWdo"
+    "dCxzdGFjazpvJiZuK28sc3RhY2tXZWlnaHQ6cn0pO3JldHVybiBlfShsLmJveGVzKSxlPVVpKHQuZmlsdGVyKHQ9PnQuYm94LmZ1"
+    "bGxTaXplKSwhMCksaT1VaShZaSh0LCJsZWZ0IiksITApLHM9VWkoWWkodCwicmlnaHQiKSksYT1VaShZaSh0LCJ0b3AiKSwhMCks"
+    "bj1VaShZaSh0LCJib3R0b20iKSksbz0kaSh0LCJ4Iikscj0kaSh0LCJ5Iik7cmV0dXJue2Z1bGxTaXplOmUsbGVmdEFuZFRvcDpp"
+    "LmNvbmNhdChhKSxyaWdodEFuZEJvdHRvbTpzLmNvbmNhdChyKS5jb25jYXQobikuY29uY2F0KG8pLGNoYXJ0QXJlYTpZaSh0LCJj"
+    "aGFydEFyZWEiKSx2ZXJ0aWNhbDppLmNvbmNhdChzKS5jb25jYXQociksaG9yaXpvbnRhbDphLmNvbmNhdChuKS5jb25jYXQobyl9"
+    "fSgpLGQ9Yy52ZXJ0aWNhbCx1PWMuaG9yaXpvbnRhbDtrKGwuYm94ZXMsdD0+eyJmdW5jdGlvbiI9PXR5cGVvZiB0LmJlZm9yZUxh"
+    "eW91dCYmdC5iZWZvcmVMYXlvdXQoKX0pO3ZhciBzPWQucmVkdWNlKCh0LGUpPT5lLmJveC5vcHRpb25zJiYhMT09PWUuYm94Lm9w"
+    "dGlvbnMuZGlzcGxheT90OnQrMSwwKXx8MSx0PU9iamVjdC5mcmVlemUoe291dGVyV2lkdGg6dCxvdXRlckhlaWdodDplLHBhZGRp"
+    "bmc6byxhdmFpbGFibGVXaWR0aDpyLGF2YWlsYWJsZUhlaWdodDpoLHZCb3hNYXhXaWR0aDpyLzIvcyxoQm94TWF4SGVpZ2h0Omgv"
+    "Mn0pLGU9T2JqZWN0LmFzc2lnbih7fSxvKTtxaShlLEkoaSkpO2NvbnN0IGc9T2JqZWN0LmFzc2lnbih7bWF4UGFkZGluZzplLHc6"
+    "cixoOmgseDpvLmxlZnQseTpvLnRvcH0sbyksZj1mdW5jdGlvbih0LGUpe3ZhciBpPWZ1bmN0aW9uKHQpe2NvbnN0IGU9e307Zm9y"
+    "KGNvbnN0IGkgb2YgdCl7Y29uc3R7c3RhY2s6dCxwb3M6cyxzdGFja1dlaWdodDphfT1pO2lmKHQmJmppLmluY2x1ZGVzKHMpKXtj"
+    "b25zdCBuPWVbdF18fChlW3RdPXtjb3VudDowLHBsYWNlZDowLHdlaWdodDowLHNpemU6MH0pO24uY291bnQrKyxuLndlaWdodCs9"
+    "YX19cmV0dXJuIGV9KHQpLHt2Qm94TWF4V2lkdGg6cyxoQm94TWF4SGVpZ2h0OmF9PWU7bGV0IG4sbyxyO2ZvcihuPTAsbz10Lmxl"
+    "bmd0aDtuPG87KytuKXtjb25zdCBvPShyPXRbbl0pLmJveFsiZnVsbFNpemUiXSxsPWlbci5zdGFja10saD1sJiZyLnN0YWNrV2Vp"
+    "Z2h0L2wud2VpZ2h0O3IuaG9yaXpvbnRhbD8oci53aWR0aD1oP2gqczpvJiZlLmF2YWlsYWJsZVdpZHRoLHIuaGVpZ2h0PWEpOihy"
+    "LndpZHRoPXMsci5oZWlnaHQ9aD9oKmE6byYmZS5hdmFpbGFibGVIZWlnaHQpfXJldHVybiBpfShkLmNvbmNhdCh1KSx0KTtLaShj"
+    "LmZ1bGxTaXplLGcsdCxmKSxLaShkLGcsdCxmKSxLaSh1LGcsdCxmKSYmS2koZCxnLHQsZik7e3ZhciBhPWc7Y29uc3QgcD1hLm1h"
+    "eFBhZGRpbmc7ZnVuY3Rpb24gbih0KXt2YXIgZT1NYXRoLm1heChwW3RdLWFbdF0sMCk7cmV0dXJuIGFbdF0rPWUsZX1hLnkrPW4o"
+    "InRvcCIpLGEueCs9bigibGVmdCIpLG4oInJpZ2h0IiksbigiYm90dG9tIil9WmkoYy5sZWZ0QW5kVG9wLGcsdCxmKSxnLngrPWcu"
+    "dyxnLnkrPWcuaCxaaShjLnJpZ2h0QW5kQm90dG9tLGcsdCxmKSxsLmNoYXJ0QXJlYT17bGVmdDpnLmxlZnQsdG9wOmcudG9wLHJp"
+    "Z2h0OmcubGVmdCtnLncsYm90dG9tOmcudG9wK2cuaCxoZWlnaHQ6Zy5oLHdpZHRoOmcud30sayhjLmNoYXJ0QXJlYSx0PT57Y29u"
+    "c3QgZT10LmJveDtPYmplY3QuYXNzaWduKGUsbC5jaGFydEFyZWEpLGUudXBkYXRlKGcudyxnLmgse2xlZnQ6MCx0b3A6MCxyaWdo"
+    "dDowLGJvdHRvbTowfSl9KX19fTtjbGFzcyBKaXthY3F1aXJlQ29udGV4dCh0LGUpe31yZWxlYXNlQ29udGV4dCh0KXtyZXR1cm4h"
+    "MX1hZGRFdmVudExpc3RlbmVyKHQsZSxpKXt9cmVtb3ZlRXZlbnRMaXN0ZW5lcih0LGUsaSl7fWdldERldmljZVBpeGVsUmF0aW8o"
+    "KXtyZXR1cm4gMX1nZXRNYXhpbXVtU2l6ZSh0LGUsaSxzKXtyZXR1cm4gZT1NYXRoLm1heCgwLGV8fHQud2lkdGgpLGk9aXx8dC5o"
+    "ZWlnaHQse3dpZHRoOmUsaGVpZ2h0Ok1hdGgubWF4KDAscz9NYXRoLmZsb29yKGUvcyk6aSl9fWlzQXR0YWNoZWQodCl7cmV0dXJu"
+    "ITB9dXBkYXRlQ29uZmlnKHQpe319Y2xhc3MgUWkgZXh0ZW5kcyBKaXthY3F1aXJlQ29udGV4dCh0KXtyZXR1cm4gdCYmdC5nZXRD"
+    "b250ZXh0JiZ0LmdldENvbnRleHQoIjJkIil8fG51bGx9dXBkYXRlQ29uZmlnKHQpe3Qub3B0aW9ucy5hbmltYXRpb249ITF9fWNv"
+    "bnN0IHRzPSIkY2hhcnRqcyIsZXM9e3RvdWNoc3RhcnQ6Im1vdXNlZG93biIsdG91Y2htb3ZlOiJtb3VzZW1vdmUiLHRvdWNoZW5k"
+    "OiJtb3VzZXVwIixwb2ludGVyZW50ZXI6Im1vdXNlZW50ZXIiLHBvaW50ZXJkb3duOiJtb3VzZWRvd24iLHBvaW50ZXJtb3ZlOiJt"
+    "b3VzZW1vdmUiLHBvaW50ZXJ1cDoibW91c2V1cCIscG9pbnRlcmxlYXZlOiJtb3VzZW91dCIscG9pbnRlcm91dDoibW91c2VvdXQi"
+    "fSxpcz10PT5udWxsPT09dHx8IiI9PT10LHNzPSEhT2UmJntwYXNzaXZlOiEwfTtmdW5jdGlvbiBhcyh0LGUpe2Zvcihjb25zdCBp"
+    "IG9mIHQpaWYoaT09PWV8fGkuY29udGFpbnMoZSkpcmV0dXJuITB9ZnVuY3Rpb24gbnModCxlLGkpe2NvbnN0IHM9dC5jYW52YXMs"
+    "YT1uZXcgTXV0YXRpb25PYnNlcnZlcih0PT57bGV0IGU9ITE7Zm9yKGNvbnN0IGkgb2YgdCllPWV8fGFzKGkuYWRkZWROb2Rlcyxz"
+    "KSxlPWUmJiFhcyhpLnJlbW92ZWROb2RlcyxzKTtlJiZpKCl9KTtyZXR1cm4gYS5vYnNlcnZlKGRvY3VtZW50LHtjaGlsZExpc3Q6"
+    "ITAsc3VidHJlZTohMH0pLGF9ZnVuY3Rpb24gb3ModCxlLGkpe2NvbnN0IHM9dC5jYW52YXMsYT1uZXcgTXV0YXRpb25PYnNlcnZl"
+    "cih0PT57bGV0IGU9ITE7Zm9yKGNvbnN0IGkgb2YgdCllPWV8fGFzKGkucmVtb3ZlZE5vZGVzLHMpLGU9ZSYmIWFzKGkuYWRkZWRO"
+    "b2RlcyxzKTtlJiZpKCl9KTtyZXR1cm4gYS5vYnNlcnZlKGRvY3VtZW50LHtjaGlsZExpc3Q6ITAsc3VidHJlZTohMH0pLGF9Y29u"
+    "c3QgcnM9bmV3IE1hcDtsZXQgbHM9MDtmdW5jdGlvbiBocygpe2NvbnN0IGk9d2luZG93LmRldmljZVBpeGVsUmF0aW87aSE9PWxz"
+    "JiYobHM9aSxycy5mb3JFYWNoKCh0LGUpPT57ZS5jdXJyZW50RGV2aWNlUGl4ZWxSYXRpbyE9PWkmJnQoKX0pKX1mdW5jdGlvbiBj"
+    "cyh0LGUscyl7Y29uc3QgaT10LmNhbnZhcyxhPWkmJnZlKGkpO2lmKGEpe2NvbnN0IG89U3QoKHQsZSk9Pnt2YXIgaT1hLmNsaWVu"
+    "dFdpZHRoO3ModCxlKSxpPGEuY2xpZW50V2lkdGgmJnMoKX0sd2luZG93KSxyPW5ldyBSZXNpemVPYnNlcnZlcih0PT57dmFyIHQ9"
+    "dFswXSxlPXQuY29udGVudFJlY3Qud2lkdGgsdD10LmNvbnRlbnRSZWN0LmhlaWdodDswPT09ZSYmMD09PXR8fG8oZSx0KX0pO3Jl"
+    "dHVybiByLm9ic2VydmUoYSksdD10LG49byxycy5zaXplfHx3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcigicmVzaXplIixocykscnMu"
+    "c2V0KHQsbikscjt2YXIgbn19ZnVuY3Rpb24gZHModCxlLGkpe2kmJmkuZGlzY29ubmVjdCgpLCJyZXNpemUiPT09ZSYmKGk9dCxy"
+    "cy5kZWxldGUoaSkscnMuc2l6ZXx8d2luZG93LnJlbW92ZUV2ZW50TGlzdGVuZXIoInJlc2l6ZSIsaHMpKX1mdW5jdGlvbiB1cyhl"
+    "LHQsaSl7dmFyIHM9ZS5jYW52YXMsYT1TdCh0PT57bnVsbCE9PWUuY3R4JiZpKGZ1bmN0aW9uKHQsZSl7dmFyIGk9ZXNbdC50eXBl"
+    "XXx8dC50eXBlLHt4OnMseTphfT1TZSh0LGUpO3JldHVybnt0eXBlOmksY2hhcnQ6ZSxuYXRpdmU6dCx4OnZvaWQgMCE9PXM/czpu"
+    "dWxsLHk6dm9pZCAwIT09YT9hOm51bGx9fSh0LGUpKX0sZSk7cmV0dXJuIHMuYWRkRXZlbnRMaXN0ZW5lcih0LGEsc3MpLGF9Y2xh"
+    "c3MgZ3MgZXh0ZW5kcyBKaXthY3F1aXJlQ29udGV4dCh0LGUpe3ZhciBpPXQmJnQuZ2V0Q29udGV4dCYmdC5nZXRDb250ZXh0KCIy"
+    "ZCIpO3tpZihpJiZpLmNhbnZhcz09PXQpe3t2YXIgcz1lO2NvbnN0IGE9dC5zdHlsZSxuPXQuZ2V0QXR0cmlidXRlKCJoZWlnaHQi"
+    "KSxvPXQuZ2V0QXR0cmlidXRlKCJ3aWR0aCIpO2lmKHRbdHNdPXtpbml0aWFsOntoZWlnaHQ6bix3aWR0aDpvLHN0eWxlOntkaXNw"
+    "bGF5OmEuZGlzcGxheSxoZWlnaHQ6YS5oZWlnaHQsd2lkdGg6YS53aWR0aH19fSxhLmRpc3BsYXk9YS5kaXNwbGF5fHwiYmxvY2si"
+    "LGEuYm94U2l6aW5nPWEuYm94U2l6aW5nfHwiYm9yZGVyLWJveCIsaXMobykpe2NvbnN0IHM9QWUodCwid2lkdGgiKTt2b2lkIDAh"
+    "PT1zJiYodC53aWR0aD1zKX1pZihpcyhuKSlpZigiIj09PXQuc3R5bGUuaGVpZ2h0KXQuaGVpZ2h0PXQud2lkdGgvKHN8fDIpO2Vs"
+    "c2V7Y29uc3Qgcz1BZSh0LCJoZWlnaHQiKTt2b2lkIDAhPT1zJiYodC5oZWlnaHQ9cyl9fXJldHVybiBpfXJldHVybiBudWxsfX1y"
+    "ZWxlYXNlQ29udGV4dCh0KXtjb25zdCBpPXQuY2FudmFzO2lmKCFpW3RzXSlyZXR1cm4hMTtjb25zdCBzPWlbdHNdLmluaXRpYWws"
+    "ZT0oWyJoZWlnaHQiLCJ3aWR0aCJdLmZvckVhY2godD0+e3ZhciBlPXNbdF07UChlKT9pLnJlbW92ZUF0dHJpYnV0ZSh0KTppLnNl"
+    "dEF0dHJpYnV0ZSh0LGUpfSkscy5zdHlsZXx8e30pO3JldHVybiBPYmplY3Qua2V5cyhlKS5mb3JFYWNoKHQ9PntpLnN0eWxlW3Rd"
+    "PWVbdF19KSxpLndpZHRoPWkud2lkdGgsZGVsZXRlIGlbdHNdLCEwfWFkZEV2ZW50TGlzdGVuZXIodCxlLGkpe3RoaXMucmVtb3Zl"
+    "RXZlbnRMaXN0ZW5lcih0LGUpO2NvbnN0IHM9dC4kcHJveGllc3x8KHQuJHByb3hpZXM9e30pLGE9e2F0dGFjaDpucyxkZXRhY2g6"
+    "b3MscmVzaXplOmNzfVtlXXx8dXM7c1tlXT1hKHQsZSxpKX1yZW1vdmVFdmVudExpc3RlbmVyKHQsZSl7Y29uc3QgaT10LiRwcm94"
+    "aWVzfHwodC4kcHJveGllcz17fSkscz1pW2VdO3MmJigoe2F0dGFjaDpkcyxkZXRhY2g6ZHMscmVzaXplOmRzfVtlXXx8ZnVuY3Rp"
+    "b24odCxlLGkpe3QuY2FudmFzLnJlbW92ZUV2ZW50TGlzdGVuZXIoZSxpLHNzKX0pKHQsZSxzKSxpW2VdPXZvaWQgMCl9Z2V0RGV2"
+    "aWNlUGl4ZWxSYXRpbygpe3JldHVybiB3aW5kb3cuZGV2aWNlUGl4ZWxSYXRpb31nZXRNYXhpbXVtU2l6ZSh0LGUsaSxzKXtyZXR1"
+    "cm4gRGUodCxlLGkscyl9aXNBdHRhY2hlZCh0KXt0PXZlKHQpO3JldHVybiEoIXR8fCF0LmlzQ29ubmVjdGVkKX19ZnVuY3Rpb24g"
+    "ZnModCl7cmV0dXJuIXhlKCl8fCJ1bmRlZmluZWQiIT10eXBlb2YgT2Zmc2NyZWVuQ2FudmFzJiZ0IGluc3RhbmNlb2YgT2Zmc2Ny"
+    "ZWVuQ2FudmFzP1FpOmdzfU9lPU9iamVjdC5mcmVlemUoe19fcHJvdG9fXzpudWxsLEJhc2VQbGF0Zm9ybTpKaSxCYXNpY1BsYXRm"
+    "b3JtOlFpLERvbVBsYXRmb3JtOmdzLF9kZXRlY3RQbGF0Zm9ybTpmc30pO2NvbnN0IHBzPSJ0cmFuc3BhcmVudCIsbXM9e2Jvb2xl"
+    "YW46KHQsZSxpKT0+LjU8aT9lOnQsY29sb3IodCxlLGkpe2NvbnN0IHM9b2UodHx8cHMpLGE9cy52YWxpZCYmb2UoZXx8cHMpO3Jl"
+    "dHVybiBhJiZhLnZhbGlkP2EubWl4KHMsaSkuaGV4U3RyaW5nKCk6ZX0sbnVtYmVyOih0LGUsaSk9PnQrKGUtdCkqaX07Y2xhc3Mg"
+    "YnN7Y29uc3RydWN0b3IodCxlLGkscyl7dmFyIGE9ZVtpXSxhPShzPWtpKFt0LnRvLHMsYSx0LmZyb21dKSxraShbdC5mcm9tLGEs"
+    "c10pKTt0aGlzLl9hY3RpdmU9ITAsdGhpcy5fZm49dC5mbnx8bXNbdC50eXBlfHx0eXBlb2YgYV0sdGhpcy5fZWFzaW5nPWdpW3Qu"
+    "ZWFzaW5nXXx8Z2kubGluZWFyLHRoaXMuX3N0YXJ0PU1hdGguZmxvb3IoRGF0ZS5ub3coKSsodC5kZWxheXx8MCkpLHRoaXMuX2R1"
+    "cmF0aW9uPXRoaXMuX3RvdGFsPU1hdGguZmxvb3IodC5kdXJhdGlvbiksdGhpcy5fbG9vcD0hIXQubG9vcCx0aGlzLl90YXJnZXQ9"
+    "ZSx0aGlzLl9wcm9wPWksdGhpcy5fZnJvbT1hLHRoaXMuX3RvPXMsdGhpcy5fcHJvbWlzZXM9dm9pZCAwfWFjdGl2ZSgpe3JldHVy"
+    "biB0aGlzLl9hY3RpdmV9dXBkYXRlKHQsZSxpKXt2YXIgcyxhLG47dGhpcy5fYWN0aXZlJiYodGhpcy5fbm90aWZ5KCExKSxzPXRo"
+    "aXMuX3RhcmdldFt0aGlzLl9wcm9wXSxhPWktdGhpcy5fc3RhcnQsbj10aGlzLl9kdXJhdGlvbi1hLHRoaXMuX3N0YXJ0PWksdGhp"
+    "cy5fZHVyYXRpb249TWF0aC5mbG9vcihNYXRoLm1heChuLHQuZHVyYXRpb24pKSx0aGlzLl90b3RhbCs9YSx0aGlzLl9sb29wPSEh"
+    "dC5sb29wLHRoaXMuX3RvPWtpKFt0LnRvLGUscyx0LmZyb21dKSx0aGlzLl9mcm9tPWtpKFt0LmZyb20scyxlXSkpfWNhbmNlbCgp"
+    "e3RoaXMuX2FjdGl2ZSYmKHRoaXMudGljayhEYXRlLm5vdygpKSx0aGlzLl9hY3RpdmU9ITEsdGhpcy5fbm90aWZ5KCExKSl9dGlj"
+    "ayh0KXt2YXIgdD10LXRoaXMuX3N0YXJ0LGU9dGhpcy5fZHVyYXRpb24saT10aGlzLl9wcm9wLHM9dGhpcy5fZnJvbSxhPXRoaXMu"
+    "X2xvb3Asbj10aGlzLl90bztsZXQgbztpZih0aGlzLl9hY3RpdmU9cyE9PW4mJihhfHx0PGUpLCF0aGlzLl9hY3RpdmUpcmV0dXJu"
+    "IHRoaXMuX3RhcmdldFtpXT1uLHZvaWQgdGhpcy5fbm90aWZ5KCEwKTt0PDA/dGhpcy5fdGFyZ2V0W2ldPXM6KG89dC9lJTIsbz1h"
+    "JiYxPG8/Mi1vOm8sbz10aGlzLl9lYXNpbmcoTWF0aC5taW4oMSxNYXRoLm1heCgwLG8pKSksdGhpcy5fdGFyZ2V0W2ldPXRoaXMu"
+    "X2ZuKHMsbixvKSl9d2FpdCgpe2NvbnN0IGk9dGhpcy5fcHJvbWlzZXN8fCh0aGlzLl9wcm9taXNlcz1bXSk7cmV0dXJuIG5ldyBQ"
+    "cm9taXNlKCh0LGUpPT57aS5wdXNoKHtyZXM6dCxyZWo6ZX0pfSl9X25vdGlmeSh0KXtjb25zdCBlPXQ/InJlcyI6InJlaiIsaT10"
+    "aGlzLl9wcm9taXNlc3x8W107Zm9yKGxldCB0PTA7dDxpLmxlbmd0aDt0KyspaVt0XVtlXSgpfX1jbGFzcyB4c3tjb25zdHJ1Y3Rv"
+    "cih0LGUpe3RoaXMuX2NoYXJ0PXQsdGhpcy5fcHJvcGVydGllcz1uZXcgTWFwLHRoaXMuY29uZmlndXJlKGUpfWNvbmZpZ3VyZShz"
+    "KXtpZihBKHMpKXtjb25zdCBhPU9iamVjdC5rZXlzKFIuYW5pbWF0aW9uKSxuPXRoaXMuX3Byb3BlcnRpZXM7T2JqZWN0LmdldE93"
+    "blByb3BlcnR5TmFtZXMocykuZm9yRWFjaChlPT57Y29uc3QgdD1zW2VdO2lmKEEodCkpe2NvbnN0IGk9e307Zm9yKGNvbnN0IHMg"
+    "b2YgYSlpW3NdPXRbc107KE8odC5wcm9wZXJ0aWVzKSYmdC5wcm9wZXJ0aWVzfHxbZV0pLmZvckVhY2godD0+e3QhPT1lJiZuLmhh"
+    "cyh0KXx8bi5zZXQodCxpKX0pfX0pfX1fYW5pbWF0ZU9wdGlvbnModCxlKXtjb25zdCBpPWUub3B0aW9ucyxzPWZ1bmN0aW9uKGUs"
+    "aSl7aWYoaSl7bGV0IHQ9ZS5vcHRpb25zO2lmKHQpcmV0dXJuIHQuJHNoYXJlZCYmKGUub3B0aW9ucz10PU9iamVjdC5hc3NpZ24o"
+    "e30sdCx7JHNoYXJlZDohMSwkYW5pbWF0aW9uczp7fX0pKSx0O2Uub3B0aW9ucz1pfX0odCxpKTtpZighcylyZXR1cm5bXTtlPXRo"
+    "aXMuX2NyZWF0ZUFuaW1hdGlvbnMocyxpKTtyZXR1cm4gaS4kc2hhcmVkJiZmdW5jdGlvbihlLHQpe2NvbnN0IGk9W10scz1PYmpl"
+    "Y3Qua2V5cyh0KTtmb3IobGV0IHQ9MDt0PHMubGVuZ3RoO3QrKyl7Y29uc3QgYT1lW3NbdF1dO2EmJmEuYWN0aXZlKCkmJmkucHVz"
+    "aChhLndhaXQoKSl9cmV0dXJuIFByb21pc2UuYWxsKGkpfSh0Lm9wdGlvbnMuJGFuaW1hdGlvbnMsaSkudGhlbigoKT0+e3Qub3B0"
+    "aW9ucz1pfSwoKT0+e30pLGV9X2NyZWF0ZUFuaW1hdGlvbnMoZSxpKXtjb25zdCBzPXRoaXMuX3Byb3BlcnRpZXMsYT1bXSxuPWUu"
+    "JGFuaW1hdGlvbnN8fChlLiRhbmltYXRpb25zPXt9KSx0PU9iamVjdC5rZXlzKGkpLG89RGF0ZS5ub3coKTtsZXQgcjtmb3Iocj10"
+    "Lmxlbmd0aC0xOzA8PXI7LS1yKXtjb25zdCBjPXRbcl07aWYoIiQiIT09Yy5jaGFyQXQoMCkpaWYoIm9wdGlvbnMiPT09YylhLnB1"
+    "c2goLi4udGhpcy5fYW5pbWF0ZU9wdGlvbnMoZSxpKSk7ZWxzZXt2YXIgbD1pW2NdO2xldCB0PW5bY107dmFyIGg9cy5nZXQoYyk7"
+    "aWYodCl7aWYoaCYmdC5hY3RpdmUoKSl7dC51cGRhdGUoaCxsLG8pO2NvbnRpbnVlfXQuY2FuY2VsKCl9aCYmaC5kdXJhdGlvbj8o"
+    "bltjXT10PW5ldyBicyhoLGUsYyxsKSxhLnB1c2godCkpOmVbY109bH19cmV0dXJuIGF9dXBkYXRlKHQsZSl7e2lmKDAhPT10aGlz"
+    "Ll9wcm9wZXJ0aWVzLnNpemUpcmV0dXJuKHQ9dGhpcy5fY3JlYXRlQW5pbWF0aW9ucyh0LGUpKS5sZW5ndGg/KGwuYWRkKHRoaXMu"
+    "X2NoYXJ0LHQpLCEwKTp2b2lkIDA7T2JqZWN0LmFzc2lnbih0LGUpfX19ZnVuY3Rpb24gdnModCxlKXt2YXIgdD10JiZ0Lm9wdGlv"
+    "bnN8fHt9LGk9dC5yZXZlcnNlLHM9dm9pZCAwPT09dC5taW4/ZTowLHQ9dm9pZCAwPT09dC5tYXg/ZTowO3JldHVybntzdGFydDpp"
+    "P3Q6cyxlbmQ6aT9zOnR9fWZ1bmN0aW9uIF9zKHQsZSl7Y29uc3QgaT1bXSxzPXQuX2dldFNvcnRlZERhdGFzZXRNZXRhcyhlKTts"
+    "ZXQgYSxuO2ZvcihhPTAsbj1zLmxlbmd0aDthPG47KythKWkucHVzaChzW2FdLmluZGV4KTtyZXR1cm4gaX1mdW5jdGlvbiB5cyh0"
+    "LGUsaSxzPXt9KXt2YXIgYT10LmtleXMsbj0ic2luZ2xlIj09PXMubW9kZTtsZXQgbyxyLGwsaDtpZihudWxsIT09ZSl7Zm9yKG89"
+    "MCxyPWEubGVuZ3RoO288cjsrK28pe2lmKChsPSthW29dKT09PWkpe2lmKHMuYWxsKWNvbnRpbnVlO2JyZWFrfXAoaD10LnZhbHVl"
+    "c1tsXSkmJihufHwwPT09ZXx8eShlKT09PXkoaCkpJiYoZSs9aCl9cmV0dXJuIGV9fWZ1bmN0aW9uIE1zKHQsZSl7dD10JiZ0Lm9w"
+    "dGlvbnMuc3RhY2tlZDtyZXR1cm4gdHx8dm9pZCAwPT09dCYmdm9pZCAwIT09ZS5zdGFja31mdW5jdGlvbiB3cyh0LGUsaSxzKXtm"
+    "b3IoY29uc3QgYSBvZiBlLmdldE1hdGNoaW5nVmlzaWJsZU1ldGFzKHMpLnJldmVyc2UoKSl7Y29uc3QgZT10W2EuaW5kZXhdO2lm"
+    "KGkmJjA8ZXx8IWkmJmU8MClyZXR1cm4gYS5pbmRleH1yZXR1cm4gbnVsbH1mdW5jdGlvbiBrcyh0LGUpe2NvbnN0e2NoYXJ0Omks"
+    "X2NhY2hlZE1ldGE6c309dCxhPWkuX3N0YWNrc3x8KGkuX3N0YWNrcz17fSkse2lTY2FsZTpuLHZTY2FsZTpvLGluZGV4OnJ9PXMs"
+    "bD1uLmF4aXMsaD1vLmF4aXMsYz1gJHtuLmlkfS4ke28uaWR9LmArKHMuc3RhY2t8fHMudHlwZSksZD1lLmxlbmd0aDtsZXQgdTtm"
+    "b3IobGV0IHQ9MDt0PGQ7Kyt0KXtjb25zdCBpPWVbdF0se1tsXTpuLFtoXTpkfT1pOyh1PShpLl9zdGFja3N8fChpLl9zdGFja3M9"
+    "e30pKVtoXT1mdW5jdGlvbih0LGUsaSl7Y29uc3Qgcz10W2VdfHwodFtlXT17fSk7cmV0dXJuIHNbaV18fChzW2ldPXt9KX0oYSxj"
+    "LG4pKVtyXT1kLHUuX3RvcD13cyh1LG8sITAscy50eXBlKSx1Ll9ib3R0b209d3ModSxvLCExLHMudHlwZSksKHUuX3Zpc3VhbFZh"
+    "bHVlc3x8KHUuX3Zpc3VhbFZhbHVlcz17fSkpW3JdPWR9fWZ1bmN0aW9uIFNzKHQsZSl7Y29uc3QgaT10LnNjYWxlcztyZXR1cm4g"
+    "T2JqZWN0LmtleXMoaSkuZmlsdGVyKHQ9PmlbdF0uYXhpcz09PWUpLnNoaWZ0KCl9ZnVuY3Rpb24gUHModCxlKXt2YXIgaT10LmNv"
+    "bnRyb2xsZXIuaW5kZXgscz10LnZTY2FsZSYmdC52U2NhbGUuYXhpcztpZihzKXtlPWV8fHQuX3BhcnNlZDtmb3IoY29uc3QgdCBv"
+    "ZiBlKXtjb25zdCBlPXQuX3N0YWNrcztpZighZXx8dm9pZCAwPT09ZVtzXXx8dm9pZCAwPT09ZVtzXVtpXSlyZXR1cm47ZGVsZXRl"
+    "IGVbc11baV0sdm9pZCAwIT09ZVtzXS5fdmlzdWFsVmFsdWVzJiZ2b2lkIDAhPT1lW3NdLl92aXN1YWxWYWx1ZXNbaV0mJmRlbGV0"
+    "ZSBlW3NdLl92aXN1YWxWYWx1ZXNbaV19fX1jb25zdCBEcz10PT4icmVzZXQiPT09dHx8Im5vbmUiPT09dCxDcz0odCxlKT0+ZT90"
+    "Ok9iamVjdC5hc3NpZ24oe30sdCk7Y2xhc3MgT3N7c3RhdGljIGRlZmF1bHRzPXt9O3N0YXRpYyBkYXRhc2V0RWxlbWVudFR5cGU9"
+    "bnVsbDtzdGF0aWMgZGF0YUVsZW1lbnRUeXBlPW51bGw7Y29uc3RydWN0b3IodCxlKXt0aGlzLmNoYXJ0PXQsdGhpcy5fY3R4PXQu"
+    "Y3R4LHRoaXMuaW5kZXg9ZSx0aGlzLl9jYWNoZWREYXRhT3B0cz17fSx0aGlzLl9jYWNoZWRNZXRhPXRoaXMuZ2V0TWV0YSgpLHRo"
+    "aXMuX3R5cGU9dGhpcy5fY2FjaGVkTWV0YS50eXBlLHRoaXMub3B0aW9ucz12b2lkIDAsdGhpcy5fcGFyc2luZz0hMSx0aGlzLl9k"
+    "YXRhPXZvaWQgMCx0aGlzLl9vYmplY3REYXRhPXZvaWQgMCx0aGlzLl9zaGFyZWRPcHRpb25zPXZvaWQgMCx0aGlzLl9kcmF3U3Rh"
+    "cnQ9dm9pZCAwLHRoaXMuX2RyYXdDb3VudD12b2lkIDAsdGhpcy5lbmFibGVPcHRpb25TaGFyaW5nPSExLHRoaXMuc3VwcG9ydHNE"
+    "ZWNpbWF0aW9uPSExLHRoaXMuJGNvbnRleHQ9dm9pZCAwLHRoaXMuX3N5bmNMaXN0PVtdLHRoaXMuZGF0YXNldEVsZW1lbnRUeXBl"
+    "PW5ldy50YXJnZXQuZGF0YXNldEVsZW1lbnRUeXBlLHRoaXMuZGF0YUVsZW1lbnRUeXBlPW5ldy50YXJnZXQuZGF0YUVsZW1lbnRU"
+    "eXBlLHRoaXMuaW5pdGlhbGl6ZSgpfWluaXRpYWxpemUoKXtjb25zdCB0PXRoaXMuX2NhY2hlZE1ldGE7dGhpcy5jb25maWd1cmUo"
+    "KSx0aGlzLmxpbmtTY2FsZXMoKSx0Ll9zdGFja2VkPU1zKHQudlNjYWxlLHQpLHRoaXMuYWRkRWxlbWVudHMoKSx0aGlzLm9wdGlv"
+    "bnMuZmlsbCYmIXRoaXMuY2hhcnQuaXNQbHVnaW5FbmFibGVkKCJmaWxsZXIiKSYmY29uc29sZS53YXJuKCJUcmllZCB0byB1c2Ug"
+    "dGhlICdmaWxsJyBvcHRpb24gd2l0aG91dCB0aGUgJ0ZpbGxlcicgcGx1Z2luIGVuYWJsZWQuIFBsZWFzZSBpbXBvcnQgYW5kIHJl"
+    "Z2lzdGVyIHRoZSAnRmlsbGVyJyBwbHVnaW4gYW5kIG1ha2Ugc3VyZSBpdCBpcyBub3QgZGlzYWJsZWQgaW4gdGhlIG9wdGlvbnMi"
+    "KX11cGRhdGVJbmRleCh0KXt0aGlzLmluZGV4IT09dCYmUHModGhpcy5fY2FjaGVkTWV0YSksdGhpcy5pbmRleD10fWxpbmtTY2Fs"
+    "ZXMoKXtjb25zdCB0PXRoaXMuY2hhcnQsZT10aGlzLl9jYWNoZWRNZXRhLGk9dGhpcy5nZXREYXRhc2V0KCkscz0odCxlLGkscyk9"
+    "PiJ4Ij09PXQ/ZToiciI9PT10P3M6aSxhPWUueEF4aXNJRD1UKGkueEF4aXNJRCxTcyh0LCJ4IikpLG49ZS55QXhpc0lEPVQoaS55"
+    "QXhpc0lELFNzKHQsInkiKSksbz1lLnJBeGlzSUQ9VChpLnJBeGlzSUQsU3ModCwiciIpKSxyPWUuaW5kZXhBeGlzLGw9ZS5pQXhp"
+    "c0lEPXMocixhLG4sbyksaD1lLnZBeGlzSUQ9cyhyLG4sYSxvKTtlLnhTY2FsZT10aGlzLmdldFNjYWxlRm9ySWQoYSksZS55U2Nh"
+    "bGU9dGhpcy5nZXRTY2FsZUZvcklkKG4pLGUuclNjYWxlPXRoaXMuZ2V0U2NhbGVGb3JJZChvKSxlLmlTY2FsZT10aGlzLmdldFNj"
+    "YWxlRm9ySWQobCksZS52U2NhbGU9dGhpcy5nZXRTY2FsZUZvcklkKGgpfWdldERhdGFzZXQoKXtyZXR1cm4gdGhpcy5jaGFydC5k"
+    "YXRhLmRhdGFzZXRzW3RoaXMuaW5kZXhdfWdldE1ldGEoKXtyZXR1cm4gdGhpcy5jaGFydC5nZXREYXRhc2V0TWV0YSh0aGlzLmlu"
+    "ZGV4KX1nZXRTY2FsZUZvcklkKHQpe3JldHVybiB0aGlzLmNoYXJ0LnNjYWxlc1t0XX1fZ2V0T3RoZXJTY2FsZSh0KXt2YXIgZT10"
+    "aGlzLl9jYWNoZWRNZXRhO3JldHVybiB0PT09ZS5pU2NhbGU/ZS52U2NhbGU6ZS5pU2NhbGV9cmVzZXQoKXt0aGlzLl91cGRhdGUo"
+    "InJlc2V0Iil9X2Rlc3Ryb3koKXt2YXIgdD10aGlzLl9jYWNoZWRNZXRhO3RoaXMuX2RhdGEmJk10KHRoaXMuX2RhdGEsdGhpcyks"
+    "dC5fc3RhY2tlZCYmUHModCl9X2RhdGFDaGVjaygpe2NvbnN0IHQ9dGhpcy5nZXREYXRhc2V0KCksZT10LmRhdGF8fCh0LmRhdGE9"
+    "W10pLGk9dGhpcy5fZGF0YTtpZihBKGUpKXRoaXMuX2RhdGE9ZnVuY3Rpb24odCl7Y29uc3QgZT1PYmplY3Qua2V5cyh0KSxpPW5l"
+    "dyBBcnJheShlLmxlbmd0aCk7bGV0IHMsYSxuO2ZvcihzPTAsYT1lLmxlbmd0aDtzPGE7KytzKW49ZVtzXSxpW3NdPXt4Om4seTp0"
+    "W25dfTtyZXR1cm4gaX0oZSk7ZWxzZSBpZihpIT09ZSl7aWYoaSl7TXQoaSx0aGlzKTtjb25zdCB0PXRoaXMuX2NhY2hlZE1ldGE7"
+    "UHModCksdC5fcGFyc2VkPVtdfWUmJk9iamVjdC5pc0V4dGVuc2libGUoZSkmJnl0KGUsdGhpcyksdGhpcy5fc3luY0xpc3Q9W10s"
+    "dGhpcy5fZGF0YT1lfX1hZGRFbGVtZW50cygpe2NvbnN0IHQ9dGhpcy5fY2FjaGVkTWV0YTt0aGlzLl9kYXRhQ2hlY2soKSx0aGlz"
+    "LmRhdGFzZXRFbGVtZW50VHlwZSYmKHQuZGF0YXNldD1uZXcgdGhpcy5kYXRhc2V0RWxlbWVudFR5cGUpfWJ1aWxkT3JVcGRhdGVF"
+    "bGVtZW50cyh0KXtjb25zdCBlPXRoaXMuX2NhY2hlZE1ldGEsaT10aGlzLmdldERhdGFzZXQoKTtsZXQgcz0hMTt0aGlzLl9kYXRh"
+    "Q2hlY2soKTt2YXIgYT1lLl9zdGFja2VkO2UuX3N0YWNrZWQ9TXMoZS52U2NhbGUsZSksZS5zdGFjayE9PWkuc3RhY2smJihzPSEw"
+    "LFBzKGUpLGUuc3RhY2s9aS5zdGFjayksdGhpcy5fcmVzeW5jRWxlbWVudHModCksIXMmJmE9PT1lLl9zdGFja2VkfHxrcyh0aGlz"
+    "LGUuX3BhcnNlZCl9Y29uZmlndXJlKCl7Y29uc3QgdD10aGlzLmNoYXJ0LmNvbmZpZyxlPXQuZGF0YXNldFNjb3BlS2V5cyh0aGlz"
+    "Ll90eXBlKSxpPXQuZ2V0T3B0aW9uU2NvcGVzKHRoaXMuZ2V0RGF0YXNldCgpLGUsITApO3RoaXMub3B0aW9ucz10LmNyZWF0ZVJl"
+    "c29sdmVyKGksdGhpcy5nZXRDb250ZXh0KCkpLHRoaXMuX3BhcnNpbmc9dGhpcy5vcHRpb25zLnBhcnNpbmcsdGhpcy5fY2FjaGVk"
+    "RGF0YU9wdHM9e319cGFyc2UodCxlKXtjb25zdHtfY2FjaGVkTWV0YTppLF9kYXRhOnN9PXRoaXMse2lTY2FsZTphLF9zdGFja2Vk"
+    "Om59PWksbz1hLmF4aXM7bGV0IHIsbCxoLGM9MD09PXQmJmU9PT1zLmxlbmd0aHx8aS5fc29ydGVkLGQ9MDx0JiZpLl9wYXJzZWRb"
+    "dC0xXTtpZighMT09PXRoaXMuX3BhcnNpbmcpaS5fcGFyc2VkPXMsaS5fc29ydGVkPSEwLGg9cztlbHNle2g9TyhzW3RdKT90aGlz"
+    "LnBhcnNlQXJyYXlEYXRhKGkscyx0LGUpOkEoc1t0XSk/dGhpcy5wYXJzZU9iamVjdERhdGEoaSxzLHQsZSk6dGhpcy5wYXJzZVBy"
+    "aW1pdGl2ZURhdGEoaSxzLHQsZSk7Y29uc3QgYT0oKT0+bnVsbD09PWxbb118fGQmJmxbb108ZFtvXTtmb3Iocj0wO3I8ZTsrK3Ip"
+    "aS5fcGFyc2VkW3IrdF09bD1oW3JdLGMmJihhKCkmJihjPSExKSxkPWwpO2kuX3NvcnRlZD1jfW4mJmtzKHRoaXMsaCl9cGFyc2VQ"
+    "cmltaXRpdmVEYXRhKHQsZSxpLHMpe2NvbnN0e2lTY2FsZTphLHZTY2FsZTpufT10LG89YS5heGlzLHI9bi5heGlzLGw9YS5nZXRM"
+    "YWJlbHMoKSxoPWE9PT1uLGM9bmV3IEFycmF5KHMpO2xldCBkLHUsZztmb3IoZD0wLHU9cztkPHU7KytkKWc9ZCtpLGNbZF09e1tv"
+    "XTpofHxhLnBhcnNlKGxbZ10sZyksW3JdOm4ucGFyc2UoZVtnXSxnKX07cmV0dXJuIGN9cGFyc2VBcnJheURhdGEodCxlLGkscyl7"
+    "Y29uc3R7eFNjYWxlOmEseVNjYWxlOm59PXQsbz1uZXcgQXJyYXkocyk7bGV0IHIsbCxoLGM7Zm9yKHI9MCxsPXM7cjxsOysrcilj"
+    "PWVbaD1yK2ldLG9bcl09e3g6YS5wYXJzZShjWzBdLGgpLHk6bi5wYXJzZShjWzFdLGgpfTtyZXR1cm4gb31wYXJzZU9iamVjdERh"
+    "dGEodCxlLGkscyl7Y29uc3R7eFNjYWxlOmEseVNjYWxlOm59PXQse3hBeGlzS2V5Om89IngiLHlBeGlzS2V5OnI9InkifT10aGlz"
+    "Ll9wYXJzaW5nLGw9bmV3IEFycmF5KHMpO2xldCBoLGMsZCx1O2ZvcihoPTAsYz1zO2g8YzsrK2gpdT1lW2Q9aCtpXSxsW2hdPXt4"
+    "OmEucGFyc2UobSh1LG8pLGQpLHk6bi5wYXJzZShtKHUsciksZCl9O3JldHVybiBsfWdldFBhcnNlZCh0KXtyZXR1cm4gdGhpcy5f"
+    "Y2FjaGVkTWV0YS5fcGFyc2VkW3RdfWdldERhdGFFbGVtZW50KHQpe3JldHVybiB0aGlzLl9jYWNoZWRNZXRhLmRhdGFbdF19YXBw"
+    "bHlTdGFjayh0LGUsaSl7dmFyIHM9dGhpcy5jaGFydCxhPXRoaXMuX2NhY2hlZE1ldGEsbj1lW3QuYXhpc107cmV0dXJuIHlzKHtr"
+    "ZXlzOl9zKHMsITApLHZhbHVlczplLl9zdGFja3NbdC5heGlzXS5fdmlzdWFsVmFsdWVzfSxuLGEuaW5kZXgse21vZGU6aX0pfXVw"
+    "ZGF0ZVJhbmdlRnJvbVBhcnNlZCh0LGUsaSxzKXt2YXIgYT1pW2UuYXhpc107bGV0IG49bnVsbD09PWE/TmFOOmE7aT1zJiZpLl9z"
+    "dGFja3NbZS5heGlzXTtzJiZpJiYocy52YWx1ZXM9aSxuPXlzKHMsYSx0aGlzLl9jYWNoZWRNZXRhLmluZGV4KSksdC5taW49TWF0"
+    "aC5taW4odC5taW4sbiksdC5tYXg9TWF0aC5tYXgodC5tYXgsbil9Z2V0TWluTWF4KGUsdCl7Y29uc3QgaT10aGlzLl9jYWNoZWRN"
+    "ZXRhLHM9aS5fcGFyc2VkLGE9aS5fc29ydGVkJiZlPT09aS5pU2NhbGUsbj1zLmxlbmd0aCxvPXRoaXMuX2dldE90aGVyU2NhbGUo"
+    "ZSkscj0oZD10aGlzLmNoYXJ0LHQmJiFpLmhpZGRlbiYmaS5fc3RhY2tlZCYme2tleXM6X3MoZCwhMCksdmFsdWVzOm51bGx9KSxs"
+    "PXttaW46TnVtYmVyLlBPU0lUSVZFX0lORklOSVRZLG1heDpOdW1iZXIuTkVHQVRJVkVfSU5GSU5JVFl9LHttaW46aCxtYXg6Y309"
+    "ZnVuY3Rpb24oKXt2YXJ7bWluOnQsbWF4OmUsbWluRGVmaW5lZDppLG1heERlZmluZWQ6c309by5nZXRVc2VyQm91bmRzKCk7cmV0"
+    "dXJue21pbjppP3Q6TnVtYmVyLk5FR0FUSVZFX0lORklOSVRZLG1heDpzP2U6TnVtYmVyLlBPU0lUSVZFX0lORklOSVRZfX0oKTt2"
+    "YXIgZDtsZXQgdSxnO2Z1bmN0aW9uIGYoKXt2YXIgdD0oZz1zW3VdKVtvLmF4aXNdO3JldHVybiFwKGdbZS5heGlzXSl8fGg+dHx8"
+    "Yzx0fWZvcih1PTA7dTxuJiYoZigpfHwodGhpcy51cGRhdGVSYW5nZUZyb21QYXJzZWQobCxlLGcsciksIWEpKTsrK3UpO2lmKGEp"
+    "Zm9yKHU9bi0xOzA8PXU7LS11KWlmKCFmKCkpe3RoaXMudXBkYXRlUmFuZ2VGcm9tUGFyc2VkKGwsZSxnLHIpO2JyZWFrfXJldHVy"
+    "biBsfWdldEFsbFBhcnNlZFZhbHVlcyh0KXtjb25zdCBlPXRoaXMuX2NhY2hlZE1ldGEuX3BhcnNlZCxpPVtdO2xldCBzLGEsbjtm"
+    "b3Iocz0wLGE9ZS5sZW5ndGg7czxhOysrcylwKG49ZVtzXVt0LmF4aXNdKSYmaS5wdXNoKG4pO3JldHVybiBpfWdldE1heE92ZXJm"
+    "bG93KCl7cmV0dXJuITF9Z2V0TGFiZWxBbmRWYWx1ZSh0KXtjb25zdCBlPXRoaXMuX2NhY2hlZE1ldGEsaT1lLmlTY2FsZSxzPWUu"
+    "dlNjYWxlLGE9dGhpcy5nZXRQYXJzZWQodCk7cmV0dXJue2xhYmVsOmk/IiIraS5nZXRMYWJlbEZvclZhbHVlKGFbaS5heGlzXSk6"
+    "IiIsdmFsdWU6cz8iIitzLmdldExhYmVsRm9yVmFsdWUoYVtzLmF4aXNdKToiIn19X3VwZGF0ZSh0KXtjb25zdCBlPXRoaXMuX2Nh"
+    "Y2hlZE1ldGE7dGhpcy51cGRhdGUodHx8ImRlZmF1bHQiKSxlLl9jbGlwPWZ1bmN0aW9uKHQpe2xldCBlLGkscyxhO3JldHVybiBB"
+    "KHQpPyhlPXQudG9wLGk9dC5yaWdodCxzPXQuYm90dG9tLGE9dC5sZWZ0KTplPWk9cz1hPXQse3RvcDplLHJpZ2h0OmksYm90dG9t"
+    "OnMsbGVmdDphLGRpc2FibGVkOiExPT09dH19KFQodGhpcy5vcHRpb25zLmNsaXAsZnVuY3Rpb24odCxlLGkpe2lmKCExPT09aSly"
+    "ZXR1cm4hMTt0PXZzKHQsaSksZT12cyhlLGkpO3JldHVybnt0b3A6ZS5lbmQscmlnaHQ6dC5lbmQsYm90dG9tOmUuc3RhcnQsbGVm"
+    "dDp0LnN0YXJ0fX0oZS54U2NhbGUsZS55U2NhbGUsdGhpcy5nZXRNYXhPdmVyZmxvdygpKSkpfXVwZGF0ZSh0KXt9ZHJhdygpe2Nv"
+    "bnN0IHQ9dGhpcy5fY3R4LGU9dGhpcy5jaGFydCxpPXRoaXMuX2NhY2hlZE1ldGEscz1pLmRhdGF8fFtdLGE9ZS5jaGFydEFyZWEs"
+    "bj1bXSxvPXRoaXMuX2RyYXdTdGFydHx8MCxyPXRoaXMuX2RyYXdDb3VudHx8cy5sZW5ndGgtbyxsPXRoaXMub3B0aW9ucy5kcmF3"
+    "QWN0aXZlRWxlbWVudHNPblRvcDtsZXQgaDtmb3IoaS5kYXRhc2V0JiZpLmRhdGFzZXQuZHJhdyh0LGEsbyxyKSxoPW87aDxvK3I7"
+    "KytoKXtjb25zdCBlPXNbaF07ZS5oaWRkZW58fChlLmFjdGl2ZSYmbD9uLnB1c2goZSk6ZS5kcmF3KHQsYSkpfWZvcihoPTA7aDxu"
+    "Lmxlbmd0aDsrK2gpbltoXS5kcmF3KHQsYSl9Z2V0U3R5bGUodCxlKXtlPWU/ImFjdGl2ZSI6ImRlZmF1bHQiO3JldHVybiB2b2lk"
+    "IDA9PT10JiZ0aGlzLl9jYWNoZWRNZXRhLmRhdGFzZXQ/dGhpcy5yZXNvbHZlRGF0YXNldEVsZW1lbnRPcHRpb25zKGUpOnRoaXMu"
+    "cmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyh0fHwwLGUpfWdldENvbnRleHQodCxlLGkpe3ZhciBzLGE9dGhpcy5nZXREYXRhc2V0"
+    "KCk7bGV0IG47aWYoMDw9dCYmdDx0aGlzLl9jYWNoZWRNZXRhLmRhdGEubGVuZ3RoKXtjb25zdCBlPXRoaXMuX2NhY2hlZE1ldGEu"
+    "ZGF0YVt0XTsobj1lLiRjb250ZXh0fHwoZS4kY29udGV4dD1QaSh0aGlzLmdldENvbnRleHQoKSx7YWN0aXZlOiExLGRhdGFJbmRl"
+    "eDp0LHBhcnNlZDp2b2lkIDAscmF3OnZvaWQgMCxlbGVtZW50OmUsaW5kZXg6dCxtb2RlOiJkZWZhdWx0Iix0eXBlOiJkYXRhIn0p"
+    "KSkucGFyc2VkPXRoaXMuZ2V0UGFyc2VkKHQpLG4ucmF3PWEuZGF0YVt0XSxuLmluZGV4PW4uZGF0YUluZGV4PXR9ZWxzZShuPXRo"
+    "aXMuJGNvbnRleHR8fCh0aGlzLiRjb250ZXh0PSh0PXRoaXMuY2hhcnQuZ2V0Q29udGV4dCgpLHM9dGhpcy5pbmRleCxQaSh0LHth"
+    "Y3RpdmU6ITEsZGF0YXNldDp2b2lkIDAsZGF0YXNldEluZGV4OnMsaW5kZXg6cyxtb2RlOiJkZWZhdWx0Iix0eXBlOiJkYXRhc2V0"
+    "In0pKSkpLmRhdGFzZXQ9YSxuLmluZGV4PW4uZGF0YXNldEluZGV4PXRoaXMuaW5kZXg7cmV0dXJuIG4uYWN0aXZlPSEhZSxuLm1v"
+    "ZGU9aSxufXJlc29sdmVEYXRhc2V0RWxlbWVudE9wdGlvbnModCl7cmV0dXJuIHRoaXMuX3Jlc29sdmVFbGVtZW50T3B0aW9ucyh0"
+    "aGlzLmRhdGFzZXRFbGVtZW50VHlwZS5pZCx0KX1yZXNvbHZlRGF0YUVsZW1lbnRPcHRpb25zKHQsZSl7cmV0dXJuIHRoaXMuX3Jl"
+    "c29sdmVFbGVtZW50T3B0aW9ucyh0aGlzLmRhdGFFbGVtZW50VHlwZS5pZCxlLHQpfV9yZXNvbHZlRWxlbWVudE9wdGlvbnModCxl"
+    "PSJkZWZhdWx0IixpKXtjb25zdCBzPSJhY3RpdmUiPT09ZSxhPXRoaXMuX2NhY2hlZERhdGFPcHRzLG49dCsiLSIrZSxvPWFbbl0s"
+    "cj10aGlzLmVuYWJsZU9wdGlvblNoYXJpbmcmJkcoaSk7aWYobylyZXR1cm4gQ3MobyxyKTtjb25zdCBsPXRoaXMuY2hhcnQuY29u"
+    "ZmlnLGg9bC5kYXRhc2V0RWxlbWVudFNjb3BlS2V5cyh0aGlzLl90eXBlLHQpLGM9cz9bdCsiSG92ZXIiLCJob3ZlciIsdCwiIl06"
+    "W3QsIiJdLGQ9bC5nZXRPcHRpb25TY29wZXModGhpcy5nZXREYXRhc2V0KCksaCksdT1PYmplY3Qua2V5cyhSLmVsZW1lbnRzW3Rd"
+    "KSxnPWwucmVzb2x2ZU5hbWVkT3B0aW9ucyhkLHUsKCk9PnRoaXMuZ2V0Q29udGV4dChpLHMsZSksYyk7cmV0dXJuIGcuJHNoYXJl"
+    "ZCYmKGcuJHNoYXJlZD1yLGFbbl09T2JqZWN0LmZyZWV6ZShDcyhnLHIpKSksZ31fcmVzb2x2ZUFuaW1hdGlvbnModCxlLGkpe2Nv"
+    "bnN0IHM9dGhpcy5jaGFydCxhPXRoaXMuX2NhY2hlZERhdGFPcHRzLG49ImFuaW1hdGlvbi0iK2Usbz1hW25dO2lmKG8pcmV0dXJu"
+    "IG87bGV0IHI7aWYoITEhPT1zLm9wdGlvbnMuYW5pbWF0aW9uKXtjb25zdCBzPXRoaXMuY2hhcnQuY29uZmlnLGE9cy5kYXRhc2V0"
+    "QW5pbWF0aW9uU2NvcGVLZXlzKHRoaXMuX3R5cGUsZSksbj1zLmdldE9wdGlvblNjb3Blcyh0aGlzLmdldERhdGFzZXQoKSxhKTty"
+    "PXMuY3JlYXRlUmVzb2x2ZXIobix0aGlzLmdldENvbnRleHQodCxpLGUpKX10PW5ldyB4cyhzLHImJnIuYW5pbWF0aW9ucyk7cmV0"
+    "dXJuIHImJnIuX2NhY2hlYWJsZSYmKGFbbl09T2JqZWN0LmZyZWV6ZSh0KSksdH1nZXRTaGFyZWRPcHRpb25zKHQpe2lmKHQuJHNo"
+    "YXJlZClyZXR1cm4gdGhpcy5fc2hhcmVkT3B0aW9uc3x8KHRoaXMuX3NoYXJlZE9wdGlvbnM9T2JqZWN0LmFzc2lnbih7fSx0KSl9"
+    "aW5jbHVkZU9wdGlvbnModCxlKXtyZXR1cm4hZXx8RHModCl8fHRoaXMuY2hhcnQuX2FuaW1hdGlvbnNEaXNhYmxlZH1fZ2V0U2hh"
+    "cmVkT3B0aW9ucyh0LGUpe3ZhciB0PXRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyh0LGUpLGk9dGhpcy5fc2hhcmVkT3B0"
+    "aW9ucyxzPXRoaXMuZ2V0U2hhcmVkT3B0aW9ucyh0KSxpPXRoaXMuaW5jbHVkZU9wdGlvbnMoZSxzKXx8cyE9PWk7cmV0dXJuIHRo"
+    "aXMudXBkYXRlU2hhcmVkT3B0aW9ucyhzLGUsdCkse3NoYXJlZE9wdGlvbnM6cyxpbmNsdWRlT3B0aW9uczppfX11cGRhdGVFbGVt"
+    "ZW50KHQsZSxpLHMpe0RzKHMpP09iamVjdC5hc3NpZ24odCxpKTp0aGlzLl9yZXNvbHZlQW5pbWF0aW9ucyhlLHMpLnVwZGF0ZSh0"
+    "LGkpfXVwZGF0ZVNoYXJlZE9wdGlvbnModCxlLGkpe3QmJiFEcyhlKSYmdGhpcy5fcmVzb2x2ZUFuaW1hdGlvbnModm9pZCAwLGUp"
+    "LnVwZGF0ZSh0LGkpfV9zZXRTdHlsZSh0LGUsaSxzKXt0LmFjdGl2ZT1zO3ZhciBhPXRoaXMuZ2V0U3R5bGUoZSxzKTt0aGlzLl9y"
+    "ZXNvbHZlQW5pbWF0aW9ucyhlLGkscykudXBkYXRlKHQse29wdGlvbnM6IXMmJnRoaXMuZ2V0U2hhcmVkT3B0aW9ucyhhKXx8YX0p"
+    "fXJlbW92ZUhvdmVyU3R5bGUodCxlLGkpe3RoaXMuX3NldFN0eWxlKHQsaSwiYWN0aXZlIiwhMSl9c2V0SG92ZXJTdHlsZSh0LGUs"
+    "aSl7dGhpcy5fc2V0U3R5bGUodCxpLCJhY3RpdmUiLCEwKX1fcmVtb3ZlRGF0YXNldEhvdmVyU3R5bGUoKXt2YXIgdD10aGlzLl9j"
+    "YWNoZWRNZXRhLmRhdGFzZXQ7dCYmdGhpcy5fc2V0U3R5bGUodCx2b2lkIDAsImFjdGl2ZSIsITEpfV9zZXREYXRhc2V0SG92ZXJT"
+    "dHlsZSgpe3ZhciB0PXRoaXMuX2NhY2hlZE1ldGEuZGF0YXNldDt0JiZ0aGlzLl9zZXRTdHlsZSh0LHZvaWQgMCwiYWN0aXZlIiwh"
+    "MCl9X3Jlc3luY0VsZW1lbnRzKHQpe2NvbnN0IGU9dGhpcy5fZGF0YSxpPXRoaXMuX2NhY2hlZE1ldGEuZGF0YTtmb3IoY29uc3Rb"
+    "dCxlLGldb2YgdGhpcy5fc3luY0xpc3QpdGhpc1t0XShlLGkpO3RoaXMuX3N5bmNMaXN0PVtdO3ZhciBzPWkubGVuZ3RoLGE9ZS5s"
+    "ZW5ndGgsbj1NYXRoLm1pbihhLHMpO24mJnRoaXMucGFyc2UoMCxuKSxzPGE/dGhpcy5faW5zZXJ0RWxlbWVudHMocyxhLXMsdCk6"
+    "YTxzJiZ0aGlzLl9yZW1vdmVFbGVtZW50cyhhLHMtYSl9X2luc2VydEVsZW1lbnRzKHQsZSxpPSEwKXtjb25zdCBzPXRoaXMuX2Nh"
+    "Y2hlZE1ldGEsYT1zLmRhdGEsbj10K2U7bGV0IG87dmFyIHI9dD0+e2Zvcih0Lmxlbmd0aCs9ZSxvPXQubGVuZ3RoLTE7bz49bjtv"
+    "LS0pdFtvXT10W28tZV19O2ZvcihyKGEpLG89dDtvPG47KytvKWFbb109bmV3IHRoaXMuZGF0YUVsZW1lbnRUeXBlO3RoaXMuX3Bh"
+    "cnNpbmcmJnIocy5fcGFyc2VkKSx0aGlzLnBhcnNlKHQsZSksaSYmdGhpcy51cGRhdGVFbGVtZW50cyhhLHQsZSwicmVzZXQiKX11"
+    "cGRhdGVFbGVtZW50cyh0LGUsaSxzKXt9X3JlbW92ZUVsZW1lbnRzKHQsZSl7Y29uc3QgaT10aGlzLl9jYWNoZWRNZXRhO3ZhciBz"
+    "O3RoaXMuX3BhcnNpbmcmJihzPWkuX3BhcnNlZC5zcGxpY2UodCxlKSxpLl9zdGFja2VkJiZQcyhpLHMpKSxpLmRhdGEuc3BsaWNl"
+    "KHQsZSl9X3N5bmModCl7dmFyIGUsaSxzO3RoaXMuX3BhcnNpbmc/dGhpcy5fc3luY0xpc3QucHVzaCh0KTooW2UsaSxzXT10LHRo"
+    "aXNbZV0oaSxzKSksdGhpcy5jaGFydC5fZGF0YUNoYW5nZXMucHVzaChbdGhpcy5pbmRleCwuLi50XSl9X29uRGF0YVB1c2goKXt2"
+    "YXIgdD1hcmd1bWVudHMubGVuZ3RoO3RoaXMuX3N5bmMoWyJfaW5zZXJ0RWxlbWVudHMiLHRoaXMuZ2V0RGF0YXNldCgpLmRhdGEu"
+    "bGVuZ3RoLXQsdF0pfV9vbkRhdGFQb3AoKXt0aGlzLl9zeW5jKFsiX3JlbW92ZUVsZW1lbnRzIix0aGlzLl9jYWNoZWRNZXRhLmRh"
+    "dGEubGVuZ3RoLTEsMV0pfV9vbkRhdGFTaGlmdCgpe3RoaXMuX3N5bmMoWyJfcmVtb3ZlRWxlbWVudHMiLDAsMV0pfV9vbkRhdGFT"
+    "cGxpY2UodCxlKXtlJiZ0aGlzLl9zeW5jKFsiX3JlbW92ZUVsZW1lbnRzIix0LGVdKTtlPWFyZ3VtZW50cy5sZW5ndGgtMjtlJiZ0"
+    "aGlzLl9zeW5jKFsiX2luc2VydEVsZW1lbnRzIix0LGVdKX1fb25EYXRhVW5zaGlmdCgpe3RoaXMuX3N5bmMoWyJfaW5zZXJ0RWxl"
+    "bWVudHMiLDAsYXJndW1lbnRzLmxlbmd0aF0pfX1jbGFzcyBle3N0YXRpYyBkZWZhdWx0cz17fTtzdGF0aWMgZGVmYXVsdFJvdXRl"
+    "cz12b2lkIDA7eDt5O2FjdGl2ZT0hMTtvcHRpb25zOyRhbmltYXRpb25zO3Rvb2x0aXBQb3NpdGlvbih0KXt2YXJ7eDp0LHk6ZX09"
+    "dGhpcy5nZXRQcm9wcyhbIngiLCJ5Il0sdCk7cmV0dXJue3g6dCx5OmV9fWhhc1ZhbHVlKCl7cmV0dXJuIHJ0KHRoaXMueCkmJnJ0"
+    "KHRoaXMueSl9Z2V0UHJvcHModCxlKXtjb25zdCBpPXRoaXMuJGFuaW1hdGlvbnM7aWYoIWV8fCFpKXJldHVybiB0aGlzO2NvbnN0"
+    "IHM9e307cmV0dXJuIHQuZm9yRWFjaCh0PT57c1t0XT1pW3RdJiZpW3RdLmFjdGl2ZSgpP2lbdF0uX3RvOnRoaXNbdF19KSxzfX1m"
+    "dW5jdGlvbiBBcyh0LGUsaSxzLGEpe3ZhciBuPVQocywwKSxvPU1hdGgubWluKFQoYSx0Lmxlbmd0aCksdC5sZW5ndGgpO2xldCBy"
+    "LGwsaCxjPTA7Zm9yKGk9TWF0aC5jZWlsKGkpLGEmJihpPShyPWEtcykvTWF0aC5mbG9vcihyL2kpKSxoPW47aDwwOyljKyssaD1N"
+    "YXRoLnJvdW5kKG4rYyppKTtmb3IobD1NYXRoLm1heChuLDApO2w8bztsKyspbD09PWgmJihlLnB1c2godFtsXSksYysrLGg9TWF0"
+    "aC5yb3VuZChuK2MqaSkpfWNvbnN0IFRzPSh0LGUsaSk9PiJ0b3AiPT09ZXx8ImxlZnQiPT09ZT90W2VdK2k6dFtlXS1pLExzPSh0"
+    "LGUpPT5NYXRoLm1pbihlfHx0LHQpO2Z1bmN0aW9uIEVzKHQsZSl7Y29uc3QgaT1bXSxzPXQubGVuZ3RoL2UsYT10Lmxlbmd0aDts"
+    "ZXQgbj0wO2Zvcig7bjxhO24rPXMpaS5wdXNoKHRbTWF0aC5mbG9vcihuKV0pO3JldHVybiBpfWZ1bmN0aW9uIFJzKHQpe3JldHVy"
+    "biB0LmRyYXdUaWNrcz90LnRpY2tMZW5ndGg6MH1mdW5jdGlvbiBJcyh0LGUpe2lmKCF0LmRpc3BsYXkpcmV0dXJuIDA7dmFyIGU9"
+    "eih0LmZvbnQsZSksaT1JKHQucGFkZGluZyk7cmV0dXJuKE8odC50ZXh0KT90LnRleHQubGVuZ3RoOjEpKmUubGluZUhlaWdodCtp"
+    "LmhlaWdodH1jbGFzcyB6cyBleHRlbmRzIGV7Y29uc3RydWN0b3IodCl7c3VwZXIoKSx0aGlzLmlkPXQuaWQsdGhpcy50eXBlPXQu"
+    "dHlwZSx0aGlzLm9wdGlvbnM9dm9pZCAwLHRoaXMuY3R4PXQuY3R4LHRoaXMuY2hhcnQ9dC5jaGFydCx0aGlzLnRvcD12b2lkIDAs"
+    "dGhpcy5ib3R0b209dm9pZCAwLHRoaXMubGVmdD12b2lkIDAsdGhpcy5yaWdodD12b2lkIDAsdGhpcy53aWR0aD12b2lkIDAsdGhp"
+    "cy5oZWlnaHQ9dm9pZCAwLHRoaXMuX21hcmdpbnM9e2xlZnQ6MCxyaWdodDowLHRvcDowLGJvdHRvbTowfSx0aGlzLm1heFdpZHRo"
+    "PXZvaWQgMCx0aGlzLm1heEhlaWdodD12b2lkIDAsdGhpcy5wYWRkaW5nVG9wPXZvaWQgMCx0aGlzLnBhZGRpbmdCb3R0b209dm9p"
+    "ZCAwLHRoaXMucGFkZGluZ0xlZnQ9dm9pZCAwLHRoaXMucGFkZGluZ1JpZ2h0PXZvaWQgMCx0aGlzLmF4aXM9dm9pZCAwLHRoaXMu"
+    "bGFiZWxSb3RhdGlvbj12b2lkIDAsdGhpcy5taW49dm9pZCAwLHRoaXMubWF4PXZvaWQgMCx0aGlzLl9yYW5nZT12b2lkIDAsdGhp"
+    "cy50aWNrcz1bXSx0aGlzLl9ncmlkTGluZUl0ZW1zPW51bGwsdGhpcy5fbGFiZWxJdGVtcz1udWxsLHRoaXMuX2xhYmVsU2l6ZXM9"
+    "bnVsbCx0aGlzLl9sZW5ndGg9MCx0aGlzLl9tYXhMZW5ndGg9MCx0aGlzLl9sb25nZXN0VGV4dENhY2hlPXt9LHRoaXMuX3N0YXJ0"
+    "UGl4ZWw9dm9pZCAwLHRoaXMuX2VuZFBpeGVsPXZvaWQgMCx0aGlzLl9yZXZlcnNlUGl4ZWxzPSExLHRoaXMuX3VzZXJNYXg9dm9p"
+    "ZCAwLHRoaXMuX3VzZXJNaW49dm9pZCAwLHRoaXMuX3N1Z2dlc3RlZE1heD12b2lkIDAsdGhpcy5fc3VnZ2VzdGVkTWluPXZvaWQg"
+    "MCx0aGlzLl90aWNrc0xlbmd0aD0wLHRoaXMuX2JvcmRlclZhbHVlPTAsdGhpcy5fY2FjaGU9e30sdGhpcy5fZGF0YUxpbWl0c0Nh"
+    "Y2hlZD0hMSx0aGlzLiRjb250ZXh0PXZvaWQgMH1pbml0KHQpe3RoaXMub3B0aW9ucz10LnNldENvbnRleHQodGhpcy5nZXRDb250"
+    "ZXh0KCkpLHRoaXMuYXhpcz10LmF4aXMsdGhpcy5fdXNlck1pbj10aGlzLnBhcnNlKHQubWluKSx0aGlzLl91c2VyTWF4PXRoaXMu"
+    "cGFyc2UodC5tYXgpLHRoaXMuX3N1Z2dlc3RlZE1pbj10aGlzLnBhcnNlKHQuc3VnZ2VzdGVkTWluKSx0aGlzLl9zdWdnZXN0ZWRN"
+    "YXg9dGhpcy5wYXJzZSh0LnN1Z2dlc3RlZE1heCl9cGFyc2UodCxlKXtyZXR1cm4gdH1nZXRVc2VyQm91bmRzKCl7dmFye191c2Vy"
+    "TWluOnQsX3VzZXJNYXg6ZSxfc3VnZ2VzdGVkTWluOmksX3N1Z2dlc3RlZE1heDpzfT10aGlzLHQ9Zyh0LE51bWJlci5QT1NJVElW"
+    "RV9JTkZJTklUWSksZT1nKGUsTnVtYmVyLk5FR0FUSVZFX0lORklOSVRZKSxpPWcoaSxOdW1iZXIuUE9TSVRJVkVfSU5GSU5JVFkp"
+    "LHM9ZyhzLE51bWJlci5ORUdBVElWRV9JTkZJTklUWSk7cmV0dXJue21pbjpnKHQsaSksbWF4OmcoZSxzKSxtaW5EZWZpbmVkOnAo"
+    "dCksbWF4RGVmaW5lZDpwKGUpfX1nZXRNaW5NYXgoaSl7bGV0IHMse21pbjphLG1heDpuLG1pbkRlZmluZWQ6byxtYXhEZWZpbmVk"
+    "OnJ9PXRoaXMuZ2V0VXNlckJvdW5kcygpO2lmKG8mJnIpcmV0dXJue21pbjphLG1heDpufTtjb25zdCBsPXRoaXMuZ2V0TWF0Y2hp"
+    "bmdWaXNpYmxlTWV0YXMoKTtmb3IobGV0IHQ9MCxlPWwubGVuZ3RoO3Q8ZTsrK3Qpcz1sW3RdLmNvbnRyb2xsZXIuZ2V0TWluTWF4"
+    "KHRoaXMsaSksb3x8KGE9TWF0aC5taW4oYSxzLm1pbikpLHJ8fChuPU1hdGgubWF4KG4scy5tYXgpKTtyZXR1cm4gYT1yJiZhPm4/"
+    "bjphLG49byYmYT5uP2E6bix7bWluOmcoYSxnKG4sYSkpLG1heDpnKG4sZyhhLG4pKX19Z2V0UGFkZGluZygpe3JldHVybntsZWZ0"
+    "OnRoaXMucGFkZGluZ0xlZnR8fDAsdG9wOnRoaXMucGFkZGluZ1RvcHx8MCxyaWdodDp0aGlzLnBhZGRpbmdSaWdodHx8MCxib3R0"
+    "b206dGhpcy5wYWRkaW5nQm90dG9tfHwwfX1nZXRUaWNrcygpe3JldHVybiB0aGlzLnRpY2tzfWdldExhYmVscygpe3ZhciB0PXRo"
+    "aXMuY2hhcnQuZGF0YTtyZXR1cm4gdGhpcy5vcHRpb25zLmxhYmVsc3x8KHRoaXMuaXNIb3Jpem9udGFsKCk/dC54TGFiZWxzOnQu"
+    "eUxhYmVscyl8fHQubGFiZWxzfHxbXX1nZXRMYWJlbEl0ZW1zKHQ9dGhpcy5jaGFydC5jaGFydEFyZWEpe3JldHVybiB0aGlzLl9s"
+    "YWJlbEl0ZW1zfHwodGhpcy5fbGFiZWxJdGVtcz10aGlzLl9jb21wdXRlTGFiZWxJdGVtcyh0KSl9YmVmb3JlTGF5b3V0KCl7dGhp"
+    "cy5fY2FjaGU9e30sdGhpcy5fZGF0YUxpbWl0c0NhY2hlZD0hMX1iZWZvcmVVcGRhdGUoKXtkKHRoaXMub3B0aW9ucy5iZWZvcmVV"
+    "cGRhdGUsW3RoaXNdKX11cGRhdGUodCxlLGkpe3ZhcntiZWdpbkF0WmVybzpzLGdyYWNlOmEsdGlja3M6bn09dGhpcy5vcHRpb25z"
+    "LG89bi5zYW1wbGVTaXplLHQ9KHRoaXMuYmVmb3JlVXBkYXRlKCksdGhpcy5tYXhXaWR0aD10LHRoaXMubWF4SGVpZ2h0PWUsdGhp"
+    "cy5fbWFyZ2lucz1pPU9iamVjdC5hc3NpZ24oe2xlZnQ6MCxyaWdodDowLHRvcDowLGJvdHRvbTowfSxpKSx0aGlzLnRpY2tzPW51"
+    "bGwsdGhpcy5fbGFiZWxTaXplcz1udWxsLHRoaXMuX2dyaWRMaW5lSXRlbXM9bnVsbCx0aGlzLl9sYWJlbEl0ZW1zPW51bGwsdGhp"
+    "cy5iZWZvcmVTZXREaW1lbnNpb25zKCksdGhpcy5zZXREaW1lbnNpb25zKCksdGhpcy5hZnRlclNldERpbWVuc2lvbnMoKSx0aGlz"
+    "Ll9tYXhMZW5ndGg9dGhpcy5pc0hvcml6b250YWwoKT90aGlzLndpZHRoK2kubGVmdCtpLnJpZ2h0OnRoaXMuaGVpZ2h0K2kudG9w"
+    "K2kuYm90dG9tLHRoaXMuX2RhdGFMaW1pdHNDYWNoZWR8fCh0aGlzLmJlZm9yZURhdGFMaW1pdHMoKSx0aGlzLmRldGVybWluZURh"
+    "dGFMaW1pdHMoKSx0aGlzLmFmdGVyRGF0YUxpbWl0cygpLHRoaXMuX3JhbmdlPVNpKHRoaXMsYSxzKSx0aGlzLl9kYXRhTGltaXRz"
+    "Q2FjaGVkPSEwKSx0aGlzLmJlZm9yZUJ1aWxkVGlja3MoKSx0aGlzLnRpY2tzPXRoaXMuYnVpbGRUaWNrcygpfHxbXSx0aGlzLmFm"
+    "dGVyQnVpbGRUaWNrcygpLG88dGhpcy50aWNrcy5sZW5ndGgpO3RoaXMuX2NvbnZlcnRUaWNrc1RvTGFiZWxzKHQ/RXModGhpcy50"
+    "aWNrcyxvKTp0aGlzLnRpY2tzKSx0aGlzLmNvbmZpZ3VyZSgpLHRoaXMuYmVmb3JlQ2FsY3VsYXRlTGFiZWxSb3RhdGlvbigpLHRo"
+    "aXMuY2FsY3VsYXRlTGFiZWxSb3RhdGlvbigpLHRoaXMuYWZ0ZXJDYWxjdWxhdGVMYWJlbFJvdGF0aW9uKCksbi5kaXNwbGF5JiYo"
+    "bi5hdXRvU2tpcHx8ImF1dG8iPT09bi5zb3VyY2UpJiYodGhpcy50aWNrcz1mdW5jdGlvbih0LHMpe2NvbnN0IGU9dC5vcHRpb25z"
+    "LnRpY2tzLGk9KGM9KHQ9dCkub3B0aW9ucy5vZmZzZXQsZD10Ll90aWNrU2l6ZSgpLGM9dC5fbGVuZ3RoL2QrKGM/MDoxKSx0PXQu"
+    "X21heExlbmd0aC9kLE1hdGguZmxvb3IoTWF0aC5taW4oYyx0KSkpLGE9TWF0aC5taW4oZS5tYXhUaWNrc0xpbWl0fHxpLGkpLG49"
+    "ZS5tYWpvci5lbmFibGVkP2Z1bmN0aW9uKHQpe2NvbnN0IGU9W107bGV0IGkscztmb3IoaT0wLHM9dC5sZW5ndGg7aTxzO2krKyl0"
+    "W2ldLm1ham9yJiZlLnB1c2goaSk7cmV0dXJuIGV9KHMpOltdLG89bi5sZW5ndGgscj1uWzBdLGw9bltvLTFdLGg9W107dmFyIGMs"
+    "ZDtpZihhPG8pe3t2YXIgdT1zO3ZhciBnPWg7dmFyIGY9bjt2YXIgcD1vL2E7bGV0IHQsZT0wLGk9ZlswXTtmb3IocD1NYXRoLmNl"
+    "aWwocCksdD0wO3Q8dS5sZW5ndGg7dCsrKXQ9PT1pJiYoZy5wdXNoKHVbdF0pLGUrKyxpPWZbZSpwXSl9cmV0dXJuIGh9dmFyIG09"
+    "ZnVuY3Rpb24odCxpLGUpe3ZhciB0PWZ1bmN0aW9uKHQpe3ZhciBlPXQubGVuZ3RoO2xldCBpLHM7aWYoZTwyKXJldHVybiExO2Zv"
+    "cihzPXRbMF0saT0xO2k8ZTsrK2kpaWYodFtpXS10W2ktMV0hPT1zKXJldHVybiExO3JldHVybiBzfSh0KSxzPWkubGVuZ3RoL2U7"
+    "aWYoIXQpcmV0dXJuIE1hdGgubWF4KHMsMSk7dmFyIGE9b3QodCk7Zm9yKGxldCB0PTAsZT1hLmxlbmd0aC0xO3Q8ZTt0Kyspe2Nv"
+    "bnN0IGk9YVt0XTtpZihpPnMpcmV0dXJuIGl9cmV0dXJuIE1hdGgubWF4KHMsMSl9KG4scyxhKTtpZigwPG8pe2xldCB0LGU7Y29u"
+    "c3QgaT0xPG8/TWF0aC5yb3VuZCgobC1yKS8oby0xKSk6bnVsbDtmb3IoQXMocyxoLG0sUChpKT8wOnItaSxyKSx0PTAsZT1vLTE7"
+    "dDxlO3QrKylBcyhzLGgsbSxuW3RdLG5bdCsxXSk7cmV0dXJuIEFzKHMsaCxtLGwsUChpKT9zLmxlbmd0aDpsK2kpLGh9cmV0dXJu"
+    "IEFzKHMsaCxtKSxofSh0aGlzLHRoaXMudGlja3MpLHRoaXMuX2xhYmVsU2l6ZXM9bnVsbCx0aGlzLmFmdGVyQXV0b1NraXAoKSks"
+    "dCYmdGhpcy5fY29udmVydFRpY2tzVG9MYWJlbHModGhpcy50aWNrcyksdGhpcy5iZWZvcmVGaXQoKSx0aGlzLmZpdCgpLHRoaXMu"
+    "YWZ0ZXJGaXQoKSx0aGlzLmFmdGVyVXBkYXRlKCl9Y29uZmlndXJlKCl7bGV0IHQsZSxpPXRoaXMub3B0aW9ucy5yZXZlcnNlO3Ro"
+    "aXMuaXNIb3Jpem9udGFsKCk/KHQ9dGhpcy5sZWZ0LGU9dGhpcy5yaWdodCk6KHQ9dGhpcy50b3AsZT10aGlzLmJvdHRvbSxpPSFp"
+    "KSx0aGlzLl9zdGFydFBpeGVsPXQsdGhpcy5fZW5kUGl4ZWw9ZSx0aGlzLl9yZXZlcnNlUGl4ZWxzPWksdGhpcy5fbGVuZ3RoPWUt"
+    "dCx0aGlzLl9hbGlnblRvUGl4ZWxzPXRoaXMub3B0aW9ucy5hbGlnblRvUGl4ZWxzfWFmdGVyVXBkYXRlKCl7ZCh0aGlzLm9wdGlv"
+    "bnMuYWZ0ZXJVcGRhdGUsW3RoaXNdKX1iZWZvcmVTZXREaW1lbnNpb25zKCl7ZCh0aGlzLm9wdGlvbnMuYmVmb3JlU2V0RGltZW5z"
+    "aW9ucyxbdGhpc10pfXNldERpbWVuc2lvbnMoKXt0aGlzLmlzSG9yaXpvbnRhbCgpPyh0aGlzLndpZHRoPXRoaXMubWF4V2lkdGgs"
+    "dGhpcy5sZWZ0PTAsdGhpcy5yaWdodD10aGlzLndpZHRoKToodGhpcy5oZWlnaHQ9dGhpcy5tYXhIZWlnaHQsdGhpcy50b3A9MCx0"
+    "aGlzLmJvdHRvbT10aGlzLmhlaWdodCksdGhpcy5wYWRkaW5nTGVmdD0wLHRoaXMucGFkZGluZ1RvcD0wLHRoaXMucGFkZGluZ1Jp"
+    "Z2h0PTAsdGhpcy5wYWRkaW5nQm90dG9tPTB9YWZ0ZXJTZXREaW1lbnNpb25zKCl7ZCh0aGlzLm9wdGlvbnMuYWZ0ZXJTZXREaW1l"
+    "bnNpb25zLFt0aGlzXSl9X2NhbGxIb29rcyh0KXt0aGlzLmNoYXJ0Lm5vdGlmeVBsdWdpbnModCx0aGlzLmdldENvbnRleHQoKSks"
+    "ZCh0aGlzLm9wdGlvbnNbdF0sW3RoaXNdKX1iZWZvcmVEYXRhTGltaXRzKCl7dGhpcy5fY2FsbEhvb2tzKCJiZWZvcmVEYXRhTGlt"
+    "aXRzIil9ZGV0ZXJtaW5lRGF0YUxpbWl0cygpe31hZnRlckRhdGFMaW1pdHMoKXt0aGlzLl9jYWxsSG9va3MoImFmdGVyRGF0YUxp"
+    "bWl0cyIpfWJlZm9yZUJ1aWxkVGlja3MoKXt0aGlzLl9jYWxsSG9va3MoImJlZm9yZUJ1aWxkVGlja3MiKX1idWlsZFRpY2tzKCl7"
+    "cmV0dXJuW119YWZ0ZXJCdWlsZFRpY2tzKCl7dGhpcy5fY2FsbEhvb2tzKCJhZnRlckJ1aWxkVGlja3MiKX1iZWZvcmVUaWNrVG9M"
+    "YWJlbENvbnZlcnNpb24oKXtkKHRoaXMub3B0aW9ucy5iZWZvcmVUaWNrVG9MYWJlbENvbnZlcnNpb24sW3RoaXNdKX1nZW5lcmF0"
+    "ZVRpY2tMYWJlbHModCl7dmFyIGU9dGhpcy5vcHRpb25zLnRpY2tzO2xldCBpLHMsYTtmb3IoaT0wLHM9dC5sZW5ndGg7aTxzO2kr"
+    "KykoYT10W2ldKS5sYWJlbD1kKGUuY2FsbGJhY2ssW2EudmFsdWUsaSx0XSx0aGlzKX1hZnRlclRpY2tUb0xhYmVsQ29udmVyc2lv"
+    "bigpe2QodGhpcy5vcHRpb25zLmFmdGVyVGlja1RvTGFiZWxDb252ZXJzaW9uLFt0aGlzXSl9YmVmb3JlQ2FsY3VsYXRlTGFiZWxS"
+    "b3RhdGlvbigpe2QodGhpcy5vcHRpb25zLmJlZm9yZUNhbGN1bGF0ZUxhYmVsUm90YXRpb24sW3RoaXNdKX1jYWxjdWxhdGVMYWJl"
+    "bFJvdGF0aW9uKCl7dmFyIHQsZSxpLHMsYT10aGlzLm9wdGlvbnMsbj1hLnRpY2tzLG89THModGhpcy50aWNrcy5sZW5ndGgsYS50"
+    "aWNrcy5tYXhUaWNrc0xpbWl0KSxyPW4ubWluUm90YXRpb258fDAsbD1uLm1heFJvdGF0aW9uO2xldCBoLGMsZCx1PXI7IXRoaXMu"
+    "X2lzVmlzaWJsZSgpfHwhbi5kaXNwbGF5fHxsPD1yfHxvPD0xfHwhdGhpcy5pc0hvcml6b250YWwoKT90aGlzLmxhYmVsUm90YXRp"
+    "b249cjooZT0odD10aGlzLl9nZXRMYWJlbFNpemVzKCkpLndpZGVzdC53aWR0aCxpPXQuaGlnaGVzdC5oZWlnaHQscz1DKHRoaXMu"
+    "Y2hhcnQud2lkdGgtZSwwLHRoaXMubWF4V2lkdGgpLChhLm9mZnNldD90aGlzLm1heFdpZHRoL286cy8oby0xKSk8ZSs2JiYoaD1z"
+    "LyhvLShhLm9mZnNldD8uNToxKSksYz10aGlzLm1heEhlaWdodC1ScyhhLmdyaWQpLW4ucGFkZGluZy1JcyhhLnRpdGxlLHRoaXMu"
+    "Y2hhcnQub3B0aW9ucy5mb250KSxkPU1hdGguc3FydChlKmUraSppKSx1PWN0KE1hdGgubWluKE1hdGguYXNpbihDKCh0LmhpZ2hl"
+    "c3QuaGVpZ2h0KzYpL2gsLTEsMSkpLE1hdGguYXNpbihDKGMvZCwtMSwxKSktTWF0aC5hc2luKEMoaS9kLC0xLDEpKSkpLHU9TWF0"
+    "aC5tYXgocixNYXRoLm1pbihsLHUpKSksdGhpcy5sYWJlbFJvdGF0aW9uPXUpfWFmdGVyQ2FsY3VsYXRlTGFiZWxSb3RhdGlvbigp"
+    "e2QodGhpcy5vcHRpb25zLmFmdGVyQ2FsY3VsYXRlTGFiZWxSb3RhdGlvbixbdGhpc10pfWFmdGVyQXV0b1NraXAoKXt9YmVmb3Jl"
+    "Rml0KCl7ZCh0aGlzLm9wdGlvbnMuYmVmb3JlRml0LFt0aGlzXSl9Zml0KCl7Y29uc3QgdD17d2lkdGg6MCxoZWlnaHQ6MH0se2No"
+    "YXJ0OmUsb3B0aW9uczp7dGlja3M6aSx0aXRsZTpzLGdyaWQ6YX19PXRoaXMsbj10aGlzLl9pc1Zpc2libGUoKSxvPXRoaXMuaXNI"
+    "b3Jpem9udGFsKCk7aWYobil7Y29uc3Qgbj1JcyhzLGUub3B0aW9ucy5mb250KTtpZihvPyh0LndpZHRoPXRoaXMubWF4V2lkdGgs"
+    "dC5oZWlnaHQ9UnMoYSkrbik6KHQuaGVpZ2h0PXRoaXMubWF4SGVpZ2h0LHQud2lkdGg9UnMoYSkrbiksaS5kaXNwbGF5JiZ0aGlz"
+    "LnRpY2tzLmxlbmd0aCl7Y29uc3R7Zmlyc3Q6ZSxsYXN0OnMsd2lkZXN0OmEsaGlnaGVzdDpufT10aGlzLl9nZXRMYWJlbFNpemVz"
+    "KCkscj0yKmkucGFkZGluZyxsPUwodGhpcy5sYWJlbFJvdGF0aW9uKSxoPU1hdGguY29zKGwpLGM9TWF0aC5zaW4obCk7aWYobyl7"
+    "Y29uc3QgZT1pLm1pcnJvcj8wOmMqYS53aWR0aCtoKm4uaGVpZ2h0O3QuaGVpZ2h0PU1hdGgubWluKHRoaXMubWF4SGVpZ2h0LHQu"
+    "aGVpZ2h0K2Urcil9ZWxzZXtjb25zdCBlPWkubWlycm9yPzA6aCphLndpZHRoK2Mqbi5oZWlnaHQ7dC53aWR0aD1NYXRoLm1pbih0"
+    "aGlzLm1heFdpZHRoLHQud2lkdGgrZStyKX10aGlzLl9jYWxjdWxhdGVQYWRkaW5nKGUscyxjLGgpfX10aGlzLl9oYW5kbGVNYXJn"
+    "aW5zKCksbz8odGhpcy53aWR0aD10aGlzLl9sZW5ndGg9ZS53aWR0aC10aGlzLl9tYXJnaW5zLmxlZnQtdGhpcy5fbWFyZ2lucy5y"
+    "aWdodCx0aGlzLmhlaWdodD10LmhlaWdodCk6KHRoaXMud2lkdGg9dC53aWR0aCx0aGlzLmhlaWdodD10aGlzLl9sZW5ndGg9ZS5o"
+    "ZWlnaHQtdGhpcy5fbWFyZ2lucy50b3AtdGhpcy5fbWFyZ2lucy5ib3R0b20pfV9jYWxjdWxhdGVQYWRkaW5nKGkscyxhLG4pe2Nv"
+    "bnN0e3RpY2tzOnthbGlnbjpvLHBhZGRpbmc6cn0scG9zaXRpb246bH09dGhpcy5vcHRpb25zLGg9MCE9PXRoaXMubGFiZWxSb3Rh"
+    "dGlvbixjPSJ0b3AiIT09bCYmIngiPT09dGhpcy5heGlzO2lmKHRoaXMuaXNIb3Jpem9udGFsKCkpe2NvbnN0IGw9dGhpcy5nZXRQ"
+    "aXhlbEZvclRpY2soMCktdGhpcy5sZWZ0LGQ9dGhpcy5yaWdodC10aGlzLmdldFBpeGVsRm9yVGljayh0aGlzLnRpY2tzLmxlbmd0"
+    "aC0xKTtsZXQgdD0wLGU9MDtoP2U9Yz8odD1uKmkud2lkdGgsYSpzLmhlaWdodCk6KHQ9YSppLmhlaWdodCxuKnMud2lkdGgpOiJz"
+    "dGFydCI9PT1vP2U9cy53aWR0aDoiZW5kIj09PW8/dD1pLndpZHRoOiJpbm5lciIhPT1vJiYodD1pLndpZHRoLzIsZT1zLndpZHRo"
+    "LzIpLHRoaXMucGFkZGluZ0xlZnQ9TWF0aC5tYXgoKHQtbCtyKSp0aGlzLndpZHRoLyh0aGlzLndpZHRoLWwpLDApLHRoaXMucGFk"
+    "ZGluZ1JpZ2h0PU1hdGgubWF4KChlLWQrcikqdGhpcy53aWR0aC8odGhpcy53aWR0aC1kKSwwKX1lbHNle2xldCB0PXMuaGVpZ2h0"
+    "LzIsZT1pLmhlaWdodC8yOyJzdGFydCI9PT1vPyh0PTAsZT1pLmhlaWdodCk6ImVuZCI9PT1vJiYodD1zLmhlaWdodCxlPTApLHRo"
+    "aXMucGFkZGluZ1RvcD10K3IsdGhpcy5wYWRkaW5nQm90dG9tPWUrcn19X2hhbmRsZU1hcmdpbnMoKXt0aGlzLl9tYXJnaW5zJiYo"
+    "dGhpcy5fbWFyZ2lucy5sZWZ0PU1hdGgubWF4KHRoaXMucGFkZGluZ0xlZnQsdGhpcy5fbWFyZ2lucy5sZWZ0KSx0aGlzLl9tYXJn"
+    "aW5zLnRvcD1NYXRoLm1heCh0aGlzLnBhZGRpbmdUb3AsdGhpcy5fbWFyZ2lucy50b3ApLHRoaXMuX21hcmdpbnMucmlnaHQ9TWF0"
+    "aC5tYXgodGhpcy5wYWRkaW5nUmlnaHQsdGhpcy5fbWFyZ2lucy5yaWdodCksdGhpcy5fbWFyZ2lucy5ib3R0b209TWF0aC5tYXgo"
+    "dGhpcy5wYWRkaW5nQm90dG9tLHRoaXMuX21hcmdpbnMuYm90dG9tKSl9YWZ0ZXJGaXQoKXtkKHRoaXMub3B0aW9ucy5hZnRlckZp"
+    "dCxbdGhpc10pfWlzSG9yaXpvbnRhbCgpe3ZhcntheGlzOnQscG9zaXRpb246ZX09dGhpcy5vcHRpb25zO3JldHVybiJ0b3AiPT09"
+    "ZXx8ImJvdHRvbSI9PT1lfHwieCI9PT10fWlzRnVsbFNpemUoKXtyZXR1cm4gdGhpcy5vcHRpb25zLmZ1bGxTaXplfV9jb252ZXJ0"
+    "VGlja3NUb0xhYmVscyh0KXtsZXQgZSxpO2Zvcih0aGlzLmJlZm9yZVRpY2tUb0xhYmVsQ29udmVyc2lvbigpLHRoaXMuZ2VuZXJh"
+    "dGVUaWNrTGFiZWxzKHQpLGU9MCxpPXQubGVuZ3RoO2U8aTtlKyspUCh0W2VdLmxhYmVsKSYmKHQuc3BsaWNlKGUsMSksaS0tLGUt"
+    "LSk7dGhpcy5hZnRlclRpY2tUb0xhYmVsQ29udmVyc2lvbigpfV9nZXRMYWJlbFNpemVzKCl7bGV0IGU9dGhpcy5fbGFiZWxTaXpl"
+    "cztpZighZSl7dmFyIGk9dGhpcy5vcHRpb25zLnRpY2tzLnNhbXBsZVNpemU7bGV0IHQ9dGhpcy50aWNrcztpPHQubGVuZ3RoJiYo"
+    "dD1Fcyh0LGkpKSx0aGlzLl9sYWJlbFNpemVzPWU9dGhpcy5fY29tcHV0ZUxhYmVsU2l6ZXModCx0Lmxlbmd0aCx0aGlzLm9wdGlv"
+    "bnMudGlja3MubWF4VGlja3NMaW1pdCl9cmV0dXJuIGV9X2NvbXB1dGVMYWJlbFNpemVzKHQsZSxpKXtjb25zdHtjdHg6cyxfbG9u"
+    "Z2VzdFRleHRDYWNoZTphfT10aGlzLG49W10sbz1bXSxyPU1hdGguZmxvb3IoZS9McyhlLGkpKTtsZXQgbCxoLGMsZCx1LGcsZixw"
+    "LG0sYix4LHY9MCxfPTA7Zm9yKGw9MDtsPGU7bCs9cil7aWYoZD10W2xdLmxhYmVsLHU9dGhpcy5fcmVzb2x2ZVRpY2tGb250T3B0"
+    "aW9ucyhsKSxzLmZvbnQ9Zz11LnN0cmluZyxmPWFbZ109YVtnXXx8e2RhdGE6e30sZ2M6W119LHA9dS5saW5lSGVpZ2h0LG09Yj0w"
+    "LFAoZCl8fE8oZCkpe2lmKE8oZCkpZm9yKGg9MCxjPWQubGVuZ3RoO2g8YzsrK2gpUCh4PWRbaF0pfHxPKHgpfHwobT1MZShzLGYu"
+    "ZGF0YSxmLmdjLG0seCksYis9cCl9ZWxzZSBtPUxlKHMsZi5kYXRhLGYuZ2MsbSxkKSxiPXA7bi5wdXNoKG0pLG8ucHVzaChiKSx2"
+    "PU1hdGgubWF4KG0sdiksXz1NYXRoLm1heChiLF8pfWk9YSx5PWUsayhpLHQ9Pntjb25zdCBlPXQuZ2MsaT1lLmxlbmd0aC8yO2xl"
+    "dCBzO2lmKHk8aSl7Zm9yKHM9MDtzPGk7KytzKWRlbGV0ZSB0LmRhdGFbZVtzXV07ZS5zcGxpY2UoMCxpKX19KTt2YXIgeSxpPW4u"
+    "aW5kZXhPZih2KSxNPW8uaW5kZXhPZihfKSx3PXQ9Pih7d2lkdGg6blt0XXx8MCxoZWlnaHQ6b1t0XXx8MH0pO3JldHVybntmaXJz"
+    "dDp3KDApLGxhc3Q6dyhlLTEpLHdpZGVzdDp3KGkpLGhpZ2hlc3Q6dyhNKSx3aWR0aHM6bixoZWlnaHRzOm99fWdldExhYmVsRm9y"
+    "VmFsdWUodCl7cmV0dXJuIHR9Z2V0UGl4ZWxGb3JWYWx1ZSh0LGUpe3JldHVybiBOYU59Z2V0VmFsdWVGb3JQaXhlbCh0KXt9Z2V0"
+    "UGl4ZWxGb3JUaWNrKHQpe3ZhciBlPXRoaXMudGlja3M7cmV0dXJuIHQ8MHx8dD5lLmxlbmd0aC0xP251bGw6dGhpcy5nZXRQaXhl"
+    "bEZvclZhbHVlKGVbdF0udmFsdWUpfWdldFBpeGVsRm9yRGVjaW1hbCh0KXt0aGlzLl9yZXZlcnNlUGl4ZWxzJiYodD0xLXQpO3Q9"
+    "dGhpcy5fc3RhcnRQaXhlbCt0KnRoaXMuX2xlbmd0aDtyZXR1cm4gbXQodGhpcy5fYWxpZ25Ub1BpeGVscz9SZSh0aGlzLmNoYXJ0"
+    "LHQsMCk6dCl9Z2V0RGVjaW1hbEZvclBpeGVsKHQpe3Q9KHQtdGhpcy5fc3RhcnRQaXhlbCkvdGhpcy5fbGVuZ3RoO3JldHVybiB0"
+    "aGlzLl9yZXZlcnNlUGl4ZWxzPzEtdDp0fWdldEJhc2VQaXhlbCgpe3JldHVybiB0aGlzLmdldFBpeGVsRm9yVmFsdWUodGhpcy5n"
+    "ZXRCYXNlVmFsdWUoKSl9Z2V0QmFzZVZhbHVlKCl7dmFye21pbjp0LG1heDplfT10aGlzO3JldHVybiB0PDAmJmU8MD9lOjA8dCYm"
+    "MDxlP3Q6MH1nZXRDb250ZXh0KHQpe3ZhciBlPXRoaXMudGlja3N8fFtdO2lmKDA8PXQmJnQ8ZS5sZW5ndGgpe2NvbnN0IGk9ZVt0"
+    "XTtyZXR1cm4gaS4kY29udGV4dHx8KGkuJGNvbnRleHQ9UGkodGhpcy5nZXRDb250ZXh0KCkse3RpY2s6aSxpbmRleDp0LHR5cGU6"
+    "InRpY2sifSkpfXJldHVybiB0aGlzLiRjb250ZXh0fHwodGhpcy4kY29udGV4dD1QaSh0aGlzLmNoYXJ0LmdldENvbnRleHQoKSx7"
+    "c2NhbGU6dGhpcyx0eXBlOiJzY2FsZSJ9KSl9X3RpY2tTaXplKCl7dmFyIHQ9dGhpcy5vcHRpb25zLnRpY2tzLGU9TCh0aGlzLmxh"
+    "YmVsUm90YXRpb24pLGk9TWF0aC5hYnMoTWF0aC5jb3MoZSkpLGU9TWF0aC5hYnMoTWF0aC5zaW4oZSkpLHM9dGhpcy5fZ2V0TGFi"
+    "ZWxTaXplcygpLHQ9dC5hdXRvU2tpcFBhZGRpbmd8fDAsYT1zP3Mud2lkZXN0LndpZHRoK3Q6MCxzPXM/cy5oaWdoZXN0LmhlaWdo"
+    "dCt0OjA7cmV0dXJuIHRoaXMuaXNIb3Jpem9udGFsKCk/YSplPHMqaT9hL2k6cy9lOnMqZTxhKmk/cy9pOmEvZX1faXNWaXNpYmxl"
+    "KCl7dmFyIHQ9dGhpcy5vcHRpb25zLmRpc3BsYXk7cmV0dXJuImF1dG8iIT09dD8hIXQ6MDx0aGlzLmdldE1hdGNoaW5nVmlzaWJs"
+    "ZU1ldGFzKCkubGVuZ3RofV9jb21wdXRlR3JpZExpbmVJdGVtcyh0KXtmdW5jdGlvbiBlKHQpe3JldHVybiBSZShzLHQsZil9Y29u"
+    "c3QgaT10aGlzLmF4aXMscz10aGlzLmNoYXJ0LGE9dGhpcy5vcHRpb25zLHtncmlkOm4scG9zaXRpb246byxib3JkZXI6cn09YSxs"
+    "PW4ub2Zmc2V0LGg9dGhpcy5pc0hvcml6b250YWwoKSxjPXRoaXMudGlja3MubGVuZ3RoKyhsPzE6MCksZD1ScyhuKSx1PVtdLGc9"
+    "ci5zZXRDb250ZXh0KHRoaXMuZ2V0Q29udGV4dCgpKSxmPWcuZGlzcGxheT9nLndpZHRoOjAscD1mLzI7bGV0IG0sYix4LHYsXyx5"
+    "LE0sdyxrLFMsUCxEO2lmKCJ0b3AiPT09byltPWUodGhpcy5ib3R0b20pLHk9dGhpcy5ib3R0b20tZCx3PW0tcCxTPWUodC50b3Ap"
+    "K3AsRD10LmJvdHRvbTtlbHNlIGlmKCJib3R0b20iPT09byltPWUodGhpcy50b3ApLFM9dC50b3AsRD1lKHQuYm90dG9tKS1wLHk9"
+    "bStwLHc9dGhpcy50b3ArZDtlbHNlIGlmKCJsZWZ0Ij09PW8pbT1lKHRoaXMucmlnaHQpLF89dGhpcy5yaWdodC1kLE09bS1wLGs9"
+    "ZSh0LmxlZnQpK3AsUD10LnJpZ2h0O2Vsc2UgaWYoInJpZ2h0Ij09PW8pbT1lKHRoaXMubGVmdCksaz10LmxlZnQsUD1lKHQucmln"
+    "aHQpLXAsXz1tK3AsTT10aGlzLmxlZnQrZDtlbHNlIGlmKCJ4Ij09PWkpe2lmKCJjZW50ZXIiPT09byltPWUoKHQudG9wK3QuYm90"
+    "dG9tKS8yKy41KTtlbHNlIGlmKEEobykpe2NvbnN0IHQ9T2JqZWN0LmtleXMobylbMF0saT1vW3RdO209ZSh0aGlzLmNoYXJ0LnNj"
+    "YWxlc1t0XS5nZXRQaXhlbEZvclZhbHVlKGkpKX1TPXQudG9wLEQ9dC5ib3R0b20seT1tK3Asdz15K2R9ZWxzZSBpZigieSI9PT1p"
+    "KXtpZigiY2VudGVyIj09PW8pbT1lKCh0LmxlZnQrdC5yaWdodCkvMik7ZWxzZSBpZihBKG8pKXtjb25zdCB0PU9iamVjdC5rZXlz"
+    "KG8pWzBdLGk9b1t0XTttPWUodGhpcy5jaGFydC5zY2FsZXNbdF0uZ2V0UGl4ZWxGb3JWYWx1ZShpKSl9Xz1tLXAsTT1fLWQsaz10"
+    "LmxlZnQsUD10LnJpZ2h0fXZhciB0PVQoYS50aWNrcy5tYXhUaWNrc0xpbWl0LGMpLEM9TWF0aC5tYXgoMSxNYXRoLmNlaWwoYy90"
+    "KSk7Zm9yKGI9MDtiPGM7Yis9Qyl7Y29uc3QgdD10aGlzLmdldENvbnRleHQoYiksaT1uLnNldENvbnRleHQodCksYT1yLnNldENv"
+    "bnRleHQodCksQT1pLmxpbmVXaWR0aCxvPWkuY29sb3IsVD1hLmRhc2h8fFtdLGM9YS5kYXNoT2Zmc2V0LGQ9aS50aWNrV2lkdGgs"
+    "Zz1pLnRpY2tDb2xvcixmPWkudGlja0JvcmRlckRhc2h8fFtdLHA9aS50aWNrQm9yZGVyRGFzaE9mZnNldDt2b2lkIDAhPT0oeD1m"
+    "dW5jdGlvbih0LGUsaSl7dmFyIHM9dC50aWNrcy5sZW5ndGgsYT1NYXRoLm1pbihlLHMtMSksbj10Ll9zdGFydFBpeGVsLG89dC5f"
+    "ZW5kUGl4ZWw7bGV0IHIsbD10LmdldFBpeGVsRm9yVGljayhhKTtpZighKGkmJihyPTE9PT1zP01hdGgubWF4KGwtbixvLWwpOjA9"
+    "PT1lPyh0LmdldFBpeGVsRm9yVGljaygxKS1sKS8yOihsLXQuZ2V0UGl4ZWxGb3JUaWNrKGEtMSkpLzIsKGwrPWE8ZT9yOi1yKTxu"
+    "LTFlLTZ8fGw+bysxZS02KSkpcmV0dXJuIGx9KHRoaXMsYixsKSkmJih2PVJlKHMseCxBKSxoP189TT1rPVA9djp5PXc9Uz1EPXYs"
+    "dS5wdXNoKHt0eDE6Xyx0eTE6eSx0eDI6TSx0eTI6dyx4MTprLHkxOlMseDI6UCx5MjpELHdpZHRoOkEsY29sb3I6byxib3JkZXJE"
+    "YXNoOlQsYm9yZGVyRGFzaE9mZnNldDpjLHRpY2tXaWR0aDpkLHRpY2tDb2xvcjpnLHRpY2tCb3JkZXJEYXNoOmYsdGlja0JvcmRl"
+    "ckRhc2hPZmZzZXQ6cH0pKX1yZXR1cm4gdGhpcy5fdGlja3NMZW5ndGg9Yyx0aGlzLl9ib3JkZXJWYWx1ZT1tLHV9X2NvbXB1dGVM"
+    "YWJlbEl0ZW1zKHMpe2NvbnN0IGE9dGhpcy5heGlzLG49dGhpcy5vcHRpb25zLHtwb3NpdGlvbjpvLHRpY2tzOmV9PW4scj10aGlz"
+    "LmlzSG9yaXpvbnRhbCgpLGw9dGhpcy50aWNrcyx7YWxpZ246aCxjcm9zc0FsaWduOmMscGFkZGluZzp0LG1pcnJvcjpkfT1lLGk9"
+    "UnMobi5ncmlkKSx1PWkrdCxnPWQ/LXQ6dSxmPS1MKHRoaXMubGFiZWxSb3RhdGlvbikscD1bXTtsZXQgbSxiLHgsdixfLHksTSx3"
+    "LGssUyxQLEQ9Im1pZGRsZSI7aWYoInRvcCI9PT1vKV89dGhpcy5ib3R0b20tZyx5PXRoaXMuX2dldFhBeGlzTGFiZWxBbGlnbm1l"
+    "bnQoKTtlbHNlIGlmKCJib3R0b20iPT09bylfPXRoaXMudG9wK2cseT10aGlzLl9nZXRYQXhpc0xhYmVsQWxpZ25tZW50KCk7ZWxz"
+    "ZSBpZigibGVmdCI9PT1vKXtjb25zdCBzPXRoaXMuX2dldFlBeGlzTGFiZWxBbGlnbm1lbnQoaSk7eT1zLnRleHRBbGlnbix2PXMu"
+    "eH1lbHNlIGlmKCJyaWdodCI9PT1vKXtjb25zdCBzPXRoaXMuX2dldFlBeGlzTGFiZWxBbGlnbm1lbnQoaSk7eT1zLnRleHRBbGln"
+    "bix2PXMueH1lbHNlIGlmKCJ4Ij09PWEpe2lmKCJjZW50ZXIiPT09bylfPShzLnRvcCtzLmJvdHRvbSkvMit1O2Vsc2UgaWYoQShv"
+    "KSl7Y29uc3Qgcz1PYmplY3Qua2V5cyhvKVswXSxhPW9bc107Xz10aGlzLmNoYXJ0LnNjYWxlc1tzXS5nZXRQaXhlbEZvclZhbHVl"
+    "KGEpK3V9eT10aGlzLl9nZXRYQXhpc0xhYmVsQWxpZ25tZW50KCl9ZWxzZSBpZigieSI9PT1hKXtpZigiY2VudGVyIj09PW8pdj0o"
+    "cy5sZWZ0K3MucmlnaHQpLzItdTtlbHNlIGlmKEEobykpe2NvbnN0IHM9T2JqZWN0LmtleXMobylbMF0sYT1vW3NdO3Y9dGhpcy5j"
+    "aGFydC5zY2FsZXNbc10uZ2V0UGl4ZWxGb3JWYWx1ZShhKX15PXRoaXMuX2dldFlBeGlzTGFiZWxBbGlnbm1lbnQoaSkudGV4dEFs"
+    "aWdufSJ5Ij09PWEmJigic3RhcnQiPT09aD9EPSJ0b3AiOiJlbmQiPT09aCYmKEQ9ImJvdHRvbSIpKTt2YXIgQz10aGlzLl9nZXRM"
+    "YWJlbFNpemVzKCk7Zm9yKG09MCxiPWwubGVuZ3RoO208YjsrK20pe3g9bFttXS5sYWJlbDtjb25zdCBzPWUuc2V0Q29udGV4dCh0"
+    "aGlzLmdldENvbnRleHQobSkpLGE9KE09dGhpcy5nZXRQaXhlbEZvclRpY2sobSkrZS5sYWJlbE9mZnNldCxrPSh3PXRoaXMuX3Jl"
+    "c29sdmVUaWNrRm9udE9wdGlvbnMobSkpLmxpbmVIZWlnaHQsKFM9Tyh4KT94Lmxlbmd0aDoxKS8yKSxuPXMuY29sb3IsQT1zLnRl"
+    "eHRTdHJva2VDb2xvcixoPXMudGV4dFN0cm9rZVdpZHRoO2xldCBpLHQ9eTtpZihyPyh2PU0sImlubmVyIj09PXkmJih0PW09PT1i"
+    "LTE/dGhpcy5vcHRpb25zLnJldmVyc2U/ImxlZnQiOiJyaWdodCI6MD09PW0/dGhpcy5vcHRpb25zLnJldmVyc2U/InJpZ2h0Ijoi"
+    "bGVmdCI6ImNlbnRlciIpLFA9InRvcCI9PT1vPyJuZWFyIj09PWN8fDAhPWY/LVMqaytrLzI6ImNlbnRlciI9PT1jPy1DLmhpZ2hl"
+    "c3QuaGVpZ2h0LzItYSprK2s6LUMuaGlnaGVzdC5oZWlnaHQray8yOiJuZWFyIj09PWN8fDAhPWY/ay8yOiJjZW50ZXIiPT09Yz9D"
+    "LmhpZ2hlc3QuaGVpZ2h0LzItYSprOkMuaGlnaGVzdC5oZWlnaHQtUyprLGQmJihQKj0tMSksMD09Znx8cy5zaG93TGFiZWxCYWNr"
+    "ZHJvcHx8KHYrPWsvMipNYXRoLnNpbihmKSkpOihfPU0sUD0oMS1TKSprLzIpLHMuc2hvd0xhYmVsQmFja2Ryb3Ape2NvbnN0IGE9"
+    "SShzLmJhY2tkcm9wUGFkZGluZyksbj1DLmhlaWdodHNbbV0sbz1DLndpZHRoc1ttXTtsZXQgdD1QLWEudG9wLGU9MC1hLmxlZnQ7"
+    "c3dpdGNoKEQpe2Nhc2UibWlkZGxlIjp0LT1uLzI7YnJlYWs7Y2FzZSJib3R0b20iOnQtPW59c3dpdGNoKHkpe2Nhc2UiY2VudGVy"
+    "IjplLT1vLzI7YnJlYWs7Y2FzZSJyaWdodCI6ZS09bzticmVhaztjYXNlImlubmVyIjptPT09Yi0xP2UtPW86MDxtJiYoZS09by8y"
+    "KX1pPXtsZWZ0OmUsdG9wOnQsd2lkdGg6bythLndpZHRoLGhlaWdodDpuK2EuaGVpZ2h0LGNvbG9yOnMuYmFja2Ryb3BDb2xvcn19"
+    "cC5wdXNoKHtsYWJlbDp4LGZvbnQ6dyx0ZXh0T2Zmc2V0OlAsb3B0aW9uczp7cm90YXRpb246Zixjb2xvcjpuLHN0cm9rZUNvbG9y"
+    "OkEsc3Ryb2tlV2lkdGg6aCx0ZXh0QWxpZ246dCx0ZXh0QmFzZWxpbmU6RCx0cmFuc2xhdGlvbjpbdixfXSxiYWNrZHJvcDppfX0p"
+    "fXJldHVybiBwfV9nZXRYQXhpc0xhYmVsQWxpZ25tZW50KCl7dmFye3Bvc2l0aW9uOnQsdGlja3M6ZX09dGhpcy5vcHRpb25zO2lm"
+    "KC1MKHRoaXMubGFiZWxSb3RhdGlvbikpcmV0dXJuInRvcCI9PT10PyJsZWZ0IjoicmlnaHQiO2xldCBpPSJjZW50ZXIiO3JldHVy"
+    "biJzdGFydCI9PT1lLmFsaWduP2k9ImxlZnQiOiJlbmQiPT09ZS5hbGlnbj9pPSJyaWdodCI6ImlubmVyIj09PWUuYWxpZ24mJihp"
+    "PSJpbm5lciIpLGl9X2dldFlBeGlzTGFiZWxBbGlnbm1lbnQodCl7dmFye3Bvc2l0aW9uOmUsdGlja3M6e2Nyb3NzQWxpZ246aSxt"
+    "aXJyb3I6cyxwYWRkaW5nOmF9fT10aGlzLm9wdGlvbnMsdD10K2Esbj10aGlzLl9nZXRMYWJlbFNpemVzKCkud2lkZXN0LndpZHRo"
+    "O2xldCBvLHI7cmV0dXJuImxlZnQiPT09ZT9zPyhyPXRoaXMucmlnaHQrYSwibmVhciI9PT1pP289ImxlZnQiOiJjZW50ZXIiPT09"
+    "aT8obz0iY2VudGVyIixyKz1uLzIpOihvPSJyaWdodCIscis9bikpOihyPXRoaXMucmlnaHQtdCwibmVhciI9PT1pP289InJpZ2h0"
+    "IjoiY2VudGVyIj09PWk/KG89ImNlbnRlciIsci09bi8yKToobz0ibGVmdCIscj10aGlzLmxlZnQpKToicmlnaHQiPT09ZT9zPyhy"
+    "PXRoaXMubGVmdCthLCJuZWFyIj09PWk/bz0icmlnaHQiOiJjZW50ZXIiPT09aT8obz0iY2VudGVyIixyLT1uLzIpOihvPSJsZWZ0"
+    "IixyLT1uKSk6KHI9dGhpcy5sZWZ0K3QsIm5lYXIiPT09aT9vPSJsZWZ0IjoiY2VudGVyIj09PWk/KG89ImNlbnRlciIscis9bi8y"
+    "KToobz0icmlnaHQiLHI9dGhpcy5yaWdodCkpOm89InJpZ2h0Iix7dGV4dEFsaWduOm8seDpyfX1fY29tcHV0ZUxhYmVsQXJlYSgp"
+    "e3ZhciB0LGU7aWYoIXRoaXMub3B0aW9ucy50aWNrcy5taXJyb3IpcmV0dXJuIHQ9dGhpcy5jaGFydCxlPXRoaXMub3B0aW9ucy5w"
+    "b3NpdGlvbiwibGVmdCI9PT1lfHwicmlnaHQiPT09ZT97dG9wOjAsbGVmdDp0aGlzLmxlZnQsYm90dG9tOnQuaGVpZ2h0LHJpZ2h0"
+    "OnRoaXMucmlnaHR9OiJ0b3AiPT09ZXx8ImJvdHRvbSI9PT1lP3t0b3A6dGhpcy50b3AsbGVmdDowLGJvdHRvbTp0aGlzLmJvdHRv"
+    "bSxyaWdodDp0LndpZHRofTp2b2lkIDB9ZHJhd0JhY2tncm91bmQoKXtjb25zdHtjdHg6dCxvcHRpb25zOntiYWNrZ3JvdW5kQ29s"
+    "b3I6ZX0sbGVmdDppLHRvcDpzLHdpZHRoOmEsaGVpZ2h0Om59PXRoaXM7ZSYmKHQuc2F2ZSgpLHQuZmlsbFN0eWxlPWUsdC5maWxs"
+    "UmVjdChpLHMsYSxuKSx0LnJlc3RvcmUoKSl9Z2V0TGluZVdpZHRoRm9yVmFsdWUoZSl7Y29uc3QgdD10aGlzLm9wdGlvbnMuZ3Jp"
+    "ZDtpZighdGhpcy5faXNWaXNpYmxlKCl8fCF0LmRpc3BsYXkpcmV0dXJuIDA7dmFyIGk9dGhpcy50aWNrcy5maW5kSW5kZXgodD0+"
+    "dC52YWx1ZT09PWUpO3JldHVybiAwPD1pP3Quc2V0Q29udGV4dCh0aGlzLmdldENvbnRleHQoaSkpLmxpbmVXaWR0aDowfWRyYXdH"
+    "cmlkKHQpe2NvbnN0IGU9dGhpcy5vcHRpb25zLmdyaWQscz10aGlzLmN0eCxpPXRoaXMuX2dyaWRMaW5lSXRlbXN8fCh0aGlzLl9n"
+    "cmlkTGluZUl0ZW1zPXRoaXMuX2NvbXB1dGVHcmlkTGluZUl0ZW1zKHQpKTtsZXQgYSxuO3ZhciBvPSh0LGUsaSk9PntpLndpZHRo"
+    "JiZpLmNvbG9yJiYocy5zYXZlKCkscy5saW5lV2lkdGg9aS53aWR0aCxzLnN0cm9rZVN0eWxlPWkuY29sb3Iscy5zZXRMaW5lRGFz"
+    "aChpLmJvcmRlckRhc2h8fFtdKSxzLmxpbmVEYXNoT2Zmc2V0PWkuYm9yZGVyRGFzaE9mZnNldCxzLmJlZ2luUGF0aCgpLHMubW92"
+    "ZVRvKHQueCx0LnkpLHMubGluZVRvKGUueCxlLnkpLHMuc3Ryb2tlKCkscy5yZXN0b3JlKCkpfTtpZihlLmRpc3BsYXkpZm9yKGE9"
+    "MCxuPWkubGVuZ3RoO2E8bjsrK2Epe2NvbnN0IHQ9aVthXTtlLmRyYXdPbkNoYXJ0QXJlYSYmbyh7eDp0LngxLHk6dC55MX0se3g6"
+    "dC54Mix5OnQueTJ9LHQpLGUuZHJhd1RpY2tzJiZvKHt4OnQudHgxLHk6dC50eTF9LHt4OnQudHgyLHk6dC50eTJ9LHtjb2xvcjp0"
+    "LnRpY2tDb2xvcix3aWR0aDp0LnRpY2tXaWR0aCxib3JkZXJEYXNoOnQudGlja0JvcmRlckRhc2gsYm9yZGVyRGFzaE9mZnNldDp0"
+    "LnRpY2tCb3JkZXJEYXNoT2Zmc2V0fSl9fWRyYXdCb3JkZXIoKXtjb25zdHtjaGFydDphLGN0eDpuLG9wdGlvbnM6e2JvcmRlcjp0"
+    "LGdyaWQ6b319PXRoaXMscj10LnNldENvbnRleHQodGhpcy5nZXRDb250ZXh0KCkpLGw9dC5kaXNwbGF5P3Iud2lkdGg6MDtpZihs"
+    "KXt2YXIgaD1vLnNldENvbnRleHQodGhpcy5nZXRDb250ZXh0KDApKS5saW5lV2lkdGgsYz10aGlzLl9ib3JkZXJWYWx1ZTtsZXQg"
+    "dCxlLGksczt0aGlzLmlzSG9yaXpvbnRhbCgpPyh0PVJlKGEsdGhpcy5sZWZ0LGwpLWwvMixlPVJlKGEsdGhpcy5yaWdodCxoKSto"
+    "LzIsaT1zPWMpOihpPVJlKGEsdGhpcy50b3AsbCktbC8yLHM9UmUoYSx0aGlzLmJvdHRvbSxoKStoLzIsdD1lPWMpLG4uc2F2ZSgp"
+    "LG4ubGluZVdpZHRoPXIud2lkdGgsbi5zdHJva2VTdHlsZT1yLmNvbG9yLG4uYmVnaW5QYXRoKCksbi5tb3ZlVG8odCxpKSxuLmxp"
+    "bmVUbyhlLHMpLG4uc3Ryb2tlKCksbi5yZXN0b3JlKCl9fWRyYXdMYWJlbHModCl7aWYodGhpcy5vcHRpb25zLnRpY2tzLmRpc3Bs"
+    "YXkpe2NvbnN0IGU9dGhpcy5jdHgsaT10aGlzLl9jb21wdXRlTGFiZWxBcmVhKCkscz0oaSYmVmUoZSxpKSx0aGlzLmdldExhYmVs"
+    "SXRlbXModCkpO2Zvcihjb25zdCB0IG9mIHMpe2NvbnN0IGk9dC5vcHRpb25zLHM9dC5mb250O0hlKGUsdC5sYWJlbCwwLHQudGV4"
+    "dE9mZnNldCxzLGkpfWkmJkJlKGUpfX1kcmF3VGl0bGUoKXt2YXJ7Y3R4OmUsb3B0aW9uczp7cG9zaXRpb246aSx0aXRsZTpzLHJl"
+    "dmVyc2U6YX19PXRoaXM7aWYocy5kaXNwbGF5KXt2YXIgbj16KHMuZm9udCksbz1JKHMucGFkZGluZykscj1zLmFsaWduO2xldCB0"
+    "PW4ubGluZUhlaWdodC8yOyJib3R0b20iPT09aXx8ImNlbnRlciI9PT1pfHxBKGkpPyh0Kz1vLmJvdHRvbSxPKHMudGV4dCkmJih0"
+    "Kz1uLmxpbmVIZWlnaHQqKHMudGV4dC5sZW5ndGgtMSkpKTp0Kz1vLnRvcDt2YXJ7dGl0bGVYOm8sdGl0bGVZOmwsbWF4V2lkdGg6"
+    "aCxyb3RhdGlvbjpjfT1mdW5jdGlvbih0LGUsaSxzKXtjb25zdHt0b3A6YSxsZWZ0Om4sYm90dG9tOm8scmlnaHQ6cixjaGFydDps"
+    "fT10LHtjaGFydEFyZWE6aCxzY2FsZXM6Y309bDtsZXQgZCx1LGcsZj0wO3ZhciBwPW8tYSxtPXItbjtpZih0LmlzSG9yaXpvbnRh"
+    "bCgpKXtpZih1PUUocyxuLHIpLEEoaSkpe2NvbnN0IHQ9T2JqZWN0LmtleXMoaSlbMF0scz1pW3RdO2c9Y1t0XS5nZXRQaXhlbEZv"
+    "clZhbHVlKHMpK3AtZX1lbHNlIGc9ImNlbnRlciI9PT1pPyhoLmJvdHRvbStoLnRvcCkvMitwLWU6VHModCxpLGUpO2Q9ci1ufWVs"
+    "c2V7aWYoQShpKSl7Y29uc3QgdD1PYmplY3Qua2V5cyhpKVswXSxzPWlbdF07dT1jW3RdLmdldFBpeGVsRm9yVmFsdWUocyktbStl"
+    "fWVsc2UgdT0iY2VudGVyIj09PWk/KGgubGVmdCtoLnJpZ2h0KS8yLW0rZTpUcyh0LGksZSk7Zz1FKHMsbyxhKSxmPSJsZWZ0Ij09"
+    "PWk/LUQ6RH1yZXR1cm57dGl0bGVYOnUsdGl0bGVZOmcsbWF4V2lkdGg6ZCxyb3RhdGlvbjpmfX0odGhpcyx0LGkscik7SGUoZSxz"
+    "LnRleHQsMCwwLG4se2NvbG9yOnMuY29sb3IsbWF4V2lkdGg6aCxyb3RhdGlvbjpjLHRleHRBbGlnbjpmdW5jdGlvbih0LGUsaSl7"
+    "bGV0IHM9RHQodCk7cmV0dXJuIHM9aSYmInJpZ2h0IiE9PWV8fCFpJiYicmlnaHQiPT09ZT8ibGVmdCI9PT0odD1zKT8icmlnaHQi"
+    "OiJyaWdodCI9PT10PyJsZWZ0Ijp0OnN9KHIsaSxhKSx0ZXh0QmFzZWxpbmU6Im1pZGRsZSIsdHJhbnNsYXRpb246W28sbF19KX19"
+    "ZHJhdyh0KXt0aGlzLl9pc1Zpc2libGUoKSYmKHRoaXMuZHJhd0JhY2tncm91bmQoKSx0aGlzLmRyYXdHcmlkKHQpLHRoaXMuZHJh"
+    "d0JvcmRlcigpLHRoaXMuZHJhd1RpdGxlKCksdGhpcy5kcmF3TGFiZWxzKHQpKX1fbGF5ZXJzKCl7dmFyIHQ9dGhpcy5vcHRpb25z"
+    "LGU9dC50aWNrcyYmdC50aWNrcy56fHwwLGk9VCh0LmdyaWQmJnQuZ3JpZC56LC0xKSx0PVQodC5ib3JkZXImJnQuYm9yZGVyLnos"
+    "MCk7cmV0dXJuIHRoaXMuX2lzVmlzaWJsZSgpJiZ0aGlzLmRyYXc9PT16cy5wcm90b3R5cGUuZHJhdz9be3o6aSxkcmF3OnQ9Pnt0"
+    "aGlzLmRyYXdCYWNrZ3JvdW5kKCksdGhpcy5kcmF3R3JpZCh0KSx0aGlzLmRyYXdUaXRsZSgpfX0se3o6dCxkcmF3OigpPT57dGhp"
+    "cy5kcmF3Qm9yZGVyKCl9fSx7ejplLGRyYXc6dD0+e3RoaXMuZHJhd0xhYmVscyh0KX19XTpbe3o6ZSxkcmF3OnQ9Pnt0aGlzLmRy"
+    "YXcodCl9fV19Z2V0TWF0Y2hpbmdWaXNpYmxlTWV0YXModCl7Y29uc3QgZT10aGlzLmNoYXJ0LmdldFNvcnRlZFZpc2libGVEYXRh"
+    "c2V0TWV0YXMoKSxpPXRoaXMuYXhpcysiQXhpc0lEIixzPVtdO2xldCBhLG47Zm9yKGE9MCxuPWUubGVuZ3RoO2E8bjsrK2Epe2Nv"
+    "bnN0IG49ZVthXTtuW2ldIT09dGhpcy5pZHx8dCYmbi50eXBlIT09dHx8cy5wdXNoKG4pfXJldHVybiBzfV9yZXNvbHZlVGlja0Zv"
+    "bnRPcHRpb25zKHQpe3JldHVybiB6KHRoaXMub3B0aW9ucy50aWNrcy5zZXRDb250ZXh0KHRoaXMuZ2V0Q29udGV4dCh0KSkuZm9u"
+    "dCl9X21heERpZ2l0cygpe3ZhciB0PXRoaXMuX3Jlc29sdmVUaWNrRm9udE9wdGlvbnMoMCkubGluZUhlaWdodDtyZXR1cm4odGhp"
+    "cy5pc0hvcml6b250YWwoKT90aGlzLndpZHRoOnRoaXMuaGVpZ2h0KS90fX1jbGFzcyBGc3tjb25zdHJ1Y3Rvcih0LGUsaSl7dGhp"
+    "cy50eXBlPXQsdGhpcy5zY29wZT1lLHRoaXMub3ZlcnJpZGU9aSx0aGlzLml0ZW1zPU9iamVjdC5jcmVhdGUobnVsbCl9aXNGb3JU"
+    "eXBlKHQpe3JldHVybiBPYmplY3QucHJvdG90eXBlLmlzUHJvdG90eXBlT2YuY2FsbCh0aGlzLnR5cGUucHJvdG90eXBlLHQucHJv"
+    "dG90eXBlKX1yZWdpc3Rlcih0KXt2YXIgZSxpLHIsbCxzPU9iamVjdC5nZXRQcm90b3R5cGVPZih0KTtsZXQgYTsiaWQiaW4oZT1z"
+    "KSYmImRlZmF1bHRzImluIGUmJihhPXRoaXMucmVnaXN0ZXIocykpO2NvbnN0IG49dGhpcy5pdGVtcyxvPXQuaWQsaD10aGlzLnNj"
+    "b3BlKyIuIitvO2lmKG8pcmV0dXJuIG8gaW4gbnx8KG5bb109dCxlPXQscz1oLGk9YSxpPVkoT2JqZWN0LmNyZWF0ZShudWxsKSxb"
+    "aT9SLmdldChpKTp7fSxSLmdldChzKSxlLmRlZmF1bHRzXSksUi5zZXQocyxpKSxlLmRlZmF1bHRSb3V0ZXMmJihyPXMsbD1lLmRl"
+    "ZmF1bHRSb3V0ZXMsT2JqZWN0LmtleXMobCkuZm9yRWFjaCh0PT57Y29uc3QgZT10LnNwbGl0KCIuIiksaT1lLnBvcCgpLHM9W3Jd"
+    "LmNvbmNhdChlKS5qb2luKCIuIiksYT1sW3RdLnNwbGl0KCIuIiksbj1hLnBvcCgpLG89YS5qb2luKCIuIik7Ui5yb3V0ZShzLGks"
+    "byxuKX0pKSxlLmRlc2NyaXB0b3JzJiZSLmRlc2NyaWJlKHMsZS5kZXNjcmlwdG9ycyksdGhpcy5vdmVycmlkZSYmUi5vdmVycmlk"
+    "ZSh0LmlkLHQub3ZlcnJpZGVzKSksaDt0aHJvdyBuZXcgRXJyb3IoImNsYXNzIGRvZXMgbm90IGhhdmUgaWQ6ICIrdCl9Z2V0KHQp"
+    "e3JldHVybiB0aGlzLml0ZW1zW3RdfXVucmVnaXN0ZXIodCl7Y29uc3QgZT10aGlzLml0ZW1zLGk9dC5pZCxzPXRoaXMuc2NvcGU7"
+    "aSBpbiBlJiZkZWxldGUgZVtpXSxzJiZpIGluIFJbc10mJihkZWxldGUgUltzXVtpXSx0aGlzLm92ZXJyaWRlJiZkZWxldGUgZmVb"
+    "aV0pfX12YXIgYj1uZXcgY2xhc3N7Y29uc3RydWN0b3IoKXt0aGlzLmNvbnRyb2xsZXJzPW5ldyBGcyhPcywiZGF0YXNldHMiLCEw"
+    "KSx0aGlzLmVsZW1lbnRzPW5ldyBGcyhlLCJlbGVtZW50cyIpLHRoaXMucGx1Z2lucz1uZXcgRnMoT2JqZWN0LCJwbHVnaW5zIiks"
+    "dGhpcy5zY2FsZXM9bmV3IEZzKHpzLCJzY2FsZXMiKSx0aGlzLl90eXBlZFJlZ2lzdHJpZXM9W3RoaXMuY29udHJvbGxlcnMsdGhp"
+    "cy5zY2FsZXMsdGhpcy5lbGVtZW50c119YWRkKC4uLnQpe3RoaXMuX2VhY2goInJlZ2lzdGVyIix0KX1yZW1vdmUoLi4udCl7dGhp"
+    "cy5fZWFjaCgidW5yZWdpc3RlciIsdCl9YWRkQ29udHJvbGxlcnMoLi4udCl7dGhpcy5fZWFjaCgicmVnaXN0ZXIiLHQsdGhpcy5j"
+    "b250cm9sbGVycyl9YWRkRWxlbWVudHMoLi4udCl7dGhpcy5fZWFjaCgicmVnaXN0ZXIiLHQsdGhpcy5lbGVtZW50cyl9YWRkUGx1"
+    "Z2lucyguLi50KXt0aGlzLl9lYWNoKCJyZWdpc3RlciIsdCx0aGlzLnBsdWdpbnMpfWFkZFNjYWxlcyguLi50KXt0aGlzLl9lYWNo"
+    "KCJyZWdpc3RlciIsdCx0aGlzLnNjYWxlcyl9Z2V0Q29udHJvbGxlcih0KXtyZXR1cm4gdGhpcy5fZ2V0KHQsdGhpcy5jb250cm9s"
+    "bGVycywiY29udHJvbGxlciIpfWdldEVsZW1lbnQodCl7cmV0dXJuIHRoaXMuX2dldCh0LHRoaXMuZWxlbWVudHMsImVsZW1lbnQi"
+    "KX1nZXRQbHVnaW4odCl7cmV0dXJuIHRoaXMuX2dldCh0LHRoaXMucGx1Z2lucywicGx1Z2luIil9Z2V0U2NhbGUodCl7cmV0dXJu"
+    "IHRoaXMuX2dldCh0LHRoaXMuc2NhbGVzLCJzY2FsZSIpfXJlbW92ZUNvbnRyb2xsZXJzKC4uLnQpe3RoaXMuX2VhY2goInVucmVn"
+    "aXN0ZXIiLHQsdGhpcy5jb250cm9sbGVycyl9cmVtb3ZlRWxlbWVudHMoLi4udCl7dGhpcy5fZWFjaCgidW5yZWdpc3RlciIsdCx0"
+    "aGlzLmVsZW1lbnRzKX1yZW1vdmVQbHVnaW5zKC4uLnQpe3RoaXMuX2VhY2goInVucmVnaXN0ZXIiLHQsdGhpcy5wbHVnaW5zKX1y"
+    "ZW1vdmVTY2FsZXMoLi4udCl7dGhpcy5fZWFjaCgidW5yZWdpc3RlciIsdCx0aGlzLnNjYWxlcyl9X2VhY2goaSx0LHMpe1suLi50"
+    "XS5mb3JFYWNoKHQ9Pntjb25zdCBlPXN8fHRoaXMuX2dldFJlZ2lzdHJ5Rm9yVHlwZSh0KTtzfHxlLmlzRm9yVHlwZSh0KXx8ZT09"
+    "PXRoaXMucGx1Z2lucyYmdC5pZD90aGlzLl9leGVjKGksZSx0KTprKHQsdD0+e3ZhciBlPXN8fHRoaXMuX2dldFJlZ2lzdHJ5Rm9y"
+    "VHlwZSh0KTt0aGlzLl9leGVjKGksZSx0KX0pfSl9X2V4ZWModCxlLGkpe3ZhciBzPUsodCk7ZChpWyJiZWZvcmUiK3NdLFtdLGkp"
+    "LGVbdF0oaSksZChpWyJhZnRlciIrc10sW10saSl9X2dldFJlZ2lzdHJ5Rm9yVHlwZShlKXtmb3IobGV0IHQ9MDt0PHRoaXMuX3R5"
+    "cGVkUmVnaXN0cmllcy5sZW5ndGg7dCsrKXtjb25zdCBpPXRoaXMuX3R5cGVkUmVnaXN0cmllc1t0XTtpZihpLmlzRm9yVHlwZShl"
+    "KSlyZXR1cm4gaX1yZXR1cm4gdGhpcy5wbHVnaW5zfV9nZXQodCxlLGkpe2U9ZS5nZXQodCk7aWYodm9pZCAwPT09ZSl0aHJvdyBu"
+    "ZXcgRXJyb3IoJyInK3QrJyIgaXMgbm90IGEgcmVnaXN0ZXJlZCAnK2krIi4iKTtyZXR1cm4gZX19O2NsYXNzIFZze2NvbnN0cnVj"
+    "dG9yKCl7dGhpcy5faW5pdD1bXX1ub3RpZnkodCxlLGkscyl7ImJlZm9yZUluaXQiPT09ZSYmKHRoaXMuX2luaXQ9dGhpcy5fY3Jl"
+    "YXRlRGVzY3JpcHRvcnModCwhMCksdGhpcy5fbm90aWZ5KHRoaXMuX2luaXQsdCwiaW5zdGFsbCIpKTtzPXM/dGhpcy5fZGVzY3Jp"
+    "cHRvcnModCkuZmlsdGVyKHMpOnRoaXMuX2Rlc2NyaXB0b3JzKHQpLGk9dGhpcy5fbm90aWZ5KHMsdCxlLGkpO3JldHVybiJhZnRl"
+    "ckRlc3Ryb3kiPT09ZSYmKHRoaXMuX25vdGlmeShzLHQsInN0b3AiKSx0aGlzLl9ub3RpZnkodGhpcy5faW5pdCx0LCJ1bmluc3Rh"
+    "bGwiKSksaX1fbm90aWZ5KHQsZSxpLHMpe3M9c3x8e307Zm9yKGNvbnN0IGEgb2YgdCl7Y29uc3QgdD1hLnBsdWdpbjtpZighMT09"
+    "PWQodFtpXSxbZSxzLGEub3B0aW9uc10sdCkmJnMuY2FuY2VsYWJsZSlyZXR1cm4hMX1yZXR1cm4hMH1pbnZhbGlkYXRlKCl7UCh0"
+    "aGlzLl9jYWNoZSl8fCh0aGlzLl9vbGRDYWNoZT10aGlzLl9jYWNoZSx0aGlzLl9jYWNoZT12b2lkIDApfV9kZXNjcmlwdG9ycyh0"
+    "KXtpZih0aGlzLl9jYWNoZSlyZXR1cm4gdGhpcy5fY2FjaGU7dmFyIGU9dGhpcy5fY2FjaGU9dGhpcy5fY3JlYXRlRGVzY3JpcHRv"
+    "cnModCk7cmV0dXJuIHRoaXMuX25vdGlmeVN0YXRlQ2hhbmdlcyh0KSxlfV9jcmVhdGVEZXNjcmlwdG9ycyh0LGUpe3ZhciBpLHM9"
+    "dCYmdC5jb25maWcsYT1UKHMub3B0aW9ucyYmcy5vcHRpb25zLnBsdWdpbnMse30pLHM9ZnVuY3Rpb24odCl7Y29uc3QgZT17fSxp"
+    "PVtdLHM9T2JqZWN0LmtleXMoYi5wbHVnaW5zLml0ZW1zKTtmb3IobGV0IHQ9MDt0PHMubGVuZ3RoO3QrKylpLnB1c2goYi5nZXRQ"
+    "bHVnaW4oc1t0XSkpO3ZhciBhPXQucGx1Z2luc3x8W107Zm9yKGxldCB0PTA7dDxhLmxlbmd0aDt0Kyspe2NvbnN0IHM9YVt0XTst"
+    "MT09PWkuaW5kZXhPZihzKSYmKGkucHVzaChzKSxlW3MuaWRdPSEwKX1yZXR1cm57cGx1Z2luczppLGxvY2FsSWRzOmV9fShzKTtp"
+    "ZighMSE9PWF8fGUpe3ZhcltuLHtwbHVnaW5zOm8sbG9jYWxJZHM6cn0sbCxoXT1bdCxzLGEsZV07Y29uc3QgYz1bXSxkPW4uZ2V0"
+    "Q29udGV4dCgpO2Zvcihjb25zdCB1IG9mIG8pe2NvbnN0IG89dS5pZCxnPShpPWxbb10saHx8ITEhPT1pPyEwPT09aT97fTppOm51"
+    "bGwpO251bGwhPT1nJiZjLnB1c2goe3BsdWdpbjp1LG9wdGlvbnM6ZnVuY3Rpb24odCx7cGx1Z2luOmUsbG9jYWw6aX0scyxhKXtj"
+    "b25zdCBuPXQucGx1Z2luU2NvcGVLZXlzKGUpLG89dC5nZXRPcHRpb25TY29wZXMocyxuKTtyZXR1cm4gaSYmZS5kZWZhdWx0cyYm"
+    "by5wdXNoKGUuZGVmYXVsdHMpLHQuY3JlYXRlUmVzb2x2ZXIobyxhLFsiIl0se3NjcmlwdGFibGU6ITEsaW5kZXhhYmxlOiExLGFs"
+    "bEtleXM6ITB9KX0obi5jb25maWcse3BsdWdpbjp1LGxvY2FsOnJbb119LGcsZCl9KX1yZXR1cm4gY31yZXR1cm5bXX1fbm90aWZ5"
+    "U3RhdGVDaGFuZ2VzKHQpe3ZhciBlPXRoaXMuX29sZENhY2hlfHxbXSxpPXRoaXMuX2NhY2hlLHM9KHQsaSk9PnQuZmlsdGVyKGU9"
+    "PiFpLnNvbWUodD0+ZS5wbHVnaW4uaWQ9PT10LnBsdWdpbi5pZCkpO3RoaXMuX25vdGlmeShzKGUsaSksdCwic3RvcCIpLHRoaXMu"
+    "X25vdGlmeShzKGksZSksdCwic3RhcnQiKX19ZnVuY3Rpb24gQnModCxlKXt2YXIgaT1SLmRhdGFzZXRzW3RdfHx7fTtyZXR1cm4o"
+    "KGUuZGF0YXNldHN8fHt9KVt0XXx8e30pLmluZGV4QXhpc3x8ZS5pbmRleEF4aXN8fGkuaW5kZXhBeGlzfHwieCJ9ZnVuY3Rpb24g"
+    "V3ModCl7aWYoIngiPT09dHx8InkiPT09dHx8InIiPT09dClyZXR1cm4gdH1mdW5jdGlvbiBOcyh0LC4uLmUpe2lmKFdzKHQpKXJl"
+    "dHVybiB0O2Zvcihjb25zdCBzIG9mIGUpe2NvbnN0IGU9cy5heGlzfHwoInRvcCI9PT0oaT1zLnBvc2l0aW9uKXx8ImJvdHRvbSI9"
+    "PT1pPyJ4IjoibGVmdCI9PT1pfHwicmlnaHQiPT09aT8ieSI6dm9pZCAwKXx8MTx0Lmxlbmd0aCYmV3ModFswXS50b0xvd2VyQ2Fz"
+    "ZSgpKTtpZihlKXJldHVybiBlfXZhciBpO3Rocm93IG5ldyBFcnJvcihgQ2Fubm90IGRldGVybWluZSB0eXBlIG9mICcke3R9JyBh"
+    "eGlzLiBQbGVhc2UgcHJvdmlkZSAnYXhpcycgb3IgJ3Bvc2l0aW9uJyBvcHRpb24uYCl9ZnVuY3Rpb24gSHModCxlLGkpe2lmKGlb"
+    "ZSsiQXhpc0lEIl09PT10KXJldHVybntheGlzOmV9fWZ1bmN0aW9uIGpzKHQpe2NvbnN0IGU9dC5vcHRpb25zfHwodC5vcHRpb25z"
+    "PXt9KTtlLnBsdWdpbnM9VChlLnBsdWdpbnMse30pLGUuc2NhbGVzPWZ1bmN0aW9uKG8sZSl7Y29uc3Qgbj1mZVtvLnR5cGVdfHx7"
+    "c2NhbGVzOnt9fSxyPWUuc2NhbGVzfHx7fSxsPUJzKG8udHlwZSxlKSxoPU9iamVjdC5jcmVhdGUobnVsbCk7cmV0dXJuIE9iamVj"
+    "dC5rZXlzKHIpLmZvckVhY2godD0+e3ZhciBlPXJbdF07aWYoIUEoZSkpcmV0dXJuIGNvbnNvbGUuZXJyb3IoIkludmFsaWQgc2Nh"
+    "bGUgY29uZmlndXJhdGlvbiBmb3Igc2NhbGU6ICIrdCk7aWYoZS5fcHJveHkpcmV0dXJuIGNvbnNvbGUud2FybigiSWdub3Jpbmcg"
+    "cmVzb2x2ZXIgcGFzc2VkIGFzIG9wdGlvbnMgZm9yIHNjYWxlOiAiK3QpO2NvbnN0IGk9TnModCxlLGZ1bmN0aW9uKGUsdCl7aWYo"
+    "dC5kYXRhJiZ0LmRhdGEuZGF0YXNldHMpe3Q9dC5kYXRhLmRhdGFzZXRzLmZpbHRlcih0PT50LnhBeGlzSUQ9PT1lfHx0LnlBeGlz"
+    "SUQ9PT1lKTtpZih0Lmxlbmd0aClyZXR1cm4gSHMoZSwieCIsdFswXSl8fEhzKGUsInkiLHRbMF0pfXJldHVybnt9fSh0LG8pLFIu"
+    "c2NhbGVzW2UudHlwZV0pLHM9aT09PWw/Il9pbmRleF8iOiJfdmFsdWVfIixhPW4uc2NhbGVzfHx7fTtoW3RdPSQoT2JqZWN0LmNy"
+    "ZWF0ZShudWxsKSxbe2F4aXM6aX0sZSxhW2ldLGFbc11dKX0pLG8uZGF0YS5kYXRhc2V0cy5mb3JFYWNoKHM9Pntjb25zdCB0PXMu"
+    "dHlwZXx8by50eXBlLGE9cy5pbmRleEF4aXN8fEJzKHQsZSksbj0oZmVbdF18fHt9KS5zY2FsZXN8fHt9O09iamVjdC5rZXlzKG4p"
+    "LmZvckVhY2godD0+e3ZhciBlPWZ1bmN0aW9uKHQsZSl7bGV0IGk9dDtyZXR1cm4iX2luZGV4XyI9PT10P2k9ZToiX3ZhbHVlXyI9"
+    "PT10JiYoaT0ieCI9PT1lPyJ5IjoieCIpLGl9KHQsYSksaT1zW2UrIkF4aXNJRCJdfHxlO2hbaV09aFtpXXx8T2JqZWN0LmNyZWF0"
+    "ZShudWxsKSwkKGhbaV0sW3theGlzOmV9LHJbaV0sblt0XV0pfSl9KSxPYmplY3Qua2V5cyhoKS5mb3JFYWNoKHQ9Pnt0PWhbdF07"
+    "JCh0LFtSLnNjYWxlc1t0LnR5cGVdLFIuc2NhbGVdKX0pLGh9KHQsZSl9ZnVuY3Rpb24gWXModCl7cmV0dXJuKHQ9dHx8e30pLmRh"
+    "dGFzZXRzPXQuZGF0YXNldHN8fFtdLHQubGFiZWxzPXQubGFiZWxzfHxbXSx0fWNvbnN0ICRzPW5ldyBNYXAsVXM9bmV3IFNldDtm"
+    "dW5jdGlvbiBYcyh0LGUpe2xldCBpPSRzLmdldCh0KTtyZXR1cm4gaXx8KGk9ZSgpLCRzLnNldCh0LGkpLFVzLmFkZChpKSksaX1j"
+    "b25zdCBxcz0odCxlLGkpPT57ZT1tKGUsaSk7dm9pZCAwIT09ZSYmdC5hZGQoZSl9O2NsYXNzIEtze2NvbnN0cnVjdG9yKHQpe3Ro"
+    "aXMuX2NvbmZpZz0oKHQ9KHQ9dCl8fHt9KS5kYXRhPVlzKHQuZGF0YSksanModCksdCksdGhpcy5fc2NvcGVDYWNoZT1uZXcgTWFw"
+    "LHRoaXMuX3Jlc29sdmVyQ2FjaGU9bmV3IE1hcH1nZXQgcGxhdGZvcm0oKXtyZXR1cm4gdGhpcy5fY29uZmlnLnBsYXRmb3JtfWdl"
+    "dCB0eXBlKCl7cmV0dXJuIHRoaXMuX2NvbmZpZy50eXBlfXNldCB0eXBlKHQpe3RoaXMuX2NvbmZpZy50eXBlPXR9Z2V0IGRhdGEo"
+    "KXtyZXR1cm4gdGhpcy5fY29uZmlnLmRhdGF9c2V0IGRhdGEodCl7dGhpcy5fY29uZmlnLmRhdGE9WXModCl9Z2V0IG9wdGlvbnMo"
+    "KXtyZXR1cm4gdGhpcy5fY29uZmlnLm9wdGlvbnN9c2V0IG9wdGlvbnModCl7dGhpcy5fY29uZmlnLm9wdGlvbnM9dH1nZXQgcGx1"
+    "Z2lucygpe3JldHVybiB0aGlzLl9jb25maWcucGx1Z2luc311cGRhdGUoKXt2YXIgdD10aGlzLl9jb25maWc7dGhpcy5jbGVhckNh"
+    "Y2hlKCksanModCl9Y2xlYXJDYWNoZSgpe3RoaXMuX3Njb3BlQ2FjaGUuY2xlYXIoKSx0aGlzLl9yZXNvbHZlckNhY2hlLmNsZWFy"
+    "KCl9ZGF0YXNldFNjb3BlS2V5cyh0KXtyZXR1cm4gWHModCwoKT0+W1siZGF0YXNldHMuIit0LCIiXV0pfWRhdGFzZXRBbmltYXRp"
+    "b25TY29wZUtleXModCxlKXtyZXR1cm4gWHModCsiLnRyYW5zaXRpb24uIitlLCgpPT5bW2BkYXRhc2V0cy4ke3R9LnRyYW5zaXRp"
+    "b25zLmArZSwidHJhbnNpdGlvbnMuIitlXSxbImRhdGFzZXRzLiIrdCwiIl1dKX1kYXRhc2V0RWxlbWVudFNjb3BlS2V5cyh0LGUp"
+    "e3JldHVybiBYcyh0KyItIitlLCgpPT5bW2BkYXRhc2V0cy4ke3R9LmVsZW1lbnRzLmArZSwiZGF0YXNldHMuIit0LCJlbGVtZW50"
+    "cy4iK2UsIiJdXSl9cGx1Z2luU2NvcGVLZXlzKHQpe2NvbnN0IGU9dC5pZDtyZXR1cm4gWHModGhpcy50eXBlKyItcGx1Z2luLSIr"
+    "ZSwoKT0+W1sicGx1Z2lucy4iK2UsLi4udC5hZGRpdGlvbmFsT3B0aW9uU2NvcGVzfHxbXV1dKX1fY2FjaGVkU2NvcGVzKHQsZSl7"
+    "Y29uc3QgaT10aGlzLl9zY29wZUNhY2hlO2xldCBzPWkuZ2V0KHQpO3JldHVybiBzJiYhZXx8KHM9bmV3IE1hcCxpLnNldCh0LHMp"
+    "KSxzfWdldE9wdGlvblNjb3BlcyhlLHQsaSl7Y29uc3R7b3B0aW9uczpzLHR5cGU6YX09dGhpcyxuPXRoaXMuX2NhY2hlZFNjb3Bl"
+    "cyhlLGkpLG89bi5nZXQodCk7aWYobylyZXR1cm4gbztjb25zdCByPW5ldyBTZXQsbD0odC5mb3JFYWNoKHQ9PntlJiYoci5hZGQo"
+    "ZSksdC5mb3JFYWNoKHQ9PnFzKHIsZSx0KSkpLHQuZm9yRWFjaCh0PT5xcyhyLHMsdCkpLHQuZm9yRWFjaCh0PT5xcyhyLGZlW2Fd"
+    "fHx7fSx0KSksdC5mb3JFYWNoKHQ9PnFzKHIsUix0KSksdC5mb3JFYWNoKHQ9PnFzKHIscGUsdCkpfSksQXJyYXkuZnJvbShyKSk7"
+    "cmV0dXJuIDA9PT1sLmxlbmd0aCYmbC5wdXNoKE9iamVjdC5jcmVhdGUobnVsbCkpLFVzLmhhcyh0KSYmbi5zZXQodCxsKSxsfWNo"
+    "YXJ0T3B0aW9uU2NvcGVzKCl7dmFye29wdGlvbnM6dCx0eXBlOmV9PXRoaXM7cmV0dXJuW3QsZmVbZV18fHt9LFIuZGF0YXNldHNb"
+    "ZV18fHt9LHt0eXBlOmV9LFIscGVdfXJlc29sdmVOYW1lZE9wdGlvbnModCxlLGkscz1bIiJdKXtjb25zdCBhPXskc2hhcmVkOiEw"
+    "fSx7cmVzb2x2ZXI6bixzdWJQcmVmaXhlczpvfT1Hcyh0aGlzLl9yZXNvbHZlckNhY2hlLHQscyk7bGV0IHI9bjshZnVuY3Rpb24o"
+    "dCxlKXtjb25zdHtpc1NjcmlwdGFibGU6aSxpc0luZGV4YWJsZTpzfT1VZSh0KTtmb3IoY29uc3QgYSBvZiBlKXtjb25zdCBlPWko"
+    "YSksbj1zKGEpLG89KG58fGUpJiZ0W2FdO2lmKGUmJih1KG8pfHxacyhvKSl8fG4mJk8obykpcmV0dXJuIDF9fShuLGUpfHwoYS4k"
+    "c2hhcmVkPSExLHI9JGUobixpPXUoaSk/aSgpOmksdGhpcy5jcmVhdGVSZXNvbHZlcih0LGksbykpKTtmb3IoY29uc3QgdCBvZiBl"
+    "KWFbdF09clt0XTtyZXR1cm4gYX1jcmVhdGVSZXNvbHZlcih0LGUsaT1bIiJdLHMpe3Q9R3ModGhpcy5fcmVzb2x2ZXJDYWNoZSx0"
+    "LGkpLnJlc29sdmVyO3JldHVybiBBKGUpPyRlKHQsZSx2b2lkIDAscyk6dH19ZnVuY3Rpb24gR3ModCxlLGkpe2xldCBzPXQuZ2V0"
+    "KGUpO3N8fChzPW5ldyBNYXAsdC5zZXQoZSxzKSk7dD1pLmpvaW4oKTtsZXQgYT1zLmdldCh0KTtyZXR1cm4gYXx8KGE9e3Jlc29s"
+    "dmVyOlllKGUsaSksc3ViUHJlZml4ZXM6aS5maWx0ZXIodD0+IXQudG9Mb3dlckNhc2UoKS5pbmNsdWRlcygiaG92ZXIiKSl9LHMu"
+    "c2V0KHQsYSkpLGF9Y29uc3QgWnM9ZT0+QShlKSYmT2JqZWN0LmdldE93blByb3BlcnR5TmFtZXMoZSkuc29tZSh0PT51KGVbdF0p"
+    "KSxKcz1bInRvcCIsImJvdHRvbSIsImxlZnQiLCJyaWdodCIsImNoYXJ0QXJlYSJdO2Z1bmN0aW9uIFFzKHQsZSl7cmV0dXJuInRv"
+    "cCI9PT10fHwiYm90dG9tIj09PXR8fC0xPT09SnMuaW5kZXhPZih0KSYmIngiPT09ZX1mdW5jdGlvbiB0YShpLHMpe3JldHVybiBm"
+    "dW5jdGlvbih0LGUpe3JldHVybiB0W2ldPT09ZVtpXT90W3NdLWVbc106dFtpXS1lW2ldfX1mdW5jdGlvbiBlYSh0KXtjb25zdCBl"
+    "PXQuY2hhcnQsaT1lLm9wdGlvbnMuYW5pbWF0aW9uO2Uubm90aWZ5UGx1Z2lucygiYWZ0ZXJSZW5kZXIiKSxkKGkmJmkub25Db21w"
+    "bGV0ZSxbdF0sZSl9ZnVuY3Rpb24gaWEodCl7dmFyIGU9dC5jaGFydCxpPWUub3B0aW9ucy5hbmltYXRpb247ZChpJiZpLm9uUHJv"
+    "Z3Jlc3MsW3RdLGUpfWZ1bmN0aW9uIHNhKHQpe3JldHVybiB4ZSgpJiYic3RyaW5nIj09dHlwZW9mIHQ/dD1kb2N1bWVudC5nZXRF"
+    "bGVtZW50QnlJZCh0KTp0JiZ0Lmxlbmd0aCYmKHQ9dFswXSksdD10JiZ0LmNhbnZhcz90LmNhbnZhczp0fWNvbnN0IGFhPXt9LG5h"
+    "PXQ9Pntjb25zdCBlPXNhKHQpO3JldHVybiBPYmplY3QudmFsdWVzKGFhKS5maWx0ZXIodD0+dC5jYW52YXM9PT1lKS5wb3AoKX07"
+    "ZnVuY3Rpb24gb2EodCxlLGkpe3JldHVybih0Lm9wdGlvbnMuY2xpcD90OmUpW2ldfWNsYXNzIGl7c3RhdGljIGRlZmF1bHRzPVI7"
+    "c3RhdGljIGluc3RhbmNlcz1hYTtzdGF0aWMgb3ZlcnJpZGVzPWZlO3N0YXRpYyByZWdpc3RyeT1iO3N0YXRpYyB2ZXJzaW9uPSI0"
+    "LjQuMSI7c3RhdGljIGdldENoYXJ0PW5hO3N0YXRpYyByZWdpc3RlciguLi50KXtiLmFkZCguLi50KSxyYSgpfXN0YXRpYyB1bnJl"
+    "Z2lzdGVyKC4uLnQpe2IucmVtb3ZlKC4uLnQpLHJhKCl9Y29uc3RydWN0b3IodCxlKXtjb25zdCBpPXRoaXMuY29uZmlnPW5ldyBL"
+    "cyhlKSxzPXNhKHQpLGE9bmEocyk7aWYoYSl0aHJvdyBuZXcgRXJyb3IoIkNhbnZhcyBpcyBhbHJlYWR5IGluIHVzZS4gQ2hhcnQg"
+    "d2l0aCBJRCAnIithLmlkKyInIG11c3QgYmUgZGVzdHJveWVkIGJlZm9yZSB0aGUgY2FudmFzIHdpdGggSUQgJyIrYS5jYW52YXMu"
+    "aWQrIicgY2FuIGJlIHJldXNlZC4iKTt2YXIgZT1pLmNyZWF0ZVJlc29sdmVyKGkuY2hhcnRPcHRpb25TY29wZXMoKSx0aGlzLmdl"
+    "dENvbnRleHQoKSksdD0odGhpcy5wbGF0Zm9ybT1uZXcoaS5wbGF0Zm9ybXx8ZnMocykpLHRoaXMucGxhdGZvcm0udXBkYXRlQ29u"
+    "ZmlnKGkpLHRoaXMucGxhdGZvcm0uYWNxdWlyZUNvbnRleHQocyxlLmFzcGVjdFJhdGlvKSksbj10JiZ0LmNhbnZhcyxvPW4mJm4u"
+    "aGVpZ2h0LHI9biYmbi53aWR0aDt0aGlzLmlkPUYoKSx0aGlzLmN0eD10LHRoaXMuY2FudmFzPW4sdGhpcy53aWR0aD1yLHRoaXMu"
+    "aGVpZ2h0PW8sdGhpcy5fb3B0aW9ucz1lLHRoaXMuX2FzcGVjdFJhdGlvPXRoaXMuYXNwZWN0UmF0aW8sdGhpcy5fbGF5ZXJzPVtd"
+    "LHRoaXMuX21ldGFzZXRzPVtdLHRoaXMuX3N0YWNrcz12b2lkIDAsdGhpcy5ib3hlcz1bXSx0aGlzLmN1cnJlbnREZXZpY2VQaXhl"
+    "bFJhdGlvPXZvaWQgMCx0aGlzLmNoYXJ0QXJlYT12b2lkIDAsdGhpcy5fYWN0aXZlPVtdLHRoaXMuX2xhc3RFdmVudD12b2lkIDAs"
+    "dGhpcy5fbGlzdGVuZXJzPXt9LHRoaXMuX3Jlc3BvbnNpdmVMaXN0ZW5lcnM9dm9pZCAwLHRoaXMuX3NvcnRlZE1ldGFzZXRzPVtd"
+    "LHRoaXMuc2NhbGVzPXt9LHRoaXMuX3BsdWdpbnM9bmV3IFZzLHRoaXMuJHByb3hpZXM9e30sdGhpcy5faGlkZGVuSW5kaWNlcz17"
+    "fSx0aGlzLmF0dGFjaGVkPSExLHRoaXMuX2FuaW1hdGlvbnNEaXNhYmxlZD12b2lkIDAsdGhpcy4kY29udGV4dD12b2lkIDAsdGhp"
+    "cy5fZG9SZXNpemU9UHQodD0+dGhpcy51cGRhdGUodCksZS5yZXNpemVEZWxheXx8MCksdGhpcy5fZGF0YUNoYW5nZXM9W10sYWFb"
+    "dGhpcy5pZF09dGhpcyx0JiZuPyhsLmxpc3Rlbih0aGlzLCJjb21wbGV0ZSIsZWEpLGwubGlzdGVuKHRoaXMsInByb2dyZXNzIixp"
+    "YSksdGhpcy5faW5pdGlhbGl6ZSgpLHRoaXMuYXR0YWNoZWQmJnRoaXMudXBkYXRlKCkpOmNvbnNvbGUuZXJyb3IoIkZhaWxlZCB0"
+    "byBjcmVhdGUgY2hhcnQ6IGNhbid0IGFjcXVpcmUgY29udGV4dCBmcm9tIHRoZSBnaXZlbiBpdGVtIil9Z2V0IGFzcGVjdFJhdGlv"
+    "KCl7dmFye29wdGlvbnM6e2FzcGVjdFJhdGlvOnQsbWFpbnRhaW5Bc3BlY3RSYXRpbzplfSx3aWR0aDppLGhlaWdodDpzLF9hc3Bl"
+    "Y3RSYXRpbzphfT10aGlzO3JldHVybiBQKHQpP2UmJmE/YTpzP2kvczpudWxsOnR9Z2V0IGRhdGEoKXtyZXR1cm4gdGhpcy5jb25m"
+    "aWcuZGF0YX1zZXQgZGF0YSh0KXt0aGlzLmNvbmZpZy5kYXRhPXR9Z2V0IG9wdGlvbnMoKXtyZXR1cm4gdGhpcy5fb3B0aW9uc31z"
+    "ZXQgb3B0aW9ucyh0KXt0aGlzLmNvbmZpZy5vcHRpb25zPXR9Z2V0IHJlZ2lzdHJ5KCl7cmV0dXJuIGJ9X2luaXRpYWxpemUoKXty"
+    "ZXR1cm4gdGhpcy5ub3RpZnlQbHVnaW5zKCJiZWZvcmVJbml0IiksdGhpcy5vcHRpb25zLnJlc3BvbnNpdmU/dGhpcy5yZXNpemUo"
+    "KTpDZSh0aGlzLHRoaXMub3B0aW9ucy5kZXZpY2VQaXhlbFJhdGlvKSx0aGlzLmJpbmRFdmVudHMoKSx0aGlzLm5vdGlmeVBsdWdp"
+    "bnMoImFmdGVySW5pdCIpLHRoaXN9Y2xlYXIoKXtyZXR1cm4gSWUodGhpcy5jYW52YXMsdGhpcy5jdHgpLHRoaXN9c3RvcCgpe3Jl"
+    "dHVybiBsLnN0b3AodGhpcyksdGhpc31yZXNpemUodCxlKXtsLnJ1bm5pbmcodGhpcyk/dGhpcy5fcmVzaXplQmVmb3JlRHJhdz17"
+    "d2lkdGg6dCxoZWlnaHQ6ZX06dGhpcy5fcmVzaXplKHQsZSl9X3Jlc2l6ZSh0LGUpe3ZhciBpPXRoaXMub3B0aW9ucyxzPXRoaXMu"
+    "Y2FudmFzLGE9aS5tYWludGFpbkFzcGVjdFJhdGlvJiZ0aGlzLmFzcGVjdFJhdGlvLHM9dGhpcy5wbGF0Zm9ybS5nZXRNYXhpbXVt"
+    "U2l6ZShzLHQsZSxhKSx0PWkuZGV2aWNlUGl4ZWxSYXRpb3x8dGhpcy5wbGF0Zm9ybS5nZXREZXZpY2VQaXhlbFJhdGlvKCksZT10"
+    "aGlzLndpZHRoPyJyZXNpemUiOiJhdHRhY2giO3RoaXMud2lkdGg9cy53aWR0aCx0aGlzLmhlaWdodD1zLmhlaWdodCx0aGlzLl9h"
+    "c3BlY3RSYXRpbz10aGlzLmFzcGVjdFJhdGlvLENlKHRoaXMsdCwhMCkmJih0aGlzLm5vdGlmeVBsdWdpbnMoInJlc2l6ZSIse3Np"
+    "emU6c30pLGQoaS5vblJlc2l6ZSxbdGhpcyxzXSx0aGlzKSx0aGlzLmF0dGFjaGVkJiZ0aGlzLl9kb1Jlc2l6ZShlKSYmdGhpcy5y"
+    "ZW5kZXIoKSl9ZW5zdXJlU2NhbGVzSGF2ZUlEcygpe2sodGhpcy5vcHRpb25zLnNjYWxlc3x8e30sKHQsZSk9Pnt0LmlkPWV9KX1i"
+    "dWlsZE9yVXBkYXRlU2NhbGVzKCl7Y29uc3Qgbz10aGlzLm9wdGlvbnMscz1vLnNjYWxlcyxyPXRoaXMuc2NhbGVzLGw9T2JqZWN0"
+    "LmtleXMocikucmVkdWNlKCh0LGUpPT4odFtlXT0hMSx0KSx7fSk7bGV0IHQ9W107ayh0PXM/dC5jb25jYXQoT2JqZWN0LmtleXMo"
+    "cykubWFwKHQ9Pnt2YXIgZT1zW3RdLHQ9TnModCxlKSxpPSJyIj09PXQsdD0ieCI9PT10O3JldHVybntvcHRpb25zOmUsZHBvc2l0"
+    "aW9uOmk/ImNoYXJ0QXJlYSI6dD8iYm90dG9tIjoibGVmdCIsZHR5cGU6aT8icmFkaWFsTGluZWFyIjp0PyJjYXRlZ29yeSI6Imxp"
+    "bmVhciJ9fSkpOnQsdD0+e2NvbnN0IGU9dC5vcHRpb25zLGk9ZS5pZCxzPU5zKGksZSksYT1UKGUudHlwZSx0LmR0eXBlKTt2b2lk"
+    "IDAhPT1lLnBvc2l0aW9uJiZRcyhlLnBvc2l0aW9uLHMpPT09UXModC5kcG9zaXRpb24pfHwoZS5wb3NpdGlvbj10LmRwb3NpdGlv"
+    "biksbFtpXT0hMDtsZXQgbj1udWxsO2kgaW4gciYmcltpXS50eXBlPT09YT9uPXJbaV06KG49bmV3KGIuZ2V0U2NhbGUoYSkpKHtp"
+    "ZDppLHR5cGU6YSxjdHg6dGhpcy5jdHgsY2hhcnQ6dGhpc30pLHJbbi5pZF09biksbi5pbml0KGUsbyl9KSxrKGwsKHQsZSk9Pnt0"
+    "fHxkZWxldGUgcltlXX0pLGsocix0PT57YS5jb25maWd1cmUodGhpcyx0LHQub3B0aW9ucyksYS5hZGRCb3godGhpcyx0KX0pfV91"
+    "cGRhdGVNZXRhc2V0cygpe2NvbnN0IHQ9dGhpcy5fbWV0YXNldHMsZT10aGlzLmRhdGEuZGF0YXNldHMubGVuZ3RoLGk9dC5sZW5n"
+    "dGg7aWYodC5zb3J0KCh0LGUpPT50LmluZGV4LWUuaW5kZXgpLGU8aSl7Zm9yKGxldCB0PWU7dDxpOysrdCl0aGlzLl9kZXN0cm95"
+    "RGF0YXNldE1ldGEodCk7dC5zcGxpY2UoZSxpLWUpfXRoaXMuX3NvcnRlZE1ldGFzZXRzPXQuc2xpY2UoMCkuc29ydCh0YSgib3Jk"
+    "ZXIiLCJpbmRleCIpKX1fcmVtb3ZlVW5yZWZlcmVuY2VkTWV0YXNldHMoKXtjb25zdHtfbWV0YXNldHM6dCxkYXRhOntkYXRhc2V0"
+    "czppfX09dGhpczt0Lmxlbmd0aD5pLmxlbmd0aCYmZGVsZXRlIHRoaXMuX3N0YWNrcyx0LmZvckVhY2goKGUsdCk9PnswPT09aS5m"
+    "aWx0ZXIodD0+dD09PWUuX2RhdGFzZXQpLmxlbmd0aCYmdGhpcy5fZGVzdHJveURhdGFzZXRNZXRhKHQpfSl9YnVpbGRPclVwZGF0"
+    "ZUNvbnRyb2xsZXJzKCl7Y29uc3QgZT1bXSxpPXRoaXMuZGF0YS5kYXRhc2V0cztsZXQgcyxhO2Zvcih0aGlzLl9yZW1vdmVVbnJl"
+    "ZmVyZW5jZWRNZXRhc2V0cygpLHM9MCxhPWkubGVuZ3RoO3M8YTtzKyspe2NvbnN0IGE9aVtzXTtsZXQgdD10aGlzLmdldERhdGFz"
+    "ZXRNZXRhKHMpO3ZhciBuPWEudHlwZXx8dGhpcy5jb25maWcudHlwZTtpZih0LnR5cGUmJnQudHlwZSE9PW4mJih0aGlzLl9kZXN0"
+    "cm95RGF0YXNldE1ldGEocyksdD10aGlzLmdldERhdGFzZXRNZXRhKHMpKSx0LnR5cGU9bix0LmluZGV4QXhpcz1hLmluZGV4QXhp"
+    "c3x8QnMobix0aGlzLm9wdGlvbnMpLHQub3JkZXI9YS5vcmRlcnx8MCx0LmluZGV4PXMsdC5sYWJlbD0iIithLmxhYmVsLHQudmlz"
+    "aWJsZT10aGlzLmlzRGF0YXNldFZpc2libGUocyksdC5jb250cm9sbGVyKXQuY29udHJvbGxlci51cGRhdGVJbmRleChzKSx0LmNv"
+    "bnRyb2xsZXIubGlua1NjYWxlcygpO2Vsc2V7Y29uc3QgaT1iLmdldENvbnRyb2xsZXIobikse2RhdGFzZXRFbGVtZW50VHlwZTph"
+    "LGRhdGFFbGVtZW50VHlwZTpvfT1SLmRhdGFzZXRzW25dO09iamVjdC5hc3NpZ24oaSx7ZGF0YUVsZW1lbnRUeXBlOmIuZ2V0RWxl"
+    "bWVudChvKSxkYXRhc2V0RWxlbWVudFR5cGU6YSYmYi5nZXRFbGVtZW50KGEpfSksdC5jb250cm9sbGVyPW5ldyBpKHRoaXMscyks"
+    "ZS5wdXNoKHQuY29udHJvbGxlcil9fXJldHVybiB0aGlzLl91cGRhdGVNZXRhc2V0cygpLGV9X3Jlc2V0RWxlbWVudHMoKXtrKHRo"
+    "aXMuZGF0YS5kYXRhc2V0cywodCxlKT0+e3RoaXMuZ2V0RGF0YXNldE1ldGEoZSkuY29udHJvbGxlci5yZXNldCgpfSx0aGlzKX1y"
+    "ZXNldCgpe3RoaXMuX3Jlc2V0RWxlbWVudHMoKSx0aGlzLm5vdGlmeVBsdWdpbnMoInJlc2V0Iil9dXBkYXRlKHQpe2NvbnN0IHM9"
+    "dGhpcy5jb25maWcsYT0ocy51cGRhdGUoKSx0aGlzLl9vcHRpb25zPXMuY3JlYXRlUmVzb2x2ZXIocy5jaGFydE9wdGlvblNjb3Bl"
+    "cygpLHRoaXMuZ2V0Q29udGV4dCgpKSksbj10aGlzLl9hbmltYXRpb25zRGlzYWJsZWQ9IWEuYW5pbWF0aW9uO2lmKHRoaXMuX3Vw"
+    "ZGF0ZVNjYWxlcygpLHRoaXMuX2NoZWNrRXZlbnRCaW5kaW5ncygpLHRoaXMuX3VwZGF0ZUhpZGRlbkluZGljZXMoKSx0aGlzLl9w"
+    "bHVnaW5zLmludmFsaWRhdGUoKSwhMSE9PXRoaXMubm90aWZ5UGx1Z2lucygiYmVmb3JlVXBkYXRlIix7bW9kZTp0LGNhbmNlbGFi"
+    "bGU6ITB9KSl7Y29uc3Qgbz10aGlzLmJ1aWxkT3JVcGRhdGVDb250cm9sbGVycygpO3RoaXMubm90aWZ5UGx1Z2lucygiYmVmb3Jl"
+    "RWxlbWVudHNVcGRhdGUiKTtsZXQgaT0wO2ZvcihsZXQgdD0wLGU9dGhpcy5kYXRhLmRhdGFzZXRzLmxlbmd0aDt0PGU7dCsrKXtj"
+    "b25zdCBzPXRoaXMuZ2V0RGF0YXNldE1ldGEodClbImNvbnRyb2xsZXIiXSxhPSFuJiYtMT09PW8uaW5kZXhPZihzKTtzLmJ1aWxk"
+    "T3JVcGRhdGVFbGVtZW50cyhhKSxpPU1hdGgubWF4KCtzLmdldE1heE92ZXJmbG93KCksaSl9aT10aGlzLl9taW5QYWRkaW5nPWEu"
+    "bGF5b3V0LmF1dG9QYWRkaW5nP2k6MCx0aGlzLl91cGRhdGVMYXlvdXQoaSksbnx8ayhvLHQ9Pnt0LnJlc2V0KCl9KSx0aGlzLl91"
+    "cGRhdGVEYXRhc2V0cyh0KSx0aGlzLm5vdGlmeVBsdWdpbnMoImFmdGVyVXBkYXRlIix7bW9kZTp0fSksdGhpcy5fbGF5ZXJzLnNv"
+    "cnQodGEoInoiLCJfaWR4IikpO3ZhcntfYWN0aXZlOnQsX2xhc3RFdmVudDplfT10aGlzO2U/dGhpcy5fZXZlbnRIYW5kbGVyKGUs"
+    "ITApOnQubGVuZ3RoJiZ0aGlzLl91cGRhdGVIb3ZlclN0eWxlcyh0LHQsITApLHRoaXMucmVuZGVyKCl9fV91cGRhdGVTY2FsZXMo"
+    "KXtrKHRoaXMuc2NhbGVzLHQ9PnthLnJlbW92ZUJveCh0aGlzLHQpfSksdGhpcy5lbnN1cmVTY2FsZXNIYXZlSURzKCksdGhpcy5i"
+    "dWlsZE9yVXBkYXRlU2NhbGVzKCl9X2NoZWNrRXZlbnRCaW5kaW5ncygpe3ZhciB0PXRoaXMub3B0aW9ucyxlPW5ldyBTZXQoT2Jq"
+    "ZWN0LmtleXModGhpcy5fbGlzdGVuZXJzKSksaT1uZXcgU2V0KHQuZXZlbnRzKTtaKGUsaSkmJiEhdGhpcy5fcmVzcG9uc2l2ZUxp"
+    "c3RlbmVycz09PXQucmVzcG9uc2l2ZXx8KHRoaXMudW5iaW5kRXZlbnRzKCksdGhpcy5iaW5kRXZlbnRzKCkpfV91cGRhdGVIaWRk"
+    "ZW5JbmRpY2VzKCl7dmFyIHQsZSxpLHMsYT10aGlzWyJfaGlkZGVuSW5kaWNlcyJdO2Zvcih7bWV0aG9kOnQsc3RhcnQ6ZSxjb3Vu"
+    "dDppfW9mIHRoaXMuX2dldFVuaWZvcm1EYXRhQ2hhbmdlcygpfHxbXSl7bj12b2lkIDA7bz12b2lkIDA7cj12b2lkIDA7cz12b2lk"
+    "IDA7dmFyIG49YTt2YXIgbz1lO3ZhciByPSJfcmVtb3ZlRWxlbWVudHMiPT09dD8taTppO2NvbnN0IGw9T2JqZWN0LmtleXMobik7"
+    "Zm9yKGNvbnN0IGggb2YgbCl7Y29uc3QgbD0raDtsPj1vJiYocz1uW2hdLGRlbGV0ZSBuW2hdLCgwPHJ8fGw+bykmJihuW2wrcl09"
+    "cykpfX19X2dldFVuaWZvcm1EYXRhQ2hhbmdlcygpe2NvbnN0IHQ9dGhpcy5fZGF0YUNoYW5nZXM7aWYodCYmdC5sZW5ndGgpe3Ro"
+    "aXMuX2RhdGFDaGFuZ2VzPVtdO3ZhciBlPXRoaXMuZGF0YS5kYXRhc2V0cy5sZW5ndGgsaT1lPT5uZXcgU2V0KHQuZmlsdGVyKHQ9"
+    "PnRbMF09PT1lKS5tYXAoKHQsZSk9PmUrIiwiK3Quc3BsaWNlKDEpLmpvaW4oIiwiKSkpLHM9aSgwKTtmb3IobGV0IHQ9MTt0PGU7"
+    "dCsrKWlmKCFaKHMsaSh0KSkpcmV0dXJuO3JldHVybiBBcnJheS5mcm9tKHMpLm1hcCh0PT50LnNwbGl0KCIsIikpLm1hcCh0PT4o"
+    "e21ldGhvZDp0WzFdLHN0YXJ0Oit0WzJdLGNvdW50Oit0WzNdfSkpfX1fdXBkYXRlTGF5b3V0KHQpe2lmKCExIT09dGhpcy5ub3Rp"
+    "ZnlQbHVnaW5zKCJiZWZvcmVMYXlvdXQiLHtjYW5jZWxhYmxlOiEwfSkpe2EudXBkYXRlKHRoaXMsdGhpcy53aWR0aCx0aGlzLmhl"
+    "aWdodCx0KTtjb25zdCBlPXRoaXMuY2hhcnRBcmVhLGk9ZS53aWR0aDw9MHx8ZS5oZWlnaHQ8PTA7dGhpcy5fbGF5ZXJzPVtdLGso"
+    "dGhpcy5ib3hlcyx0PT57aSYmImNoYXJ0QXJlYSI9PT10LnBvc2l0aW9ufHwodC5jb25maWd1cmUmJnQuY29uZmlndXJlKCksdGhp"
+    "cy5fbGF5ZXJzLnB1c2goLi4udC5fbGF5ZXJzKCkpKX0sdGhpcyksdGhpcy5fbGF5ZXJzLmZvckVhY2goKHQsZSk9Pnt0Ll9pZHg9"
+    "ZX0pLHRoaXMubm90aWZ5UGx1Z2lucygiYWZ0ZXJMYXlvdXQiKX19X3VwZGF0ZURhdGFzZXRzKGkpe2lmKCExIT09dGhpcy5ub3Rp"
+    "ZnlQbHVnaW5zKCJiZWZvcmVEYXRhc2V0c1VwZGF0ZSIse21vZGU6aSxjYW5jZWxhYmxlOiEwfSkpe2ZvcihsZXQgdD0wLGU9dGhp"
+    "cy5kYXRhLmRhdGFzZXRzLmxlbmd0aDt0PGU7Kyt0KXRoaXMuZ2V0RGF0YXNldE1ldGEodCkuY29udHJvbGxlci5jb25maWd1cmUo"
+    "KTtmb3IobGV0IHQ9MCxlPXRoaXMuZGF0YS5kYXRhc2V0cy5sZW5ndGg7dDxlOysrdCl0aGlzLl91cGRhdGVEYXRhc2V0KHQsdShp"
+    "KT9pKHtkYXRhc2V0SW5kZXg6dH0pOmkpO3RoaXMubm90aWZ5UGx1Z2lucygiYWZ0ZXJEYXRhc2V0c1VwZGF0ZSIse21vZGU6aX0p"
+    "fX1fdXBkYXRlRGF0YXNldCh0LGUpe2NvbnN0IGk9dGhpcy5nZXREYXRhc2V0TWV0YSh0KSxzPXttZXRhOmksaW5kZXg6dCxtb2Rl"
+    "OmUsY2FuY2VsYWJsZTohMH07ITEhPT10aGlzLm5vdGlmeVBsdWdpbnMoImJlZm9yZURhdGFzZXRVcGRhdGUiLHMpJiYoaS5jb250"
+    "cm9sbGVyLl91cGRhdGUoZSkscy5jYW5jZWxhYmxlPSExLHRoaXMubm90aWZ5UGx1Z2lucygiYWZ0ZXJEYXRhc2V0VXBkYXRlIixz"
+    "KSl9cmVuZGVyKCl7ITEhPT10aGlzLm5vdGlmeVBsdWdpbnMoImJlZm9yZVJlbmRlciIse2NhbmNlbGFibGU6ITB9KSYmKGwuaGFz"
+    "KHRoaXMpP3RoaXMuYXR0YWNoZWQmJiFsLnJ1bm5pbmcodGhpcykmJmwuc3RhcnQodGhpcyk6KHRoaXMuZHJhdygpLGVhKHtjaGFy"
+    "dDp0aGlzfSkpKX1kcmF3KCl7bGV0IHQ7aWYodGhpcy5fcmVzaXplQmVmb3JlRHJhdyl7Y29uc3R7d2lkdGg6dCxoZWlnaHQ6ZX09"
+    "dGhpcy5fcmVzaXplQmVmb3JlRHJhdzt0aGlzLl9yZXNpemUodCxlKSx0aGlzLl9yZXNpemVCZWZvcmVEcmF3PW51bGx9aWYodGhp"
+    "cy5jbGVhcigpLCEodGhpcy53aWR0aDw9MHx8dGhpcy5oZWlnaHQ8PTApJiYhMSE9PXRoaXMubm90aWZ5UGx1Z2lucygiYmVmb3Jl"
+    "RHJhdyIse2NhbmNlbGFibGU6ITB9KSl7Y29uc3QgZT10aGlzLl9sYXllcnM7Zm9yKHQ9MDt0PGUubGVuZ3RoJiZlW3RdLno8PTA7"
+    "Kyt0KWVbdF0uZHJhdyh0aGlzLmNoYXJ0QXJlYSk7Zm9yKHRoaXMuX2RyYXdEYXRhc2V0cygpO3Q8ZS5sZW5ndGg7Kyt0KWVbdF0u"
+    "ZHJhdyh0aGlzLmNoYXJ0QXJlYSk7dGhpcy5ub3RpZnlQbHVnaW5zKCJhZnRlckRyYXciKX19X2dldFNvcnRlZERhdGFzZXRNZXRh"
+    "cyh0KXtjb25zdCBlPXRoaXMuX3NvcnRlZE1ldGFzZXRzLGk9W107bGV0IHMsYTtmb3Iocz0wLGE9ZS5sZW5ndGg7czxhOysrcyl7"
+    "Y29uc3QgYT1lW3NdO3QmJiFhLnZpc2libGV8fGkucHVzaChhKX1yZXR1cm4gaX1nZXRTb3J0ZWRWaXNpYmxlRGF0YXNldE1ldGFz"
+    "KCl7cmV0dXJuIHRoaXMuX2dldFNvcnRlZERhdGFzZXRNZXRhcyghMCl9X2RyYXdEYXRhc2V0cygpe2lmKCExIT09dGhpcy5ub3Rp"
+    "ZnlQbHVnaW5zKCJiZWZvcmVEYXRhc2V0c0RyYXciLHtjYW5jZWxhYmxlOiEwfSkpe3ZhciBlPXRoaXMuZ2V0U29ydGVkVmlzaWJs"
+    "ZURhdGFzZXRNZXRhcygpO2ZvcihsZXQgdD1lLmxlbmd0aC0xOzA8PXQ7LS10KXRoaXMuX2RyYXdEYXRhc2V0KGVbdF0pO3RoaXMu"
+    "bm90aWZ5UGx1Z2lucygiYWZ0ZXJEYXRhc2V0c0RyYXciKX19X2RyYXdEYXRhc2V0KHMpe2NvbnN0IHQ9dGhpcy5jdHgsZT1zLl9j"
+    "bGlwLGk9IWUuZGlzYWJsZWQsYT1mdW5jdGlvbih0KXt2YXJ7eFNjYWxlOmUseVNjYWxlOml9PXM7cmV0dXJuIGUmJmk/e2xlZnQ6"
+    "b2EoZSx0LCJsZWZ0IikscmlnaHQ6b2EoZSx0LCJyaWdodCIpLHRvcDpvYShpLHQsInRvcCIpLGJvdHRvbTpvYShpLHQsImJvdHRv"
+    "bSIpfTp0fSh0aGlzLmNoYXJ0QXJlYSksbj17bWV0YTpzLGluZGV4OnMuaW5kZXgsY2FuY2VsYWJsZTohMH07ITEhPT10aGlzLm5v"
+    "dGlmeVBsdWdpbnMoImJlZm9yZURhdGFzZXREcmF3IixuKSYmKGkmJlZlKHQse2xlZnQ6ITE9PT1lLmxlZnQ/MDphLmxlZnQtZS5s"
+    "ZWZ0LHJpZ2h0OiExPT09ZS5yaWdodD90aGlzLndpZHRoOmEucmlnaHQrZS5yaWdodCx0b3A6ITE9PT1lLnRvcD8wOmEudG9wLWUu"
+    "dG9wLGJvdHRvbTohMT09PWUuYm90dG9tP3RoaXMuaGVpZ2h0OmEuYm90dG9tK2UuYm90dG9tfSkscy5jb250cm9sbGVyLmRyYXco"
+    "KSxpJiZCZSh0KSxuLmNhbmNlbGFibGU9ITEsdGhpcy5ub3RpZnlQbHVnaW5zKCJhZnRlckRhdGFzZXREcmF3IixuKSl9aXNQb2lu"
+    "dEluQXJlYSh0KXtyZXR1cm4gTSh0LHRoaXMuY2hhcnRBcmVhLHRoaXMuX21pblBhZGRpbmcpfWdldEVsZW1lbnRzQXRFdmVudEZv"
+    "ck1vZGUodCxlLGkscyl7Y29uc3QgYT1IaS5tb2Rlc1tlXTtyZXR1cm4iZnVuY3Rpb24iPT10eXBlb2YgYT9hKHRoaXMsdCxpLHMp"
+    "OltdfWdldERhdGFzZXRNZXRhKHQpe2NvbnN0IGU9dGhpcy5kYXRhLmRhdGFzZXRzW3RdLGk9dGhpcy5fbWV0YXNldHM7bGV0IHM9"
+    "aS5maWx0ZXIodD0+dCYmdC5fZGF0YXNldD09PWUpLnBvcCgpO3JldHVybiBzfHwocz17dHlwZTpudWxsLGRhdGE6W10sZGF0YXNl"
+    "dDpudWxsLGNvbnRyb2xsZXI6bnVsbCxoaWRkZW46bnVsbCx4QXhpc0lEOm51bGwseUF4aXNJRDpudWxsLG9yZGVyOmUmJmUub3Jk"
+    "ZXJ8fDAsaW5kZXg6dCxfZGF0YXNldDplLF9wYXJzZWQ6W10sX3NvcnRlZDohMX0saS5wdXNoKHMpKSxzfWdldENvbnRleHQoKXty"
+    "ZXR1cm4gdGhpcy4kY29udGV4dHx8KHRoaXMuJGNvbnRleHQ9UGkobnVsbCx7Y2hhcnQ6dGhpcyx0eXBlOiJjaGFydCJ9KSl9Z2V0"
+    "VmlzaWJsZURhdGFzZXRDb3VudCgpe3JldHVybiB0aGlzLmdldFNvcnRlZFZpc2libGVEYXRhc2V0TWV0YXMoKS5sZW5ndGh9aXNE"
+    "YXRhc2V0VmlzaWJsZSh0KXt2YXIgZT10aGlzLmRhdGEuZGF0YXNldHNbdF07aWYoIWUpcmV0dXJuITE7dD10aGlzLmdldERhdGFz"
+    "ZXRNZXRhKHQpO3JldHVybiJib29sZWFuIj09dHlwZW9mIHQuaGlkZGVuPyF0LmhpZGRlbjohZS5oaWRkZW59c2V0RGF0YXNldFZp"
+    "c2liaWxpdHkodCxlKXt0aGlzLmdldERhdGFzZXRNZXRhKHQpLmhpZGRlbj0hZX10b2dnbGVEYXRhVmlzaWJpbGl0eSh0KXt0aGlz"
+    "Ll9oaWRkZW5JbmRpY2VzW3RdPSF0aGlzLl9oaWRkZW5JbmRpY2VzW3RdfWdldERhdGFWaXNpYmlsaXR5KHQpe3JldHVybiF0aGlz"
+    "Ll9oaWRkZW5JbmRpY2VzW3RdfV91cGRhdGVWaXNpYmlsaXR5KGUsdCxpKXtjb25zdCBzPWk/InNob3ciOiJoaWRlIixhPXRoaXMu"
+    "Z2V0RGF0YXNldE1ldGEoZSksbj1hLmNvbnRyb2xsZXIuX3Jlc29sdmVBbmltYXRpb25zKHZvaWQgMCxzKTtHKHQpPyhhLmRhdGFb"
+    "dF0uaGlkZGVuPSFpLHRoaXMudXBkYXRlKCkpOih0aGlzLnNldERhdGFzZXRWaXNpYmlsaXR5KGUsaSksbi51cGRhdGUoYSx7dmlz"
+    "aWJsZTppfSksdGhpcy51cGRhdGUodD0+dC5kYXRhc2V0SW5kZXg9PT1lP3M6dm9pZCAwKSl9aGlkZSh0LGUpe3RoaXMuX3VwZGF0"
+    "ZVZpc2liaWxpdHkodCxlLCExKX1zaG93KHQsZSl7dGhpcy5fdXBkYXRlVmlzaWJpbGl0eSh0LGUsITApfV9kZXN0cm95RGF0YXNl"
+    "dE1ldGEodCl7Y29uc3QgZT10aGlzLl9tZXRhc2V0c1t0XTtlJiZlLmNvbnRyb2xsZXImJmUuY29udHJvbGxlci5fZGVzdHJveSgp"
+    "LGRlbGV0ZSB0aGlzLl9tZXRhc2V0c1t0XX1fc3RvcCgpe2xldCB0LGU7Zm9yKHRoaXMuc3RvcCgpLGwucmVtb3ZlKHRoaXMpLHQ9"
+    "MCxlPXRoaXMuZGF0YS5kYXRhc2V0cy5sZW5ndGg7dDxlOysrdCl0aGlzLl9kZXN0cm95RGF0YXNldE1ldGEodCl9ZGVzdHJveSgp"
+    "e3RoaXMubm90aWZ5UGx1Z2lucygiYmVmb3JlRGVzdHJveSIpO3ZhcntjYW52YXM6dCxjdHg6ZX09dGhpczt0aGlzLl9zdG9wKCks"
+    "dGhpcy5jb25maWcuY2xlYXJDYWNoZSgpLHQmJih0aGlzLnVuYmluZEV2ZW50cygpLEllKHQsZSksdGhpcy5wbGF0Zm9ybS5yZWxl"
+    "YXNlQ29udGV4dChlKSx0aGlzLmNhbnZhcz1udWxsLHRoaXMuY3R4PW51bGwpLGRlbGV0ZSBhYVt0aGlzLmlkXSx0aGlzLm5vdGlm"
+    "eVBsdWdpbnMoImFmdGVyRGVzdHJveSIpfXRvQmFzZTY0SW1hZ2UoLi4udCl7cmV0dXJuIHRoaXMuY2FudmFzLnRvRGF0YVVSTCgu"
+    "Li50KX1iaW5kRXZlbnRzKCl7dGhpcy5iaW5kVXNlckV2ZW50cygpLHRoaXMub3B0aW9ucy5yZXNwb25zaXZlP3RoaXMuYmluZFJl"
+    "c3BvbnNpdmVFdmVudHMoKTp0aGlzLmF0dGFjaGVkPSEwfWJpbmRVc2VyRXZlbnRzKCl7Y29uc3QgaT10aGlzLl9saXN0ZW5lcnMs"
+    "cz10aGlzLnBsYXRmb3JtLGU9KHQsZSk9PntzLmFkZEV2ZW50TGlzdGVuZXIodGhpcyx0LGUpLGlbdF09ZX0sYT0odCxlLGkpPT57"
+    "dC5vZmZzZXRYPWUsdC5vZmZzZXRZPWksdGhpcy5fZXZlbnRIYW5kbGVyKHQpfTtrKHRoaXMub3B0aW9ucy5ldmVudHMsdD0+ZSh0"
+    "LGEpKX1iaW5kUmVzcG9uc2l2ZUV2ZW50cygpe3RoaXMuX3Jlc3BvbnNpdmVMaXN0ZW5lcnN8fCh0aGlzLl9yZXNwb25zaXZlTGlz"
+    "dGVuZXJzPXt9KTtjb25zdCBpPXRoaXMuX3Jlc3BvbnNpdmVMaXN0ZW5lcnMscz10aGlzLnBsYXRmb3JtLHQ9KHQsZSk9PntzLmFk"
+    "ZEV2ZW50TGlzdGVuZXIodGhpcyx0LGUpLGlbdF09ZX0sZT0odCxlKT0+e2lbdF0mJihzLnJlbW92ZUV2ZW50TGlzdGVuZXIodGhp"
+    "cyx0LGUpLGRlbGV0ZSBpW3RdKX0sYT0odCxlKT0+e3RoaXMuY2FudmFzJiZ0aGlzLnJlc2l6ZSh0LGUpfTtsZXQgbjtjb25zdCBv"
+    "PSgpPT57ZSgiYXR0YWNoIixvKSx0aGlzLmF0dGFjaGVkPSEwLHRoaXMucmVzaXplKCksdCgicmVzaXplIixhKSx0KCJkZXRhY2gi"
+    "LG4pfTtuPSgpPT57dGhpcy5hdHRhY2hlZD0hMSxlKCJyZXNpemUiLGEpLHRoaXMuX3N0b3AoKSx0aGlzLl9yZXNpemUoMCwwKSx0"
+    "KCJhdHRhY2giLG8pfSwocy5pc0F0dGFjaGVkKHRoaXMuY2FudmFzKT9vOm4pKCl9dW5iaW5kRXZlbnRzKCl7ayh0aGlzLl9saXN0"
+    "ZW5lcnMsKHQsZSk9Pnt0aGlzLnBsYXRmb3JtLnJlbW92ZUV2ZW50TGlzdGVuZXIodGhpcyxlLHQpfSksdGhpcy5fbGlzdGVuZXJz"
+    "PXt9LGsodGhpcy5fcmVzcG9uc2l2ZUxpc3RlbmVycywodCxlKT0+e3RoaXMucGxhdGZvcm0ucmVtb3ZlRXZlbnRMaXN0ZW5lcih0"
+    "aGlzLGUsdCl9KSx0aGlzLl9yZXNwb25zaXZlTGlzdGVuZXJzPXZvaWQgMH11cGRhdGVIb3ZlclN0eWxlKHQsZSxpKXt2YXIgcz1p"
+    "PyJzZXQiOiJyZW1vdmUiO2xldCBhLG4sbyxyO2ZvcigiZGF0YXNldCI9PT1lJiYoYT10aGlzLmdldERhdGFzZXRNZXRhKHRbMF0u"
+    "ZGF0YXNldEluZGV4KSkuY29udHJvbGxlclsiXyIrcysiRGF0YXNldEhvdmVyU3R5bGUiXSgpLG89MCxyPXQubGVuZ3RoO288cjsr"
+    "K28pe2NvbnN0IGU9KG49dFtvXSkmJnRoaXMuZ2V0RGF0YXNldE1ldGEobi5kYXRhc2V0SW5kZXgpLmNvbnRyb2xsZXI7ZSYmZVtz"
+    "KyJIb3ZlclN0eWxlIl0obi5lbGVtZW50LG4uZGF0YXNldEluZGV4LG4uaW5kZXgpfX1nZXRBY3RpdmVFbGVtZW50cygpe3JldHVy"
+    "biB0aGlzLl9hY3RpdmV8fFtdfXNldEFjdGl2ZUVsZW1lbnRzKHQpe3ZhciBlPXRoaXMuX2FjdGl2ZXx8W10sdD10Lm1hcCgoe2Rh"
+    "dGFzZXRJbmRleDp0LGluZGV4OmV9KT0+e3ZhciBpPXRoaXMuZ2V0RGF0YXNldE1ldGEodCk7aWYoaSlyZXR1cm57ZGF0YXNldElu"
+    "ZGV4OnQsZWxlbWVudDppLmRhdGFbZV0saW5kZXg6ZX07dGhyb3cgbmV3IEVycm9yKCJObyBkYXRhc2V0IGZvdW5kIGF0IGluZGV4"
+    "ICIrdCl9KTtXKHQsZSl8fCh0aGlzLl9hY3RpdmU9dCx0aGlzLl9sYXN0RXZlbnQ9bnVsbCx0aGlzLl91cGRhdGVIb3ZlclN0eWxl"
+    "cyh0LGUpKX1ub3RpZnlQbHVnaW5zKHQsZSxpKXtyZXR1cm4gdGhpcy5fcGx1Z2lucy5ub3RpZnkodGhpcyx0LGUsaSl9aXNQbHVn"
+    "aW5FbmFibGVkKGUpe3JldHVybiAxPT09dGhpcy5fcGx1Z2lucy5fY2FjaGUuZmlsdGVyKHQ9PnQucGx1Z2luLmlkPT09ZSkubGVu"
+    "Z3RofV91cGRhdGVIb3ZlclN0eWxlcyh0LGUsaSl7dmFyIHM9dGhpcy5vcHRpb25zLmhvdmVyLGE9KHQsaSk9PnQuZmlsdGVyKGU9"
+    "PiFpLnNvbWUodD0+ZS5kYXRhc2V0SW5kZXg9PT10LmRhdGFzZXRJbmRleCYmZS5pbmRleD09PXQuaW5kZXgpKSxuPWEoZSx0KSxp"
+    "PWk/dDphKHQsZSk7bi5sZW5ndGgmJnRoaXMudXBkYXRlSG92ZXJTdHlsZShuLHMubW9kZSwhMSksaS5sZW5ndGgmJnMubW9kZSYm"
+    "dGhpcy51cGRhdGVIb3ZlclN0eWxlKGkscy5tb2RlLCEwKX1fZXZlbnRIYW5kbGVyKGUsdCl7Y29uc3QgaT17ZXZlbnQ6ZSxyZXBs"
+    "YXk6dCxjYW5jZWxhYmxlOiEwLGluQ2hhcnRBcmVhOnRoaXMuaXNQb2ludEluQXJlYShlKX0scz10PT4odC5vcHRpb25zLmV2ZW50"
+    "c3x8dGhpcy5vcHRpb25zLmV2ZW50cykuaW5jbHVkZXMoZS5uYXRpdmUudHlwZSk7aWYoITEhPT10aGlzLm5vdGlmeVBsdWdpbnMo"
+    "ImJlZm9yZUV2ZW50IixpLHMpKXJldHVybiB0PXRoaXMuX2hhbmRsZUV2ZW50KGUsdCxpLmluQ2hhcnRBcmVhKSxpLmNhbmNlbGFi"
+    "bGU9ITEsdGhpcy5ub3RpZnlQbHVnaW5zKCJhZnRlckV2ZW50IixpLHMpLCh0fHxpLmNoYW5nZWQpJiZ0aGlzLnJlbmRlcigpLHRo"
+    "aXN9X2hhbmRsZUV2ZW50KHQsZSxpKXtjb25zdHtfYWN0aXZlOnM9W10sb3B0aW9uczphfT10aGlzLG49ZSxvPXRoaXMuX2dldEFj"
+    "dGl2ZUVsZW1lbnRzKHQscyxpLG4pLHI9Sih0KSxsPShoPXQsYz10aGlzLl9sYXN0RXZlbnQsaSYmIm1vdXNlb3V0IiE9PWgudHlw"
+    "ZT9yP2M6aDpudWxsKTtpJiYodGhpcy5fbGFzdEV2ZW50PW51bGwsZChhLm9uSG92ZXIsW3Qsbyx0aGlzXSx0aGlzKSxyJiZkKGEu"
+    "b25DbGljayxbdCxvLHRoaXNdLHRoaXMpKTt2YXIgaCxjPSFXKG8scyk7cmV0dXJuKGN8fGUpJiYodGhpcy5fYWN0aXZlPW8sdGhp"
+    "cy5fdXBkYXRlSG92ZXJTdHlsZXMobyxzLGUpKSx0aGlzLl9sYXN0RXZlbnQ9bCxjfV9nZXRBY3RpdmVFbGVtZW50cyh0LGUsaSxz"
+    "KXtpZigibW91c2VvdXQiPT09dC50eXBlKXJldHVybltdO2lmKCFpKXJldHVybiBlO2k9dGhpcy5vcHRpb25zLmhvdmVyO3JldHVy"
+    "biB0aGlzLmdldEVsZW1lbnRzQXRFdmVudEZvck1vZGUodCxpLm1vZGUsaSxzKX19ZnVuY3Rpb24gcmEoKXtrKGkuaW5zdGFuY2Vz"
+    "LHQ9PnQuX3BsdWdpbnMuaW52YWxpZGF0ZSgpKX1mdW5jdGlvbiBsYSgpe3Rocm93IG5ldyBFcnJvcigiVGhpcyBtZXRob2QgaXMg"
+    "bm90IGltcGxlbWVudGVkOiBDaGVjayB0aGF0IGEgY29tcGxldGUgZGF0ZSBhZGFwdGVyIGlzIHByb3ZpZGVkLiIpfXZhciBoYT17"
+    "X2RhdGU6Y2xhc3MgWG57c3RhdGljIG92ZXJyaWRlKHQpe09iamVjdC5hc3NpZ24oWG4ucHJvdG90eXBlLHQpfW9wdGlvbnM7Y29u"
+    "c3RydWN0b3IodCl7dGhpcy5vcHRpb25zPXR8fHt9fWluaXQoKXt9Zm9ybWF0cygpe3JldHVybiBsYSgpfXBhcnNlKCl7cmV0dXJu"
+    "IGxhKCl9Zm9ybWF0KCl7cmV0dXJuIGxhKCl9YWRkKCl7cmV0dXJuIGxhKCl9ZGlmZigpe3JldHVybiBsYSgpfXN0YXJ0T2YoKXty"
+    "ZXR1cm4gbGEoKX1lbmRPZigpe3JldHVybiBsYSgpfX19O2Z1bmN0aW9uIGNhKGkscyxhLG4pe2lmKE8oaSkpe3ZhciBvPWkscj1z"
+    "LGw9YSxoPW4sYz1sLnBhcnNlKG9bMF0saCksbz1sLnBhcnNlKG9bMV0saCksaD1NYXRoLm1pbihjLG8pLGQ9TWF0aC5tYXgoYyxv"
+    "KTtsZXQgdD1oLGU9ZDtNYXRoLmFicyhoKT5NYXRoLmFicyhkKSYmKHQ9ZCxlPWgpLHJbbC5heGlzXT1lLHIuX2N1c3RvbT17YmFy"
+    "U3RhcnQ6dCxiYXJFbmQ6ZSxzdGFydDpjLGVuZDpvLG1pbjpoLG1heDpkfX1lbHNlIHNbYS5heGlzXT1hLnBhcnNlKGksbik7cmV0"
+    "dXJuIHN9ZnVuY3Rpb24gZGEodCxlLGkscyl7Y29uc3QgYT10LmlTY2FsZSxuPXQudlNjYWxlLG89YS5nZXRMYWJlbHMoKSxyPWE9"
+    "PT1uLGw9W107bGV0IGgsYyxkLHU7Zm9yKGM9KGg9aSkrcztoPGM7KytoKXU9ZVtoXSwoZD17fSlbYS5heGlzXT1yfHxhLnBhcnNl"
+    "KG9baF0saCksbC5wdXNoKGNhKHUsZCxuLGgpKTtyZXR1cm4gbH1mdW5jdGlvbiB1YSh0KXtyZXR1cm4gdCYmdm9pZCAwIT09dC5i"
+    "YXJTdGFydCYmdm9pZCAwIT09dC5iYXJFbmR9ZnVuY3Rpb24gZ2EodCxlLGkscyl7cmV0dXJuIHQ9cz9mYSh0PXQ9PT1lP2k6dD09"
+    "PWk/ZTp0LGksZSk6ZmEodCxlLGkpfWZ1bmN0aW9uIGZhKHQsZSxpKXtyZXR1cm4ic3RhcnQiPT09dD9lOiJlbmQiPT09dD9pOnR9"
+    "Y2xhc3MgcGEgZXh0ZW5kcyBPc3tzdGF0aWMgaWQ9ImRvdWdobnV0IjtzdGF0aWMgZGVmYXVsdHM9e2RhdGFzZXRFbGVtZW50VHlw"
+    "ZTohMSxkYXRhRWxlbWVudFR5cGU6ImFyYyIsYW5pbWF0aW9uOnthbmltYXRlUm90YXRlOiEwLGFuaW1hdGVTY2FsZTohMX0sYW5p"
+    "bWF0aW9uczp7bnVtYmVyczp7dHlwZToibnVtYmVyIixwcm9wZXJ0aWVzOlsiY2lyY3VtZmVyZW5jZSIsImVuZEFuZ2xlIiwiaW5u"
+    "ZXJSYWRpdXMiLCJvdXRlclJhZGl1cyIsInN0YXJ0QW5nbGUiLCJ4IiwieSIsIm9mZnNldCIsImJvcmRlcldpZHRoIiwic3BhY2lu"
+    "ZyJdfX0sY3V0b3V0OiI1MCUiLHJvdGF0aW9uOjAsY2lyY3VtZmVyZW5jZTozNjAscmFkaXVzOiIxMDAlIixzcGFjaW5nOjAsaW5k"
+    "ZXhBeGlzOiJyIn07c3RhdGljIGRlc2NyaXB0b3JzPXtfc2NyaXB0YWJsZTp0PT4ic3BhY2luZyIhPT10LF9pbmRleGFibGU6dD0+"
+    "InNwYWNpbmciIT09dCYmIXQuc3RhcnRzV2l0aCgiYm9yZGVyRGFzaCIpJiYhdC5zdGFydHNXaXRoKCJob3ZlckJvcmRlckRhc2gi"
+    "KX07c3RhdGljIG92ZXJyaWRlcz17YXNwZWN0UmF0aW86MSxwbHVnaW5zOntsZWdlbmQ6e2xhYmVsczp7Z2VuZXJhdGVMYWJlbHMo"
+    "cyl7Y29uc3QgdD1zLmRhdGE7aWYodC5sYWJlbHMubGVuZ3RoJiZ0LmRhdGFzZXRzLmxlbmd0aCl7Y29uc3R7cG9pbnRTdHlsZTph"
+    "LGNvbG9yOm59PXMubGVnZW5kLm9wdGlvbnNbImxhYmVscyJdO3JldHVybiB0LmxhYmVscy5tYXAoKHQsZSk9Pnt2YXIgaT1zLmdl"
+    "dERhdGFzZXRNZXRhKDApLmNvbnRyb2xsZXIuZ2V0U3R5bGUoZSk7cmV0dXJue3RleHQ6dCxmaWxsU3R5bGU6aS5iYWNrZ3JvdW5k"
+    "Q29sb3Isc3Ryb2tlU3R5bGU6aS5ib3JkZXJDb2xvcixmb250Q29sb3I6bixsaW5lV2lkdGg6aS5ib3JkZXJXaWR0aCxwb2ludFN0"
+    "eWxlOmEsaGlkZGVuOiFzLmdldERhdGFWaXNpYmlsaXR5KGUpLGluZGV4OmV9fSl9cmV0dXJuW119fSxvbkNsaWNrKHQsZSxpKXtp"
+    "LmNoYXJ0LnRvZ2dsZURhdGFWaXNpYmlsaXR5KGUuaW5kZXgpLGkuY2hhcnQudXBkYXRlKCl9fX19O2NvbnN0cnVjdG9yKHQsZSl7"
+    "c3VwZXIodCxlKSx0aGlzLmVuYWJsZU9wdGlvblNoYXJpbmc9ITAsdGhpcy5pbm5lclJhZGl1cz12b2lkIDAsdGhpcy5vdXRlclJh"
+    "ZGl1cz12b2lkIDAsdGhpcy5vZmZzZXRYPXZvaWQgMCx0aGlzLm9mZnNldFk9dm9pZCAwfWxpbmtTY2FsZXMoKXt9cGFyc2Uocyxh"
+    "KXtjb25zdCBuPXRoaXMuZ2V0RGF0YXNldCgpLmRhdGEsbz10aGlzLl9jYWNoZWRNZXRhO2lmKCExPT09dGhpcy5fcGFyc2luZylv"
+    "Ll9wYXJzZWQ9bjtlbHNle2xldCB0LGUsaT10PT4rblt0XTtpZihBKG5bc10pKXtjb25zdHtrZXk6cz0idmFsdWUifT10aGlzLl9w"
+    "YXJzaW5nO2k9dD0+K20oblt0XSxzKX1mb3IoZT0odD1zKSthO3Q8ZTsrK3Qpby5fcGFyc2VkW3RdPWkodCl9fV9nZXRSb3RhdGlv"
+    "bigpe3JldHVybiBMKHRoaXMub3B0aW9ucy5yb3RhdGlvbi05MCl9X2dldENpcmN1bWZlcmVuY2UoKXtyZXR1cm4gTCh0aGlzLm9w"
+    "dGlvbnMuY2lyY3VtZmVyZW5jZSl9X2dldFJvdGF0aW9uRXh0ZW50cygpe2xldCBlPV8saT0tXztmb3IobGV0IHQ9MDt0PHRoaXMu"
+    "Y2hhcnQuZGF0YS5kYXRhc2V0cy5sZW5ndGg7Kyt0KWlmKHRoaXMuY2hhcnQuaXNEYXRhc2V0VmlzaWJsZSh0KSYmdGhpcy5jaGFy"
+    "dC5nZXREYXRhc2V0TWV0YSh0KS50eXBlPT09dGhpcy5fdHlwZSl7Y29uc3Qgcz10aGlzLmNoYXJ0LmdldERhdGFzZXRNZXRhKHQp"
+    "LmNvbnRyb2xsZXIsYT1zLl9nZXRSb3RhdGlvbigpLG49cy5fZ2V0Q2lyY3VtZmVyZW5jZSgpO2U9TWF0aC5taW4oZSxhKSxpPU1h"
+    "dGgubWF4KGksYStuKX1yZXR1cm57cm90YXRpb246ZSxjaXJjdW1mZXJlbmNlOmktZX19dXBkYXRlKHQpe2NvbnN0IGU9dGhpcy5j"
+    "aGFydCxpPWVbImNoYXJ0QXJlYSJdLHM9dGhpcy5fY2FjaGVkTWV0YSxhPXMuZGF0YSxuPXRoaXMuZ2V0TWF4Qm9yZGVyV2lkdGgo"
+    "KSt0aGlzLmdldE1heE9mZnNldChhKSt0aGlzLm9wdGlvbnMuc3BhY2luZyxvPU1hdGgubWF4KChNYXRoLm1pbihpLndpZHRoLGku"
+    "aGVpZ2h0KS1uKS8yLDApLHI9TWF0aC5taW4oVih0aGlzLm9wdGlvbnMuY3V0b3V0LG8pLDEpLGw9dGhpcy5fZ2V0UmluZ1dlaWdo"
+    "dCh0aGlzLmluZGV4KSx7Y2lyY3VtZmVyZW5jZTpoLHJvdGF0aW9uOmN9PXRoaXMuX2dldFJvdGF0aW9uRXh0ZW50cygpLHtyYXRp"
+    "b1g6ZCxyYXRpb1k6dSxvZmZzZXRYOmcsb2Zmc2V0WTpmfT1mdW5jdGlvbih0LGUscyl7bGV0IGk9MSxhPTEsbj0wLG89MDtpZihl"
+    "PF8pe2NvbnN0IHI9dCxsPXIrZSxoPU1hdGguY29zKHIpLGM9TWF0aC5zaW4ociksZD1NYXRoLmNvcyhsKSx1PU1hdGguc2luKGwp"
+    "LGc9KHQsZSxpKT0+cHQodCxyLGwsITApPzE6TWF0aC5tYXgoZSxlKnMsaSxpKnMpLGY9KHQsZSxpKT0+cHQodCxyLGwsITApPy0x"
+    "Ok1hdGgubWluKGUsZSpzLGksaSpzKSxwPWcoMCxoLGQpLG09ZyhELGMsdSksYj1mKFMsaCxkKSx4PWYoUytELGMsdSk7aT0ocC1i"
+    "KS8yLGE9KG0teCkvMixuPS0ocCtiKS8yLG89LShtK3gpLzJ9cmV0dXJue3JhdGlvWDppLHJhdGlvWTphLG9mZnNldFg6bixvZmZz"
+    "ZXRZOm99fShjLGgscikscD0oaS53aWR0aC1uKS9kLG09KGkuaGVpZ2h0LW4pL3UsYj1NYXRoLm1heChNYXRoLm1pbihwLG0pLzIs"
+    "MCkseD1CKHRoaXMub3B0aW9ucy5yYWRpdXMsYiksdj0oeC1NYXRoLm1heCh4KnIsMCkpL3RoaXMuX2dldFZpc2libGVEYXRhc2V0"
+    "V2VpZ2h0VG90YWwoKTt0aGlzLm9mZnNldFg9Zyp4LHRoaXMub2Zmc2V0WT1mKngscy50b3RhbD10aGlzLmNhbGN1bGF0ZVRvdGFs"
+    "KCksdGhpcy5vdXRlclJhZGl1cz14LXYqdGhpcy5fZ2V0UmluZ1dlaWdodE9mZnNldCh0aGlzLmluZGV4KSx0aGlzLmlubmVyUmFk"
+    "aXVzPU1hdGgubWF4KHRoaXMub3V0ZXJSYWRpdXMtdipsLDApLHRoaXMudXBkYXRlRWxlbWVudHMoYSwwLGEubGVuZ3RoLHQpfV9j"
+    "aXJjdW1mZXJlbmNlKHQsZSl7dmFyIGk9dGhpcy5vcHRpb25zLHM9dGhpcy5fY2FjaGVkTWV0YSxhPXRoaXMuX2dldENpcmN1bWZl"
+    "cmVuY2UoKTtyZXR1cm4gZSYmaS5hbmltYXRpb24uYW5pbWF0ZVJvdGF0ZXx8IXRoaXMuY2hhcnQuZ2V0RGF0YVZpc2liaWxpdHko"
+    "dCl8fG51bGw9PT1zLl9wYXJzZWRbdF18fHMuZGF0YVt0XS5oaWRkZW4/MDp0aGlzLmNhbGN1bGF0ZUNpcmN1bWZlcmVuY2Uocy5f"
+    "cGFyc2VkW3RdKmEvXyl9dXBkYXRlRWxlbWVudHModCxlLGkscyl7Y29uc3QgYT0icmVzZXQiPT09cyxuPXRoaXMuY2hhcnQsbz1u"
+    "LmNoYXJ0QXJlYSxyPW4ub3B0aW9ucy5hbmltYXRpb24sbD0oby5sZWZ0K28ucmlnaHQpLzIsaD0oby50b3Arby5ib3R0b20pLzIs"
+    "Yz1hJiZyLmFuaW1hdGVTY2FsZSxkPWM/MDp0aGlzLmlubmVyUmFkaXVzLHU9Yz8wOnRoaXMub3V0ZXJSYWRpdXMse3NoYXJlZE9w"
+    "dGlvbnM6ZyxpbmNsdWRlT3B0aW9uczpmfT10aGlzLl9nZXRTaGFyZWRPcHRpb25zKGUscyk7bGV0IHAsbT10aGlzLl9nZXRSb3Rh"
+    "dGlvbigpO2ZvcihwPTA7cDxlOysrcCltKz10aGlzLl9jaXJjdW1mZXJlbmNlKHAsYSk7Zm9yKHA9ZTtwPGUraTsrK3Ape2NvbnN0"
+    "IGU9dGhpcy5fY2lyY3VtZmVyZW5jZShwLGEpLGk9dFtwXSxuPXt4OmwrdGhpcy5vZmZzZXRYLHk6aCt0aGlzLm9mZnNldFksc3Rh"
+    "cnRBbmdsZTptLGVuZEFuZ2xlOm0rZSxjaXJjdW1mZXJlbmNlOmUsb3V0ZXJSYWRpdXM6dSxpbm5lclJhZGl1czpkfTtmJiYobi5v"
+    "cHRpb25zPWd8fHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyhwLGkuYWN0aXZlPyJhY3RpdmUiOnMpKSxtKz1lLHRoaXMu"
+    "dXBkYXRlRWxlbWVudChpLHAsbixzKX19Y2FsY3VsYXRlVG90YWwoKXt2YXIgdD10aGlzLl9jYWNoZWRNZXRhLGU9dC5kYXRhO2xl"
+    "dCBpLHM9MDtmb3IoaT0wO2k8ZS5sZW5ndGg7aSsrKXt2YXIgYT10Ll9wYXJzZWRbaV07bnVsbD09PWF8fGlzTmFOKGEpfHwhdGhp"
+    "cy5jaGFydC5nZXREYXRhVmlzaWJpbGl0eShpKXx8ZVtpXS5oaWRkZW58fChzKz1NYXRoLmFicyhhKSl9cmV0dXJuIHN9Y2FsY3Vs"
+    "YXRlQ2lyY3VtZmVyZW5jZSh0KXt2YXIgZT10aGlzLl9jYWNoZWRNZXRhLnRvdGFsO3JldHVybiAwPGUmJiFpc05hTih0KT9fKihN"
+    "YXRoLmFicyh0KS9lKTowfWdldExhYmVsQW5kVmFsdWUodCl7dmFyIGU9dGhpcy5fY2FjaGVkTWV0YSxpPXRoaXMuY2hhcnQscz1p"
+    "LmRhdGEubGFiZWxzfHxbXSxlPWRlKGUuX3BhcnNlZFt0XSxpLm9wdGlvbnMubG9jYWxlKTtyZXR1cm57bGFiZWw6c1t0XXx8IiIs"
+    "dmFsdWU6ZX19Z2V0TWF4Qm9yZGVyV2lkdGgodCl7bGV0IGU9MDtjb25zdCBpPXRoaXMuY2hhcnQ7bGV0IHMsYSxuLG8scjtpZigh"
+    "dClmb3Iocz0wLGE9aS5kYXRhLmRhdGFzZXRzLmxlbmd0aDtzPGE7KytzKWlmKGkuaXNEYXRhc2V0VmlzaWJsZShzKSl7dD0obj1p"
+    "LmdldERhdGFzZXRNZXRhKHMpKS5kYXRhLG89bi5jb250cm9sbGVyO2JyZWFrfWlmKCF0KXJldHVybiAwO2ZvcihzPTAsYT10Lmxl"
+    "bmd0aDtzPGE7KytzKSJpbm5lciIhPT0ocj1vLnJlc29sdmVEYXRhRWxlbWVudE9wdGlvbnMocykpLmJvcmRlckFsaWduJiYoZT1N"
+    "YXRoLm1heChlLHIuYm9yZGVyV2lkdGh8fDAsci5ob3ZlckJvcmRlcldpZHRofHwwKSk7cmV0dXJuIGV9Z2V0TWF4T2Zmc2V0KGkp"
+    "e2xldCBzPTA7Zm9yKGxldCB0PTAsZT1pLmxlbmd0aDt0PGU7Kyt0KXtjb25zdCBpPXRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0"
+    "aW9ucyh0KTtzPU1hdGgubWF4KHMsaS5vZmZzZXR8fDAsaS5ob3Zlck9mZnNldHx8MCl9cmV0dXJuIHN9X2dldFJpbmdXZWlnaHRP"
+    "ZmZzZXQoZSl7bGV0IGk9MDtmb3IobGV0IHQ9MDt0PGU7Kyt0KXRoaXMuY2hhcnQuaXNEYXRhc2V0VmlzaWJsZSh0KSYmKGkrPXRo"
+    "aXMuX2dldFJpbmdXZWlnaHQodCkpO3JldHVybiBpfV9nZXRSaW5nV2VpZ2h0KHQpe3JldHVybiBNYXRoLm1heChUKHRoaXMuY2hh"
+    "cnQuZGF0YS5kYXRhc2V0c1t0XS53ZWlnaHQsMSksMCl9X2dldFZpc2libGVEYXRhc2V0V2VpZ2h0VG90YWwoKXtyZXR1cm4gdGhp"
+    "cy5fZ2V0UmluZ1dlaWdodE9mZnNldCh0aGlzLmNoYXJ0LmRhdGEuZGF0YXNldHMubGVuZ3RoKXx8MX19Y2xhc3MgbWEgZXh0ZW5k"
+    "cyBPc3tzdGF0aWMgaWQ9InBvbGFyQXJlYSI7c3RhdGljIGRlZmF1bHRzPXtkYXRhRWxlbWVudFR5cGU6ImFyYyIsYW5pbWF0aW9u"
+    "OnthbmltYXRlUm90YXRlOiEwLGFuaW1hdGVTY2FsZTohMH0sYW5pbWF0aW9uczp7bnVtYmVyczp7dHlwZToibnVtYmVyIixwcm9w"
+    "ZXJ0aWVzOlsieCIsInkiLCJzdGFydEFuZ2xlIiwiZW5kQW5nbGUiLCJpbm5lclJhZGl1cyIsIm91dGVyUmFkaXVzIl19fSxpbmRl"
+    "eEF4aXM6InIiLHN0YXJ0QW5nbGU6MH07c3RhdGljIG92ZXJyaWRlcz17YXNwZWN0UmF0aW86MSxwbHVnaW5zOntsZWdlbmQ6e2xh"
+    "YmVsczp7Z2VuZXJhdGVMYWJlbHMocyl7Y29uc3QgdD1zLmRhdGE7aWYodC5sYWJlbHMubGVuZ3RoJiZ0LmRhdGFzZXRzLmxlbmd0"
+    "aCl7Y29uc3R7cG9pbnRTdHlsZTphLGNvbG9yOm59PXMubGVnZW5kLm9wdGlvbnNbImxhYmVscyJdO3JldHVybiB0LmxhYmVscy5t"
+    "YXAoKHQsZSk9Pnt2YXIgaT1zLmdldERhdGFzZXRNZXRhKDApLmNvbnRyb2xsZXIuZ2V0U3R5bGUoZSk7cmV0dXJue3RleHQ6dCxm"
+    "aWxsU3R5bGU6aS5iYWNrZ3JvdW5kQ29sb3Isc3Ryb2tlU3R5bGU6aS5ib3JkZXJDb2xvcixmb250Q29sb3I6bixsaW5lV2lkdGg6"
+    "aS5ib3JkZXJXaWR0aCxwb2ludFN0eWxlOmEsaGlkZGVuOiFzLmdldERhdGFWaXNpYmlsaXR5KGUpLGluZGV4OmV9fSl9cmV0dXJu"
+    "W119fSxvbkNsaWNrKHQsZSxpKXtpLmNoYXJ0LnRvZ2dsZURhdGFWaXNpYmlsaXR5KGUuaW5kZXgpLGkuY2hhcnQudXBkYXRlKCl9"
+    "fX0sc2NhbGVzOntyOnt0eXBlOiJyYWRpYWxMaW5lYXIiLGFuZ2xlTGluZXM6e2Rpc3BsYXk6ITF9LGJlZ2luQXRaZXJvOiEwLGdy"
+    "aWQ6e2NpcmN1bGFyOiEwfSxwb2ludExhYmVsczp7ZGlzcGxheTohMX0sc3RhcnRBbmdsZTowfX19O2NvbnN0cnVjdG9yKHQsZSl7"
+    "c3VwZXIodCxlKSx0aGlzLmlubmVyUmFkaXVzPXZvaWQgMCx0aGlzLm91dGVyUmFkaXVzPXZvaWQgMH1nZXRMYWJlbEFuZFZhbHVl"
+    "KHQpe3ZhciBlPXRoaXMuX2NhY2hlZE1ldGEsaT10aGlzLmNoYXJ0LHM9aS5kYXRhLmxhYmVsc3x8W10sZT1kZShlLl9wYXJzZWRb"
+    "dF0ucixpLm9wdGlvbnMubG9jYWxlKTtyZXR1cm57bGFiZWw6c1t0XXx8IiIsdmFsdWU6ZX19cGFyc2VPYmplY3REYXRhKHQsZSxp"
+    "LHMpe3JldHVybiBpaS5iaW5kKHRoaXMpKHQsZSxpLHMpfXVwZGF0ZSh0KXt2YXIgZT10aGlzLl9jYWNoZWRNZXRhLmRhdGE7dGhp"
+    "cy5fdXBkYXRlUmFkaXVzKCksdGhpcy51cGRhdGVFbGVtZW50cyhlLDAsZS5sZW5ndGgsdCl9Z2V0TWluTWF4KCl7Y29uc3QgdD10"
+    "aGlzLl9jYWNoZWRNZXRhLHM9e21pbjpOdW1iZXIuUE9TSVRJVkVfSU5GSU5JVFksbWF4Ok51bWJlci5ORUdBVElWRV9JTkZJTklU"
+    "WX07cmV0dXJuIHQuZGF0YS5mb3JFYWNoKCh0LGUpPT57dmFyIGk9dGhpcy5nZXRQYXJzZWQoZSkucjshaXNOYU4oaSkmJnRoaXMu"
+    "Y2hhcnQuZ2V0RGF0YVZpc2liaWxpdHkoZSkmJihpPHMubWluJiYocy5taW49aSksaT5zLm1heCYmKHMubWF4PWkpKX0pLHN9X3Vw"
+    "ZGF0ZVJhZGl1cygpe2NvbnN0IHQ9dGhpcy5jaGFydCxlPXQuY2hhcnRBcmVhLGk9dC5vcHRpb25zLHM9TWF0aC5taW4oZS5yaWdo"
+    "dC1lLmxlZnQsZS5ib3R0b20tZS50b3ApLGE9TWF0aC5tYXgocy8yLDApLG49KGEtTWF0aC5tYXgoaS5jdXRvdXRQZXJjZW50YWdl"
+    "P2EvMTAwKmkuY3V0b3V0UGVyY2VudGFnZToxLDApKS90LmdldFZpc2libGVEYXRhc2V0Q291bnQoKTt0aGlzLm91dGVyUmFkaXVz"
+    "PWEtbip0aGlzLmluZGV4LHRoaXMuaW5uZXJSYWRpdXM9dGhpcy5vdXRlclJhZGl1cy1ufXVwZGF0ZUVsZW1lbnRzKHMsYSx0LG4p"
+    "e2NvbnN0IG89InJlc2V0Ij09PW4scj10aGlzLmNoYXJ0LGw9ci5vcHRpb25zLmFuaW1hdGlvbixoPXRoaXMuX2NhY2hlZE1ldGEu"
+    "clNjYWxlLGM9aC54Q2VudGVyLGQ9aC55Q2VudGVyLHU9aC5nZXRJbmRleEFuZ2xlKDApLS41KlM7bGV0IGcsZj11O3ZhciBwPTM2"
+    "MC90aGlzLmNvdW50VmlzaWJsZUVsZW1lbnRzKCk7Zm9yKGc9MDtnPGE7KytnKWYrPXRoaXMuX2NvbXB1dGVBbmdsZShnLG4scCk7"
+    "Zm9yKGc9YTtnPGErdDtnKyspe2NvbnN0IGE9c1tnXTtsZXQgdD1mLGU9Zit0aGlzLl9jb21wdXRlQW5nbGUoZyxuLHApLGk9ci5n"
+    "ZXREYXRhVmlzaWJpbGl0eShnKT9oLmdldERpc3RhbmNlRnJvbUNlbnRlckZvclZhbHVlKHRoaXMuZ2V0UGFyc2VkKGcpLnIpOjA7"
+    "Zj1lLG8mJihsLmFuaW1hdGVTY2FsZSYmKGk9MCksbC5hbmltYXRlUm90YXRlJiYodD1lPXUpKTt2YXIgbT17eDpjLHk6ZCxpbm5l"
+    "clJhZGl1czowLG91dGVyUmFkaXVzOmksc3RhcnRBbmdsZTp0LGVuZEFuZ2xlOmUsb3B0aW9uczp0aGlzLnJlc29sdmVEYXRhRWxl"
+    "bWVudE9wdGlvbnMoZyxhLmFjdGl2ZT8iYWN0aXZlIjpuKX07dGhpcy51cGRhdGVFbGVtZW50KGEsZyxtLG4pfX1jb3VudFZpc2li"
+    "bGVFbGVtZW50cygpe2NvbnN0IHQ9dGhpcy5fY2FjaGVkTWV0YTtsZXQgaT0wO3JldHVybiB0LmRhdGEuZm9yRWFjaCgodCxlKT0+"
+    "eyFpc05hTih0aGlzLmdldFBhcnNlZChlKS5yKSYmdGhpcy5jaGFydC5nZXREYXRhVmlzaWJpbGl0eShlKSYmaSsrfSksaX1fY29t"
+    "cHV0ZUFuZ2xlKHQsZSxpKXtyZXR1cm4gdGhpcy5jaGFydC5nZXREYXRhVmlzaWJpbGl0eSh0KT9MKHRoaXMucmVzb2x2ZURhdGFF"
+    "bGVtZW50T3B0aW9ucyh0LGUpLmFuZ2xlfHxpKTowfX12YXIgYmE9T2JqZWN0LmZyZWV6ZSh7X19wcm90b19fOm51bGwsQmFyQ29u"
+    "dHJvbGxlcjpjbGFzcyBleHRlbmRzIE9ze3N0YXRpYyBpZD0iYmFyIjtzdGF0aWMgZGVmYXVsdHM9e2RhdGFzZXRFbGVtZW50VHlw"
+    "ZTohMSxkYXRhRWxlbWVudFR5cGU6ImJhciIsY2F0ZWdvcnlQZXJjZW50YWdlOi44LGJhclBlcmNlbnRhZ2U6LjksZ3JvdXBlZDoh"
+    "MCxhbmltYXRpb25zOntudW1iZXJzOnt0eXBlOiJudW1iZXIiLHByb3BlcnRpZXM6WyJ4IiwieSIsImJhc2UiLCJ3aWR0aCIsImhl"
+    "aWdodCJdfX19O3N0YXRpYyBvdmVycmlkZXM9e3NjYWxlczp7X2luZGV4Xzp7dHlwZToiY2F0ZWdvcnkiLG9mZnNldDohMCxncmlk"
+    "OntvZmZzZXQ6ITB9fSxfdmFsdWVfOnt0eXBlOiJsaW5lYXIiLGJlZ2luQXRaZXJvOiEwfX19O3BhcnNlUHJpbWl0aXZlRGF0YSh0"
+    "LGUsaSxzKXtyZXR1cm4gZGEodCxlLGkscyl9cGFyc2VBcnJheURhdGEodCxlLGkscyl7cmV0dXJuIGRhKHQsZSxpLHMpfXBhcnNl"
+    "T2JqZWN0RGF0YSh0LGUsaSxzKXtjb25zdHtpU2NhbGU6YSx2U2NhbGU6bn09dCx7eEF4aXNLZXk6bz0ieCIseUF4aXNLZXk6cj0i"
+    "eSJ9PXRoaXMuX3BhcnNpbmcsbD0ieCI9PT1hLmF4aXM/bzpyLGg9IngiPT09bi5heGlzP286cixjPVtdO2xldCBkLHUsZyxmO2Zv"
+    "cih1PShkPWkpK3M7ZDx1OysrZClmPWVbZF0sKGc9e30pW2EuYXhpc109YS5wYXJzZShtKGYsbCksZCksYy5wdXNoKGNhKG0oZixo"
+    "KSxnLG4sZCkpO3JldHVybiBjfXVwZGF0ZVJhbmdlRnJvbVBhcnNlZCh0LGUsaSxzKXtzdXBlci51cGRhdGVSYW5nZUZyb21QYXJz"
+    "ZWQodCxlLGkscyk7cz1pLl9jdXN0b207cyYmZT09PXRoaXMuX2NhY2hlZE1ldGEudlNjYWxlJiYodC5taW49TWF0aC5taW4odC5t"
+    "aW4scy5taW4pLHQubWF4PU1hdGgubWF4KHQubWF4LHMubWF4KSl9Z2V0TWF4T3ZlcmZsb3coKXtyZXR1cm4gMH1nZXRMYWJlbEFu"
+    "ZFZhbHVlKHQpe2NvbnN0IGU9dGhpcy5fY2FjaGVkTWV0YSx7aVNjYWxlOmksdlNjYWxlOnN9PWUsYT10aGlzLmdldFBhcnNlZCh0"
+    "KSxuPWEuX2N1c3RvbSxvPXVhKG4pPyJbIituLnN0YXJ0KyIsICIrbi5lbmQrIl0iOiIiK3MuZ2V0TGFiZWxGb3JWYWx1ZShhW3Mu"
+    "YXhpc10pO3JldHVybntsYWJlbDoiIitpLmdldExhYmVsRm9yVmFsdWUoYVtpLmF4aXNdKSx2YWx1ZTpvfX1pbml0aWFsaXplKCl7"
+    "dGhpcy5lbmFibGVPcHRpb25TaGFyaW5nPSEwLHN1cGVyLmluaXRpYWxpemUoKSx0aGlzLl9jYWNoZWRNZXRhLnN0YWNrPXRoaXMu"
+    "Z2V0RGF0YXNldCgpLnN0YWNrfXVwZGF0ZSh0KXt2YXIgZT10aGlzLl9jYWNoZWRNZXRhO3RoaXMudXBkYXRlRWxlbWVudHMoZS5k"
+    "YXRhLDAsZS5kYXRhLmxlbmd0aCx0KX11cGRhdGVFbGVtZW50cyhlLGkscyxhKXtjb25zdCBuPSJyZXNldCI9PT1hLHtpbmRleDpv"
+    "LF9jYWNoZWRNZXRhOnt2U2NhbGU6cn19PXRoaXMsbD1yLmdldEJhc2VQaXhlbCgpLGg9ci5pc0hvcml6b250YWwoKSxjPXRoaXMu"
+    "X2dldFJ1bGVyKCkse3NoYXJlZE9wdGlvbnM6ZCxpbmNsdWRlT3B0aW9uczp1fT10aGlzLl9nZXRTaGFyZWRPcHRpb25zKGksYSk7"
+    "Zm9yKGxldCB0PWk7dDxpK3M7dCsrKXtjb25zdCBpPXRoaXMuZ2V0UGFyc2VkKHQpLHM9bnx8UChpW3IuYXhpc10pP3tiYXNlOmws"
+    "aGVhZDpsfTp0aGlzLl9jYWxjdWxhdGVCYXJWYWx1ZVBpeGVscyh0KSxtPXRoaXMuX2NhbGN1bGF0ZUJhckluZGV4UGl4ZWxzKHQs"
+    "YyksYj0oaS5fc3RhY2tzfHx7fSlbci5heGlzXSx4PXtob3Jpem9udGFsOmgsYmFzZTpzLmJhc2UsZW5hYmxlQm9yZGVyUmFkaXVz"
+    "OiFifHx1YShpLl9jdXN0b20pfHxvPT09Yi5fdG9wfHxvPT09Yi5fYm90dG9tLHg6aD9zLmhlYWQ6bS5jZW50ZXIseTpoP20uY2Vu"
+    "dGVyOnMuaGVhZCxoZWlnaHQ6aD9tLnNpemU6TWF0aC5hYnMocy5zaXplKSx3aWR0aDpoP01hdGguYWJzKHMuc2l6ZSk6bS5zaXpl"
+    "fTt1JiYoeC5vcHRpb25zPWR8fHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyh0LGVbdF0uYWN0aXZlPyJhY3RpdmUiOmEp"
+    "KTt2YXIgZz14Lm9wdGlvbnN8fGVbdF0ub3B0aW9uczsoZnVuY3Rpb24obix0LGUsaSl7bGV0IHM9dC5ib3JkZXJTa2lwcGVkO2Nv"
+    "bnN0IGE9e307aWYoIXMpcmV0dXJuIG4uYm9yZGVyU2tpcHBlZD1hO2lmKCEwPT09cylyZXR1cm4gbi5ib3JkZXJTa2lwcGVkPXt0"
+    "b3A6ITAscmlnaHQ6ITAsYm90dG9tOiEwLGxlZnQ6ITB9O3ZhcntzdGFydDp0LGVuZDpvLHJldmVyc2U6cix0b3A6bCxib3R0b206"
+    "aH09ZnVuY3Rpb24oKXtsZXQgdCxlLGkscyxhO3JldHVybiBpPW4uaG9yaXpvbnRhbD8odD1uLmJhc2U+bi54LGU9ImxlZnQiLCJy"
+    "aWdodCIpOih0PW4uYmFzZTxuLnksZT0iYm90dG9tIiwidG9wIiksYT10PyhzPSJlbmQiLCJzdGFydCIpOihzPSJzdGFydCIsImVu"
+    "ZCIpLHtzdGFydDplLGVuZDppLHJldmVyc2U6dCx0b3A6cyxib3R0b206YX19KCk7Im1pZGRsZSI9PT1zJiZlJiYobi5lbmFibGVC"
+    "b3JkZXJSYWRpdXM9ITAscz0oZS5fdG9wfHwwKT09PWk/bDooZS5fYm90dG9tfHwwKT09PWk/aDooYVtnYShoLHQsbyxyKV09ITAs"
+    "bCkpLGFbZ2Eocyx0LG8scildPSEwLG4uYm9yZGVyU2tpcHBlZD1hfSkoeCxnLGIsbyksW2csZixwXT1beCxnWyJpbmZsYXRlQW1v"
+    "dW50Il0sYy5yYXRpb10sZy5pbmZsYXRlQW1vdW50PSJhdXRvIj09PWY/MT09PXA/LjMzOjA6Zix0aGlzLnVwZGF0ZUVsZW1lbnQo"
+    "ZVt0XSx0LHgsYSl9dmFyIGYscH1fZ2V0U3RhY2tzKHQsaSl7Y29uc3QgZT10aGlzLl9jYWNoZWRNZXRhWyJpU2NhbGUiXSxzPWUu"
+    "Z2V0TWF0Y2hpbmdWaXNpYmxlTWV0YXModGhpcy5fdHlwZSkuZmlsdGVyKHQ9PnQuY29udHJvbGxlci5vcHRpb25zLmdyb3VwZWQp"
+    "LGE9ZS5vcHRpb25zLnN0YWNrZWQsbj1bXTtmb3IoY29uc3QgZSBvZiBzKWlmKCh2b2lkIDA9PT1pfHwhKHQ9Pnt2YXIgZT10LmNv"
+    "bnRyb2xsZXIuZ2V0UGFyc2VkKGkpLGU9ZSYmZVt0LnZTY2FsZS5heGlzXTtpZihQKGUpfHxpc05hTihlKSlyZXR1cm4hMH0pKGUp"
+    "KSYmKCghMT09PWF8fC0xPT09bi5pbmRleE9mKGUuc3RhY2spfHx2b2lkIDA9PT1hJiZ2b2lkIDA9PT1lLnN0YWNrKSYmbi5wdXNo"
+    "KGUuc3RhY2spLGUuaW5kZXg9PT10KSlicmVhaztyZXR1cm4gbi5sZW5ndGh8fG4ucHVzaCh2b2lkIDApLG59X2dldFN0YWNrQ291"
+    "bnQodCl7cmV0dXJuIHRoaXMuX2dldFN0YWNrcyh2b2lkIDAsdCkubGVuZ3RofV9nZXRTdGFja0luZGV4KHQsZSxpKXtjb25zdCBz"
+    "PXRoaXMuX2dldFN0YWNrcyh0LGkpLGE9dm9pZCAwIT09ZT9zLmluZGV4T2YoZSk6LTE7cmV0dXJuLTE9PT1hP3MubGVuZ3RoLTE6"
+    "YX1fZ2V0UnVsZXIoKXtjb25zdCB0PXRoaXMub3B0aW9ucyxlPXRoaXMuX2NhY2hlZE1ldGEsaT1lLmlTY2FsZSxzPVtdO2xldCBh"
+    "LG47Zm9yKGE9MCxuPWUuZGF0YS5sZW5ndGg7YTxuOysrYSlzLnB1c2goaS5nZXRQaXhlbEZvclZhbHVlKHRoaXMuZ2V0UGFyc2Vk"
+    "KGEpW2kuYXhpc10sYSkpO3ZhciBvPXQuYmFyVGhpY2tuZXNzO3JldHVybnttaW46b3x8ZnVuY3Rpb24odCl7Y29uc3QgZT10LmlT"
+    "Y2FsZSxpPWZ1bmN0aW9uKHMsdCl7aWYoIXMuX2NhY2hlLiRiYXIpe2NvbnN0IGE9cy5nZXRNYXRjaGluZ1Zpc2libGVNZXRhcyh0"
+    "KTtsZXQgaT1bXTtmb3IobGV0IHQ9MCxlPWEubGVuZ3RoO3Q8ZTt0KyspaT1pLmNvbmNhdChhW3RdLmNvbnRyb2xsZXIuZ2V0QWxs"
+    "UGFyc2VkVmFsdWVzKHMpKTtzLl9jYWNoZS4kYmFyPXd0KGkuc29ydCgodCxlKT0+dC1lKSl9cmV0dXJuIHMuX2NhY2hlLiRiYXJ9"
+    "KGUsdC50eXBlKTtsZXQgcyxhLG4sbyxyPWUuX2xlbmd0aDt2YXIgbD0oKT0+ezMyNzY3IT09biYmLTMyNzY4IT09biYmKEcobykm"
+    "JihyPU1hdGgubWluKHIsTWF0aC5hYnMobi1vKXx8cikpLG89bil9O2ZvcihzPTAsYT1pLmxlbmd0aDtzPGE7KytzKW49ZS5nZXRQ"
+    "aXhlbEZvclZhbHVlKGlbc10pLGwoKTtmb3Iobz12b2lkIDAscz0wLGE9ZS50aWNrcy5sZW5ndGg7czxhOysrcyluPWUuZ2V0UGl4"
+    "ZWxGb3JUaWNrKHMpLGwoKTtyZXR1cm4gcn0oZSkscGl4ZWxzOnMsc3RhcnQ6aS5fc3RhcnRQaXhlbCxlbmQ6aS5fZW5kUGl4ZWws"
+    "c3RhY2tDb3VudDp0aGlzLl9nZXRTdGFja0NvdW50KCksc2NhbGU6aSxncm91cGVkOnQuZ3JvdXBlZCxyYXRpbzpvPzE6dC5jYXRl"
+    "Z29yeVBlcmNlbnRhZ2UqdC5iYXJQZXJjZW50YWdlfX1fY2FsY3VsYXRlQmFyVmFsdWVQaXhlbHModCl7Y29uc3R7X2NhY2hlZE1l"
+    "dGE6e3ZTY2FsZTplLF9zdGFja2VkOmksaW5kZXg6c30sb3B0aW9uczp7YmFzZTphLG1pbkJhckxlbmd0aDpufX09dGhpcyxvPWF8"
+    "fDAscj10aGlzLmdldFBhcnNlZCh0KSxsPXIuX2N1c3RvbSxoPXVhKGwpO2xldCBjLGQsdT1yW2UuYXhpc10sZz0wLGY9aT90aGlz"
+    "LmFwcGx5U3RhY2soZSxyLGkpOnU7ZiE9PXUmJihnPWYtdSxmPXUpLGgmJih1PWwuYmFyU3RhcnQsZj1sLmJhckVuZC1sLmJhclN0"
+    "YXJ0LDAhPT11JiZ5KHUpIT09eShsLmJhckVuZCkmJihnPTApLGcrPXUpO3ZhciBwLG0sYj1QKGEpfHxoP2c6YTtsZXQgeD1lLmdl"
+    "dFBpeGVsRm9yVmFsdWUoYik7aWYoYz10aGlzLmNoYXJ0LmdldERhdGFWaXNpYmlsaXR5KHQpP2UuZ2V0UGl4ZWxGb3JWYWx1ZShn"
+    "K2YpOngsZD1jLXgsTWF0aC5hYnMoZCk8bil7ZD0oYj1kLHA9ZSxtPW8sKDAhPT1iP3koYik6KHAuaXNIb3Jpem9udGFsKCk/MTot"
+    "MSkqKHAubWluPj1tPzE6LTEpKSpuKSx1PT09byYmKHgtPWQvMik7Y29uc3QgdD1lLmdldFBpeGVsRm9yRGVjaW1hbCgwKSxQPWUu"
+    "Z2V0UGl4ZWxGb3JEZWNpbWFsKDEpLGE9TWF0aC5taW4odCxQKSxsPU1hdGgubWF4KHQsUCk7eD1NYXRoLm1heChNYXRoLm1pbih4"
+    "LGwpLGEpLGM9eCtkLGkmJiFoJiYoci5fc3RhY2tzW2UuYXhpc10uX3Zpc3VhbFZhbHVlc1tzXT1lLmdldFZhbHVlRm9yUGl4ZWwo"
+    "YyktZS5nZXRWYWx1ZUZvclBpeGVsKHgpKX1pZih4PT09ZS5nZXRQaXhlbEZvclZhbHVlKG8pKXtjb25zdCB0PXkoZCkqZS5nZXRM"
+    "aW5lV2lkdGhGb3JWYWx1ZShvKS8yO3grPXQsZC09dH1yZXR1cm57c2l6ZTpkLGJhc2U6eCxoZWFkOmMsY2VudGVyOmMrZC8yfX1f"
+    "Y2FsY3VsYXRlQmFySW5kZXhQaXhlbHModCxlKXtjb25zdCBpPWUuc2NhbGUscz10aGlzLm9wdGlvbnMsYT1zLnNraXBOdWxsLG49"
+    "VChzLm1heEJhclRoaWNrbmVzcywxLzApO2xldCBvLHI7aWYoZS5ncm91cGVkKXtjb25zdCBpPWE/dGhpcy5fZ2V0U3RhY2tDb3Vu"
+    "dCh0KTplLnN0YWNrQ291bnQsVD0oImZsZXgiPT09cy5iYXJUaGlja25lc3M/ZnVuY3Rpb24odCxlLGkscyl7dmFyIGE9ZS5waXhl"
+    "bHMsbj1hW3RdO2xldCBvPTA8dD9hW3QtMV06bnVsbCxyPXQ8YS5sZW5ndGgtMT9hW3QrMV06bnVsbDthPWkuY2F0ZWdvcnlQZXJj"
+    "ZW50YWdlLG51bGw9PT1vJiYobz1uLShudWxsPT09cj9lLmVuZC1lLnN0YXJ0OnItbikpLG51bGw9PT1yJiYocj1uK24tbyksdD1u"
+    "LShuLU1hdGgubWluKG8scikpLzIqYTtyZXR1cm57Y2h1bms6TWF0aC5hYnMoci1vKS8yKmEvcyxyYXRpbzppLmJhclBlcmNlbnRh"
+    "Z2Usc3RhcnQ6dH19OmZ1bmN0aW9uKHQsZSxpLHMpe3ZhciBhPWkuYmFyVGhpY2tuZXNzO2xldCBuLG87cmV0dXJuIG89UChhKT8o"
+    "bj1lLm1pbippLmNhdGVnb3J5UGVyY2VudGFnZSxpLmJhclBlcmNlbnRhZ2UpOihuPWEqcywxKSx7Y2h1bms6bi9zLHJhdGlvOm8s"
+    "c3RhcnQ6ZS5waXhlbHNbdF0tbi8yfX0pKHQsZSxzLGkpLGw9dGhpcy5fZ2V0U3RhY2tJbmRleCh0aGlzLmluZGV4LHRoaXMuX2Nh"
+    "Y2hlZE1ldGEuc3RhY2ssYT90OnZvaWQgMCk7bz1ULnN0YXJ0K1QuY2h1bmsqbCtULmNodW5rLzIscj1NYXRoLm1pbihuLFQuY2h1"
+    "bmsqVC5yYXRpbyl9ZWxzZSBvPWkuZ2V0UGl4ZWxGb3JWYWx1ZSh0aGlzLmdldFBhcnNlZCh0KVtpLmF4aXNdLHQpLHI9TWF0aC5t"
+    "aW4obixlLm1pbiplLnJhdGlvKTtyZXR1cm57YmFzZTpvLXIvMixoZWFkOm8rci8yLGNlbnRlcjpvLHNpemU6cn19ZHJhdygpe2Nv"
+    "bnN0IHQ9dGhpcy5fY2FjaGVkTWV0YSxlPXQudlNjYWxlLGk9dC5kYXRhLHM9aS5sZW5ndGg7bGV0IGE9MDtmb3IoO2E8czsrK2Ep"
+    "bnVsbCE9PXRoaXMuZ2V0UGFyc2VkKGEpW2UuYXhpc10mJmlbYV0uZHJhdyh0aGlzLl9jdHgpfX0sQnViYmxlQ29udHJvbGxlcjpj"
+    "bGFzcyBleHRlbmRzIE9ze3N0YXRpYyBpZD0iYnViYmxlIjtzdGF0aWMgZGVmYXVsdHM9e2RhdGFzZXRFbGVtZW50VHlwZTohMSxk"
+    "YXRhRWxlbWVudFR5cGU6InBvaW50IixhbmltYXRpb25zOntudW1iZXJzOnt0eXBlOiJudW1iZXIiLHByb3BlcnRpZXM6WyJ4Iiwi"
+    "eSIsImJvcmRlcldpZHRoIiwicmFkaXVzIl19fX07c3RhdGljIG92ZXJyaWRlcz17c2NhbGVzOnt4Ont0eXBlOiJsaW5lYXIifSx5"
+    "Ont0eXBlOiJsaW5lYXIifX19O2luaXRpYWxpemUoKXt0aGlzLmVuYWJsZU9wdGlvblNoYXJpbmc9ITAsc3VwZXIuaW5pdGlhbGl6"
+    "ZSgpfXBhcnNlUHJpbWl0aXZlRGF0YSh0LGUsaSxzKXtjb25zdCBhPXN1cGVyLnBhcnNlUHJpbWl0aXZlRGF0YSh0LGUsaSxzKTtm"
+    "b3IobGV0IHQ9MDt0PGEubGVuZ3RoO3QrKylhW3RdLl9jdXN0b209dGhpcy5yZXNvbHZlRGF0YUVsZW1lbnRPcHRpb25zKHQraSku"
+    "cmFkaXVzO3JldHVybiBhfXBhcnNlQXJyYXlEYXRhKHQsZSxpLHMpe2NvbnN0IGE9c3VwZXIucGFyc2VBcnJheURhdGEodCxlLGks"
+    "cyk7Zm9yKGxldCB0PTA7dDxhLmxlbmd0aDt0Kyspe2NvbnN0IHM9ZVtpK3RdO2FbdF0uX2N1c3RvbT1UKHNbMl0sdGhpcy5yZXNv"
+    "bHZlRGF0YUVsZW1lbnRPcHRpb25zKHQraSkucmFkaXVzKX1yZXR1cm4gYX1wYXJzZU9iamVjdERhdGEodCxlLGkscyl7Y29uc3Qg"
+    "YT1zdXBlci5wYXJzZU9iamVjdERhdGEodCxlLGkscyk7Zm9yKGxldCB0PTA7dDxhLmxlbmd0aDt0Kyspe2NvbnN0IHM9ZVtpK3Rd"
+    "O2FbdF0uX2N1c3RvbT1UKHMmJnMuciYmK3Mucix0aGlzLnJlc29sdmVEYXRhRWxlbWVudE9wdGlvbnModCtpKS5yYWRpdXMpfXJl"
+    "dHVybiBhfWdldE1heE92ZXJmbG93KCl7Y29uc3QgZT10aGlzLl9jYWNoZWRNZXRhLmRhdGE7bGV0IGk9MDtmb3IobGV0IHQ9ZS5s"
+    "ZW5ndGgtMTswPD10Oy0tdClpPU1hdGgubWF4KGksZVt0XS5zaXplKHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyh0KSkv"
+    "Mik7cmV0dXJuIDA8aSYmaX1nZXRMYWJlbEFuZFZhbHVlKHQpe2NvbnN0IGU9dGhpcy5fY2FjaGVkTWV0YSxpPXRoaXMuY2hhcnQu"
+    "ZGF0YS5sYWJlbHN8fFtdLHt4U2NhbGU6cyx5U2NhbGU6YX09ZSxuPXRoaXMuZ2V0UGFyc2VkKHQpLG89cy5nZXRMYWJlbEZvclZh"
+    "bHVlKG4ueCkscj1hLmdldExhYmVsRm9yVmFsdWUobi55KSxsPW4uX2N1c3RvbTtyZXR1cm57bGFiZWw6aVt0XXx8IiIsdmFsdWU6"
+    "IigiK28rIiwgIityKyhsPyIsICIrbDoiIikrIikifX11cGRhdGUodCl7dmFyIGU9dGhpcy5fY2FjaGVkTWV0YS5kYXRhO3RoaXMu"
+    "dXBkYXRlRWxlbWVudHMoZSwwLGUubGVuZ3RoLHQpfXVwZGF0ZUVsZW1lbnRzKGUsaSxzLGEpe2NvbnN0IG49InJlc2V0Ij09PWEs"
+    "e2lTY2FsZTpvLHZTY2FsZTpyfT10aGlzLl9jYWNoZWRNZXRhLHtzaGFyZWRPcHRpb25zOmwsaW5jbHVkZU9wdGlvbnM6aH09dGhp"
+    "cy5fZ2V0U2hhcmVkT3B0aW9ucyhpLGEpLGM9by5heGlzLGQ9ci5heGlzO2ZvcihsZXQgdD1pO3Q8aStzO3QrKyl7Y29uc3QgaT1l"
+    "W3RdLHM9IW4mJnRoaXMuZ2V0UGFyc2VkKHQpLHU9e30sZz11W2NdPW4/by5nZXRQaXhlbEZvckRlY2ltYWwoLjUpOm8uZ2V0UGl4"
+    "ZWxGb3JWYWx1ZShzW2NdKSxmPXVbZF09bj9yLmdldEJhc2VQaXhlbCgpOnIuZ2V0UGl4ZWxGb3JWYWx1ZShzW2RdKTt1LnNraXA9"
+    "aXNOYU4oZyl8fGlzTmFOKGYpLGgmJih1Lm9wdGlvbnM9bHx8dGhpcy5yZXNvbHZlRGF0YUVsZW1lbnRPcHRpb25zKHQsaS5hY3Rp"
+    "dmU/ImFjdGl2ZSI6YSksbiYmKHUub3B0aW9ucy5yYWRpdXM9MCkpLHRoaXMudXBkYXRlRWxlbWVudChpLHQsdSxhKX19cmVzb2x2"
+    "ZURhdGFFbGVtZW50T3B0aW9ucyh0LGUpe3ZhciBpPXRoaXMuZ2V0UGFyc2VkKHQpO2xldCBzPXN1cGVyLnJlc29sdmVEYXRhRWxl"
+    "bWVudE9wdGlvbnModCxlKTt0PShzPXMuJHNoYXJlZD9PYmplY3QuYXNzaWduKHt9LHMseyRzaGFyZWQ6ITF9KTpzKS5yYWRpdXM7"
+    "cmV0dXJuImFjdGl2ZSIhPT1lJiYocy5yYWRpdXM9MCkscy5yYWRpdXMrPVQoaSYmaS5fY3VzdG9tLHQpLHN9fSxEb3VnaG51dENv"
+    "bnRyb2xsZXI6cGEsTGluZUNvbnRyb2xsZXI6Y2xhc3MgZXh0ZW5kcyBPc3tzdGF0aWMgaWQ9ImxpbmUiO3N0YXRpYyBkZWZhdWx0"
+    "cz17ZGF0YXNldEVsZW1lbnRUeXBlOiJsaW5lIixkYXRhRWxlbWVudFR5cGU6InBvaW50IixzaG93TGluZTohMCxzcGFuR2Fwczoh"
+    "MX07c3RhdGljIG92ZXJyaWRlcz17c2NhbGVzOntfaW5kZXhfOnt0eXBlOiJjYXRlZ29yeSJ9LF92YWx1ZV86e3R5cGU6ImxpbmVh"
+    "ciJ9fX07aW5pdGlhbGl6ZSgpe3RoaXMuZW5hYmxlT3B0aW9uU2hhcmluZz0hMCx0aGlzLnN1cHBvcnRzRGVjaW1hdGlvbj0hMCxz"
+    "dXBlci5pbml0aWFsaXplKCl9dXBkYXRlKHQpe2NvbnN0IGU9dGhpcy5fY2FjaGVkTWV0YSx7ZGF0YXNldDppLGRhdGE6cz1bXSxf"
+    "ZGF0YXNldDphfT1lLG49dGhpcy5jaGFydC5fYW5pbWF0aW9uc0Rpc2FibGVkO2xldHtzdGFydDpvLGNvdW50OnJ9PU90KGUscyxu"
+    "KTt0aGlzLl9kcmF3U3RhcnQ9byx0aGlzLl9kcmF3Q291bnQ9cixBdChlKSYmKG89MCxyPXMubGVuZ3RoKSxpLl9jaGFydD10aGlz"
+    "LmNoYXJ0LGkuX2RhdGFzZXRJbmRleD10aGlzLmluZGV4LGkuX2RlY2ltYXRlZD0hIWEuX2RlY2ltYXRlZCxpLnBvaW50cz1zO2Nv"
+    "bnN0IGw9dGhpcy5yZXNvbHZlRGF0YXNldEVsZW1lbnRPcHRpb25zKHQpO3RoaXMub3B0aW9ucy5zaG93TGluZXx8KGwuYm9yZGVy"
+    "V2lkdGg9MCksbC5zZWdtZW50PXRoaXMub3B0aW9ucy5zZWdtZW50LHRoaXMudXBkYXRlRWxlbWVudChpLHZvaWQgMCx7YW5pbWF0"
+    "ZWQ6IW4sb3B0aW9uczpsfSx0KSx0aGlzLnVwZGF0ZUVsZW1lbnRzKHMsbyxyLHQpfXVwZGF0ZUVsZW1lbnRzKGUsaSx0LHMpe2Nv"
+    "bnN0IGE9InJlc2V0Ij09PXMse2lTY2FsZTpuLHZTY2FsZTpvLF9zdGFja2VkOnIsX2RhdGFzZXQ6bH09dGhpcy5fY2FjaGVkTWV0"
+    "YSx7c2hhcmVkT3B0aW9uczpoLGluY2x1ZGVPcHRpb25zOmN9PXRoaXMuX2dldFNoYXJlZE9wdGlvbnMoaSxzKSxkPW4uYXhpcyx1"
+    "PW8uYXhpcyx7c3BhbkdhcHM6ZyxzZWdtZW50OmZ9PXRoaXMub3B0aW9ucyxwPXJ0KGcpP2c6TnVtYmVyLlBPU0lUSVZFX0lORklO"
+    "SVRZLG09dGhpcy5jaGFydC5fYW5pbWF0aW9uc0Rpc2FibGVkfHxhfHwibm9uZSI9PT1zLGI9aSt0LHg9ZS5sZW5ndGg7bGV0IHY9"
+    "MDxpJiZ0aGlzLmdldFBhcnNlZChpLTEpO2ZvcihsZXQgdD0wO3Q8eDsrK3Qpe2NvbnN0IGc9ZVt0XSx4PW0/Zzp7fTt2YXIgXyx5"
+    "LE0sdzt0PGl8fHQ+PWI/eC5za2lwPSEwOih5PVAoKF89dGhpcy5nZXRQYXJzZWQodCkpW3VdKSxNPXhbZF09bi5nZXRQaXhlbEZv"
+    "clZhbHVlKF9bZF0sdCksdz14W3VdPWF8fHk/by5nZXRCYXNlUGl4ZWwoKTpvLmdldFBpeGVsRm9yVmFsdWUocj90aGlzLmFwcGx5"
+    "U3RhY2sobyxfLHIpOl9bdV0sdCkseC5za2lwPWlzTmFOKE0pfHxpc05hTih3KXx8eSx4LnN0b3A9MDx0JiZNYXRoLmFicyhfW2Rd"
+    "LXZbZF0pPnAsZiYmKHgucGFyc2VkPV8seC5yYXc9bC5kYXRhW3RdKSxjJiYoeC5vcHRpb25zPWh8fHRoaXMucmVzb2x2ZURhdGFF"
+    "bGVtZW50T3B0aW9ucyh0LGcuYWN0aXZlPyJhY3RpdmUiOnMpKSxtfHx0aGlzLnVwZGF0ZUVsZW1lbnQoZyx0LHgscyksdj1fKX19"
+    "Z2V0TWF4T3ZlcmZsb3coKXtjb25zdCB0PXRoaXMuX2NhY2hlZE1ldGEsZT10LmRhdGFzZXQsaT1lLm9wdGlvbnMmJmUub3B0aW9u"
+    "cy5ib3JkZXJXaWR0aHx8MCxzPXQuZGF0YXx8W107aWYoIXMubGVuZ3RoKXJldHVybiBpO3ZhciBhPXNbMF0uc2l6ZSh0aGlzLnJl"
+    "c29sdmVEYXRhRWxlbWVudE9wdGlvbnMoMCkpLG49c1tzLmxlbmd0aC0xXS5zaXplKHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0"
+    "aW9ucyhzLmxlbmd0aC0xKSk7cmV0dXJuIE1hdGgubWF4KGksYSxuKS8yfWRyYXcoKXtjb25zdCB0PXRoaXMuX2NhY2hlZE1ldGE7"
+    "dC5kYXRhc2V0LnVwZGF0ZUNvbnRyb2xQb2ludHModGhpcy5jaGFydC5jaGFydEFyZWEsdC5pU2NhbGUuYXhpcyksc3VwZXIuZHJh"
+    "dygpfX0sUGllQ29udHJvbGxlcjpjbGFzcyBleHRlbmRzIHBhe3N0YXRpYyBpZD0icGllIjtzdGF0aWMgZGVmYXVsdHM9e2N1dG91"
+    "dDowLHJvdGF0aW9uOjAsY2lyY3VtZmVyZW5jZTozNjAscmFkaXVzOiIxMDAlIn19LFBvbGFyQXJlYUNvbnRyb2xsZXI6bWEsUmFk"
+    "YXJDb250cm9sbGVyOmNsYXNzIGV4dGVuZHMgT3N7c3RhdGljIGlkPSJyYWRhciI7c3RhdGljIGRlZmF1bHRzPXtkYXRhc2V0RWxl"
+    "bWVudFR5cGU6ImxpbmUiLGRhdGFFbGVtZW50VHlwZToicG9pbnQiLGluZGV4QXhpczoiciIsc2hvd0xpbmU6ITAsZWxlbWVudHM6"
+    "e2xpbmU6e2ZpbGw6InN0YXJ0In19fTtzdGF0aWMgb3ZlcnJpZGVzPXthc3BlY3RSYXRpbzoxLHNjYWxlczp7cjp7dHlwZToicmFk"
+    "aWFsTGluZWFyIn19fTtnZXRMYWJlbEFuZFZhbHVlKHQpe2NvbnN0IGU9dGhpcy5fY2FjaGVkTWV0YS52U2NhbGUsaT10aGlzLmdl"
+    "dFBhcnNlZCh0KTtyZXR1cm57bGFiZWw6ZS5nZXRMYWJlbHMoKVt0XSx2YWx1ZToiIitlLmdldExhYmVsRm9yVmFsdWUoaVtlLmF4"
+    "aXNdKX19cGFyc2VPYmplY3REYXRhKHQsZSxpLHMpe3JldHVybiBpaS5iaW5kKHRoaXMpKHQsZSxpLHMpfXVwZGF0ZSh0KXtjb25z"
+    "dCBlPXRoaXMuX2NhY2hlZE1ldGEsaT1lLmRhdGFzZXQscz1lLmRhdGF8fFtdLGE9ZS5pU2NhbGUuZ2V0TGFiZWxzKCk7aWYoaS5w"
+    "b2ludHM9cywicmVzaXplIiE9PXQpe2NvbnN0IGU9dGhpcy5yZXNvbHZlRGF0YXNldEVsZW1lbnRPcHRpb25zKHQpO3RoaXMub3B0"
+    "aW9ucy5zaG93TGluZXx8KGUuYm9yZGVyV2lkdGg9MCk7dmFyIG49e19sb29wOiEwLF9mdWxsTG9vcDphLmxlbmd0aD09PXMubGVu"
+    "Z3RoLG9wdGlvbnM6ZX07dGhpcy51cGRhdGVFbGVtZW50KGksdm9pZCAwLG4sdCl9dGhpcy51cGRhdGVFbGVtZW50cyhzLDAscy5s"
+    "ZW5ndGgsdCl9dXBkYXRlRWxlbWVudHMoZSxpLHMsYSl7Y29uc3Qgbj10aGlzLl9jYWNoZWRNZXRhLnJTY2FsZSxvPSJyZXNldCI9"
+    "PT1hO2ZvcihsZXQgdD1pO3Q8aStzO3QrKyl7Y29uc3QgaT1lW3RdLHM9dGhpcy5yZXNvbHZlRGF0YUVsZW1lbnRPcHRpb25zKHQs"
+    "aS5hY3RpdmU/ImFjdGl2ZSI6YSkscj1uLmdldFBvaW50UG9zaXRpb25Gb3JWYWx1ZSh0LHRoaXMuZ2V0UGFyc2VkKHQpLnIpLGw9"
+    "bz9uLnhDZW50ZXI6ci54LGg9bz9uLnlDZW50ZXI6ci55LGM9e3g6bCx5OmgsYW5nbGU6ci5hbmdsZSxza2lwOmlzTmFOKGwpfHxp"
+    "c05hTihoKSxvcHRpb25zOnN9O3RoaXMudXBkYXRlRWxlbWVudChpLHQsYyxhKX19fSxTY2F0dGVyQ29udHJvbGxlcjpjbGFzcyBl"
+    "eHRlbmRzIE9ze3N0YXRpYyBpZD0ic2NhdHRlciI7c3RhdGljIGRlZmF1bHRzPXtkYXRhc2V0RWxlbWVudFR5cGU6ITEsZGF0YUVs"
+    "ZW1lbnRUeXBlOiJwb2ludCIsc2hvd0xpbmU6ITEsZmlsbDohMX07c3RhdGljIG92ZXJyaWRlcz17aW50ZXJhY3Rpb246e21vZGU6"
+    "InBvaW50In0sc2NhbGVzOnt4Ont0eXBlOiJsaW5lYXIifSx5Ont0eXBlOiJsaW5lYXIifX19O2dldExhYmVsQW5kVmFsdWUodCl7"
+    "Y29uc3QgZT10aGlzLl9jYWNoZWRNZXRhLGk9dGhpcy5jaGFydC5kYXRhLmxhYmVsc3x8W10se3hTY2FsZTpzLHlTY2FsZTphfT1l"
+    "LG49dGhpcy5nZXRQYXJzZWQodCksbz1zLmdldExhYmVsRm9yVmFsdWUobi54KSxyPWEuZ2V0TGFiZWxGb3JWYWx1ZShuLnkpO3Jl"
+    "dHVybntsYWJlbDppW3RdfHwiIix2YWx1ZToiKCIrbysiLCAiK3IrIikifX11cGRhdGUodCl7Y29uc3QgZT10aGlzLl9jYWNoZWRN"
+    "ZXRhLHtkYXRhOmk9W119PWUscz10aGlzLmNoYXJ0Ll9hbmltYXRpb25zRGlzYWJsZWQ7bGV0e3N0YXJ0OmEsY291bnQ6bn09T3Qo"
+    "ZSxpLHMpO2lmKHRoaXMuX2RyYXdTdGFydD1hLHRoaXMuX2RyYXdDb3VudD1uLEF0KGUpJiYoYT0wLG49aS5sZW5ndGgpLHRoaXMu"
+    "b3B0aW9ucy5zaG93TGluZSl7dGhpcy5kYXRhc2V0RWxlbWVudFR5cGV8fHRoaXMuYWRkRWxlbWVudHMoKTtjb25zdHtkYXRhc2V0"
+    "OmEsX2RhdGFzZXQ6bn09ZSxvPShhLl9jaGFydD10aGlzLmNoYXJ0LGEuX2RhdGFzZXRJbmRleD10aGlzLmluZGV4LGEuX2RlY2lt"
+    "YXRlZD0hIW4uX2RlY2ltYXRlZCxhLnBvaW50cz1pLHRoaXMucmVzb2x2ZURhdGFzZXRFbGVtZW50T3B0aW9ucyh0KSk7by5zZWdt"
+    "ZW50PXRoaXMub3B0aW9ucy5zZWdtZW50LHRoaXMudXBkYXRlRWxlbWVudChhLHZvaWQgMCx7YW5pbWF0ZWQ6IXMsb3B0aW9uczpv"
+    "fSx0KX1lbHNlIHRoaXMuZGF0YXNldEVsZW1lbnRUeXBlJiYoZGVsZXRlIGUuZGF0YXNldCx0aGlzLmRhdGFzZXRFbGVtZW50VHlw"
+    "ZT0hMSk7dGhpcy51cGRhdGVFbGVtZW50cyhpLGEsbix0KX1hZGRFbGVtZW50cygpe3ZhciB0PXRoaXMub3B0aW9uc1sic2hvd0xp"
+    "bmUiXTshdGhpcy5kYXRhc2V0RWxlbWVudFR5cGUmJnQmJih0aGlzLmRhdGFzZXRFbGVtZW50VHlwZT10aGlzLmNoYXJ0LnJlZ2lz"
+    "dHJ5LmdldEVsZW1lbnQoImxpbmUiKSksc3VwZXIuYWRkRWxlbWVudHMoKX11cGRhdGVFbGVtZW50cyhlLGkscyxhKXtjb25zdCBu"
+    "PSJyZXNldCI9PT1hLHtpU2NhbGU6byx2U2NhbGU6cixfc3RhY2tlZDpsLF9kYXRhc2V0Omh9PXRoaXMuX2NhY2hlZE1ldGEsdD10"
+    "aGlzLnJlc29sdmVEYXRhRWxlbWVudE9wdGlvbnMoaSxhKSxjPXRoaXMuZ2V0U2hhcmVkT3B0aW9ucyh0KSxkPXRoaXMuaW5jbHVk"
+    "ZU9wdGlvbnMoYSxjKSx1PW8uYXhpcyxnPXIuYXhpcyx7c3BhbkdhcHM6ZixzZWdtZW50OnB9PXRoaXMub3B0aW9ucyxtPXJ0KGYp"
+    "P2Y6TnVtYmVyLlBPU0lUSVZFX0lORklOSVRZLGI9dGhpcy5jaGFydC5fYW5pbWF0aW9uc0Rpc2FibGVkfHxufHwibm9uZSI9PT1h"
+    "O2xldCB4PTA8aSYmdGhpcy5nZXRQYXJzZWQoaS0xKTtmb3IobGV0IHQ9aTt0PGkrczsrK3Qpe2NvbnN0IGk9ZVt0XSxzPXRoaXMu"
+    "Z2V0UGFyc2VkKHQpLGY9Yj9pOnt9LHY9UChzW2ddKSxfPWZbdV09by5nZXRQaXhlbEZvclZhbHVlKHNbdV0sdCkseT1mW2ddPW58"
+    "fHY/ci5nZXRCYXNlUGl4ZWwoKTpyLmdldFBpeGVsRm9yVmFsdWUobD90aGlzLmFwcGx5U3RhY2socixzLGwpOnNbZ10sdCk7Zi5z"
+    "a2lwPWlzTmFOKF8pfHxpc05hTih5KXx8dixmLnN0b3A9MDx0JiZNYXRoLmFicyhzW3VdLXhbdV0pPm0scCYmKGYucGFyc2VkPXMs"
+    "Zi5yYXc9aC5kYXRhW3RdKSxkJiYoZi5vcHRpb25zPWN8fHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0aW9ucyh0LGkuYWN0aXZl"
+    "PyJhY3RpdmUiOmEpKSxifHx0aGlzLnVwZGF0ZUVsZW1lbnQoaSx0LGYsYSkseD1zfXRoaXMudXBkYXRlU2hhcmVkT3B0aW9ucyhj"
+    "LGEsdCl9Z2V0TWF4T3ZlcmZsb3coKXtjb25zdCB0PXRoaXMuX2NhY2hlZE1ldGEsaT10LmRhdGF8fFtdO2lmKCF0aGlzLm9wdGlv"
+    "bnMuc2hvd0xpbmUpe2xldCBlPTA7Zm9yKGxldCB0PWkubGVuZ3RoLTE7MDw9dDstLXQpZT1NYXRoLm1heChlLGlbdF0uc2l6ZSh0"
+    "aGlzLnJlc29sdmVEYXRhRWxlbWVudE9wdGlvbnModCkpLzIpO3JldHVybiAwPGUmJmV9dmFyIGU9dC5kYXRhc2V0LGU9ZS5vcHRp"
+    "b25zJiZlLm9wdGlvbnMuYm9yZGVyV2lkdGh8fDA7aWYoIWkubGVuZ3RoKXJldHVybiBlO3ZhciBzPWlbMF0uc2l6ZSh0aGlzLnJl"
+    "c29sdmVEYXRhRWxlbWVudE9wdGlvbnMoMCkpLGE9aVtpLmxlbmd0aC0xXS5zaXplKHRoaXMucmVzb2x2ZURhdGFFbGVtZW50T3B0"
+    "aW9ucyhpLmxlbmd0aC0xKSk7cmV0dXJuIE1hdGgubWF4KGUscyxhKS8yfX19KTtmdW5jdGlvbiB4YSh0LGUsaSxzKXtyZXR1cm57"
+    "eDppK3QqTWF0aC5jb3MoZSkseTpzK3QqTWF0aC5zaW4oZSl9fWZ1bmN0aW9uIHZhKHQsZSxpLHMsYSxuKXt2YXJ7eDpvLHk6cixz"
+    "dGFydEFuZ2xlOmwscGl4ZWxNYXJnaW46aCxpbm5lclJhZGl1czpjfT1lLGQ9TWF0aC5tYXgoZS5vdXRlclJhZGl1cytzK2ktaCww"
+    "KSxoPTA8Yz9jK3MraStoOjA7bGV0IHU9MDt2YXIgZz1hLWw7aWYocyl7Y29uc3QgdD0oKDA8Yz9jLXM6MCkrKDA8ZD9kLXM6MCkp"
+    "LzI7dT0oZy0oMCE9dD9nKnQvKHQrcyk6ZykpLzJ9dmFyIGM9KGctTWF0aC5tYXgoLjAwMSxnKmQtaS9TKS9kKS8yLGc9bCtjK3Us"
+    "bD1hLWMtdSx7b3V0ZXJTdGFydDpjLG91dGVyRW5kOmYsaW5uZXJTdGFydDpwLGlubmVyRW5kOm19PWZ1bmN0aW9uKHQsZSxpLHMp"
+    "e3Q9eWkodC5vcHRpb25zLmJvcmRlclJhZGl1cyxbIm91dGVyU3RhcnQiLCJvdXRlckVuZCIsImlubmVyU3RhcnQiLCJpbm5lckVu"
+    "ZCJdKTtjb25zdCBhPShpLWUpLzIsbj1NYXRoLm1pbihhLHMqZS8yKSxvPXQ9Pnt2YXIgZT0oaS1NYXRoLm1pbihhLHQpKSpzLzI7"
+    "cmV0dXJuIEModCwwLE1hdGgubWluKGEsZSkpfTtyZXR1cm57b3V0ZXJTdGFydDpvKHQub3V0ZXJTdGFydCksb3V0ZXJFbmQ6byh0"
+    "Lm91dGVyRW5kKSxpbm5lclN0YXJ0OkModC5pbm5lclN0YXJ0LDAsbiksaW5uZXJFbmQ6Qyh0LmlubmVyRW5kLDAsbil9fShlLGgs"
+    "ZCxsLWcpLGI9ZC1jLHg9ZC1mLHY9ZytjL2IsXz1sLWYveCx5PWgrcCxNPWgrbSx3PWcrcC95LGs9bC1tL007aWYodC5iZWdpblBh"
+    "dGgoKSxuKXtjb25zdCBlPSh2K18pLzI7aWYodC5hcmMobyxyLGQsdixlKSx0LmFyYyhvLHIsZCxlLF8pLDA8Zil7Y29uc3QgZT14"
+    "YSh4LF8sbyxyKTt0LmFyYyhlLngsZS55LGYsXyxsK0QpfWNvbnN0IGk9eGEoTSxsLG8scik7aWYodC5saW5lVG8oaS54LGkueSks"
+    "MDxtKXtjb25zdCBlPXhhKE0sayxvLHIpO3QuYXJjKGUueCxlLnksbSxsK0QsaytNYXRoLlBJKX1jb25zdCBzPShsLW0vaCsoZytw"
+    "L2gpKS8yO2lmKHQuYXJjKG8scixoLGwtbS9oLHMsITApLHQuYXJjKG8scixoLHMsZytwL2gsITApLDA8cCl7Y29uc3QgZT14YSh5"
+    "LHcsbyxyKTt0LmFyYyhlLngsZS55LHAsdytNYXRoLlBJLGctRCl9Y29uc3QgYT14YShiLGcsbyxyKTtpZih0LmxpbmVUbyhhLngs"
+    "YS55KSwwPGMpe2NvbnN0IGU9eGEoYix2LG8scik7dC5hcmMoZS54LGUueSxjLGctRCx2KX19ZWxzZXt0Lm1vdmVUbyhvLHIpO2Nv"
+    "bnN0IGU9TWF0aC5jb3ModikqZCtvLGk9TWF0aC5zaW4odikqZCtyLHM9KHQubGluZVRvKGUsaSksTWF0aC5jb3MoXykqZCtvKSxh"
+    "PU1hdGguc2luKF8pKmQrcjt0LmxpbmVUbyhzLGEpfXQuY2xvc2VQYXRoKCl9ZnVuY3Rpb24gX2EodCxlLGk9ZSl7dC5saW5lQ2Fw"
+    "PVQoaS5ib3JkZXJDYXBTdHlsZSxlLmJvcmRlckNhcFN0eWxlKSx0LnNldExpbmVEYXNoKFQoaS5ib3JkZXJEYXNoLGUuYm9yZGVy"
+    "RGFzaCkpLHQubGluZURhc2hPZmZzZXQ9VChpLmJvcmRlckRhc2hPZmZzZXQsZS5ib3JkZXJEYXNoT2Zmc2V0KSx0LmxpbmVKb2lu"
+    "PVQoaS5ib3JkZXJKb2luU3R5bGUsZS5ib3JkZXJKb2luU3R5bGUpLHQubGluZVdpZHRoPVQoaS5ib3JkZXJXaWR0aCxlLmJvcmRl"
+    "cldpZHRoKSx0LnN0cm9rZVN0eWxlPVQoaS5ib3JkZXJDb2xvcixlLmJvcmRlckNvbG9yKX1mdW5jdGlvbiB5YSh0LGUsaSl7dC5s"
+    "aW5lVG8oaS54LGkueSl9ZnVuY3Rpb24gTWEodCxlLGk9e30pe3ZhciB0PXQubGVuZ3RoLHtzdGFydDppPTAsZW5kOnM9dC0xfT1p"
+    "LHtzdGFydDphLGVuZDpufT1lLG89TWF0aC5tYXgoaSxhKSxyPU1hdGgubWluKHMsbik7cmV0dXJue2NvdW50OnQsc3RhcnQ6byxs"
+    "b29wOmUubG9vcCxpbGVuOnI8byYmIShpPGEmJnM8YXx8bjxpJiZuPHMpP3Qrci1vOnItb319ZnVuY3Rpb24gd2EodCxlLGkscyl7"
+    "Y29uc3R7cG9pbnRzOmEsb3B0aW9uczpufT1lLHtjb3VudDpvLHN0YXJ0OnIsbG9vcDpsLGlsZW46aH09TWEoYSxpLHMpLGM9bi5z"
+    "dGVwcGVkP1dlOm4udGVuc2lvbnx8Im1vbm90b25lIj09PW4uY3ViaWNJbnRlcnBvbGF0aW9uTW9kZT9OZTp5YTtsZXQgZCx1LGcs"
+    "e21vdmU6Zj0hMCxyZXZlcnNlOnB9PXN8fHt9O2ZvcihkPTA7ZDw9aDsrK2QpKHU9YVsocisocD9oLWQ6ZCkpJW9dKS5za2lwfHwo"
+    "Zj8odC5tb3ZlVG8odS54LHUueSksZj0hMSk6Yyh0LGcsdSxwLG4uc3RlcHBlZCksZz11KTtyZXR1cm4gbCYmKHU9YVsocisocD9o"
+    "OjApKSVvXSxjKHQsZyx1LHAsbi5zdGVwcGVkKSksISFsfWZ1bmN0aW9uIGthKHQsZSxpLHMpe2NvbnN0IGE9ZS5wb2ludHMse2Nv"
+    "dW50Om4sc3RhcnQ6byxpbGVuOnJ9PU1hKGEsaSxzKSx7bW92ZTpsPSEwLHJldmVyc2U6aH09c3x8e307bGV0IGMsZCx1LGcsZixw"
+    "LG09MCxiPTA7dmFyIHg9dD0+KG8rKGg/ci10OnQpKSVuLHY9KCk9PntnIT09ZiYmKHQubGluZVRvKG0sZiksdC5saW5lVG8obSxn"
+    "KSx0LmxpbmVUbyhtLHApKX07Zm9yKGwmJihkPWFbeCgwKV0sdC5tb3ZlVG8oZC54LGQueSkpLGM9MDtjPD1yOysrYylpZighKGQ9"
+    "YVt4KGMpXSkuc2tpcCl7Y29uc3QgZT1kLngsaT1kLnkscz0wfGU7cz09PXU/KGk8Zz9nPWk6aT5mJiYoZj1pKSxtPShiKm0rZSkv"
+    "KytiKToodigpLHQubGluZVRvKGUsaSksdT1zLGI9MCxnPWY9aSkscD1pfXYoKX1mdW5jdGlvbiBTYSh0KXt2YXIgZT10Lm9wdGlv"
+    "bnMsaT1lLmJvcmRlckRhc2gmJmUuYm9yZGVyRGFzaC5sZW5ndGg7cmV0dXJuIHQuX2RlY2ltYXRlZHx8dC5fbG9vcHx8ZS50ZW5z"
+    "aW9ufHwibW9ub3RvbmUiPT09ZS5jdWJpY0ludGVycG9sYXRpb25Nb2RlfHxlLnN0ZXBwZWR8fGk/d2E6a2F9Y29uc3QgUGE9ImZ1"
+    "bmN0aW9uIj09dHlwZW9mIFBhdGgyRDtjbGFzcyBEYSBleHRlbmRzIGV7c3RhdGljIGlkPSJsaW5lIjtzdGF0aWMgZGVmYXVsdHM9"
+    "e2JvcmRlckNhcFN0eWxlOiJidXR0Iixib3JkZXJEYXNoOltdLGJvcmRlckRhc2hPZmZzZXQ6MCxib3JkZXJKb2luU3R5bGU6Im1p"
+    "dGVyIixib3JkZXJXaWR0aDozLGNhcEJlemllclBvaW50czohMCxjdWJpY0ludGVycG9sYXRpb25Nb2RlOiJkZWZhdWx0IixmaWxs"
+    "OiExLHNwYW5HYXBzOiExLHN0ZXBwZWQ6ITEsdGVuc2lvbjowfTtzdGF0aWMgZGVmYXVsdFJvdXRlcz17YmFja2dyb3VuZENvbG9y"
+    "OiJiYWNrZ3JvdW5kQ29sb3IiLGJvcmRlckNvbG9yOiJib3JkZXJDb2xvciJ9O3N0YXRpYyBkZXNjcmlwdG9ycz17X3NjcmlwdGFi"
+    "bGU6ITAsX2luZGV4YWJsZTp0PT4iYm9yZGVyRGFzaCIhPT10JiYiZmlsbCIhPT10fTtjb25zdHJ1Y3Rvcih0KXtzdXBlcigpLHRo"
+    "aXMuYW5pbWF0ZWQ9ITAsdGhpcy5vcHRpb25zPXZvaWQgMCx0aGlzLl9jaGFydD12b2lkIDAsdGhpcy5fbG9vcD12b2lkIDAsdGhp"
+    "cy5fZnVsbExvb3A9dm9pZCAwLHRoaXMuX3BhdGg9dm9pZCAwLHRoaXMuX3BvaW50cz12b2lkIDAsdGhpcy5fc2VnbWVudHM9dm9p"
+    "ZCAwLHRoaXMuX2RlY2ltYXRlZD0hMSx0aGlzLl9wb2ludHNVcGRhdGVkPSExLHRoaXMuX2RhdGFzZXRJbmRleD12b2lkIDAsdCYm"
+    "T2JqZWN0LmFzc2lnbih0aGlzLHQpfXVwZGF0ZUNvbnRyb2xQb2ludHModCxlKXt2YXIgaSxzPXRoaXMub3B0aW9uczshcy50ZW5z"
+    "aW9uJiYibW9ub3RvbmUiIT09cy5jdWJpY0ludGVycG9sYXRpb25Nb2RlfHxzLnN0ZXBwZWR8fHRoaXMuX3BvaW50c1VwZGF0ZWR8"
+    "fChpPXMuc3BhbkdhcHM/dGhpcy5fbG9vcDp0aGlzLl9mdWxsTG9vcCxoaSh0aGlzLl9wb2ludHMscyx0LGksZSksdGhpcy5fcG9p"
+    "bnRzVXBkYXRlZD0hMCl9c2V0IHBvaW50cyh0KXt0aGlzLl9wb2ludHM9dCxkZWxldGUgdGhpcy5fc2VnbWVudHMsZGVsZXRlIHRo"
+    "aXMuX3BhdGgsdGhpcy5fcG9pbnRzVXBkYXRlZD0hMX1nZXQgcG9pbnRzKCl7cmV0dXJuIHRoaXMuX3BvaW50c31nZXQgc2VnbWVu"
+    "dHMoKXtyZXR1cm4gdGhpcy5fc2VnbWVudHN8fCh0aGlzLl9zZWdtZW50cz1SaSh0aGlzLHRoaXMub3B0aW9ucy5zZWdtZW50KSl9"
+    "Zmlyc3QoKXt2YXIgdD10aGlzLnNlZ21lbnRzLGU9dGhpcy5wb2ludHM7cmV0dXJuIHQubGVuZ3RoJiZlW3RbMF0uc3RhcnRdfWxh"
+    "c3QoKXt2YXIgdD10aGlzLnNlZ21lbnRzLGU9dGhpcy5wb2ludHMsaT10Lmxlbmd0aDtyZXR1cm4gaSYmZVt0W2ktMV0uZW5kXX1p"
+    "bnRlcnBvbGF0ZShpLHMpe3ZhciBhPXRoaXMub3B0aW9ucyxuPWlbc10sbz10aGlzLnBvaW50cyxyPUVpKHRoaXMse3Byb3BlcnR5"
+    "OnMsc3RhcnQ6bixlbmQ6bn0pO2lmKHIubGVuZ3RoKXtjb25zdCBsPVtdLGg9YS5zdGVwcGVkP3BpOmEudGVuc2lvbnx8Im1vbm90"
+    "b25lIj09PWEuY3ViaWNJbnRlcnBvbGF0aW9uTW9kZT9taTpmaTtsZXQgZSx0O2ZvcihlPTAsdD1yLmxlbmd0aDtlPHQ7KytlKXtj"
+    "b25zdHtzdGFydDp0LGVuZDpjfT1yW2VdLGQ9b1t0XSx1PW9bY107aWYoZD09PXUpbC5wdXNoKGQpO2Vsc2V7Y29uc3QgZz1oKGQs"
+    "dSxNYXRoLmFicygobi1kW3NdKS8odVtzXS1kW3NdKSksYS5zdGVwcGVkKTtnW3NdPWlbc10sbC5wdXNoKGcpfX1yZXR1cm4gMT09"
+    "PWwubGVuZ3RoP2xbMF06bH19cGF0aFNlZ21lbnQodCxlLGkpe3JldHVybiBTYSh0aGlzKSh0LHRoaXMsZSxpKX1wYXRoKHQsZSxp"
+    "KXtjb25zdCBzPXRoaXMuc2VnbWVudHMsYT1TYSh0aGlzKTtsZXQgbj10aGlzLl9sb29wO2U9ZXx8MCxpPWl8fHRoaXMucG9pbnRz"
+    "Lmxlbmd0aC1lO2Zvcihjb25zdCBvIG9mIHMpbiY9YSh0LHRoaXMsbyx7c3RhcnQ6ZSxlbmQ6ZStpLTF9KTtyZXR1cm4hIW59ZHJh"
+    "dyh0LGUsaSxzKXt2YXIgYSxuPXRoaXMub3B0aW9uc3x8e307KHRoaXMucG9pbnRzfHxbXSkubGVuZ3RoJiZuLmJvcmRlcldpZHRo"
+    "JiYodC5zYXZlKCksbj10LGE9dGhpcyxpPWkscz1zLChQYSYmIWEub3B0aW9ucy5zZWdtZW50P2Z1bmN0aW9uKHQsZSxpLHMpe2xl"
+    "dCBhPWUuX3BhdGg7YXx8KGE9ZS5fcGF0aD1uZXcgUGF0aDJELGUucGF0aChhLGkscykmJmEuY2xvc2VQYXRoKCkpLF9hKHQsZS5v"
+    "cHRpb25zKSx0LnN0cm9rZShhKX06ZnVuY3Rpb24odCxlLGkscyl7Y29uc3R7c2VnbWVudHM6YSxvcHRpb25zOm59PWUsbz1TYShl"
+    "KTtmb3IoY29uc3QgciBvZiBhKV9hKHQsbixyLnN0eWxlKSx0LmJlZ2luUGF0aCgpLG8odCxlLHIse3N0YXJ0OmksZW5kOmkrcy0x"
+    "fSkmJnQuY2xvc2VQYXRoKCksdC5zdHJva2UoKX0pKG4sYSxpLHMpLHQucmVzdG9yZSgpKSx0aGlzLmFuaW1hdGVkJiYodGhpcy5f"
+    "cG9pbnRzVXBkYXRlZD0hMSx0aGlzLl9wYXRoPXZvaWQgMCl9fWZ1bmN0aW9uIENhKHQsZSxpLHMpe3ZhciBhPXQub3B0aW9ucyx7"
+    "W2ldOnR9PXQuZ2V0UHJvcHMoW2ldLHMpO3JldHVybiBNYXRoLmFicyhlLXQpPGEucmFkaXVzK2EuaGl0UmFkaXVzfWZ1bmN0aW9u"
+    "IE9hKHQsZSl7dmFye3g6ZSx5OmksYmFzZTpzLHdpZHRoOmEsaGVpZ2h0Om59PXQuZ2V0UHJvcHMoWyJ4IiwieSIsImJhc2UiLCJ3"
+    "aWR0aCIsImhlaWdodCJdLGUpO2xldCBvLHIsbCxoLGM7cmV0dXJuIGg9dC5ob3Jpem9udGFsPyhjPW4vMixvPU1hdGgubWluKGUs"
+    "cykscj1NYXRoLm1heChlLHMpLGw9aS1jLGkrYyk6KGM9YS8yLG89ZS1jLHI9ZStjLGw9TWF0aC5taW4oaSxzKSxNYXRoLm1heChp"
+    "LHMpKSx7bGVmdDpvLHRvcDpsLHJpZ2h0OnIsYm90dG9tOmh9fWZ1bmN0aW9uIEFhKHQsZSxpLHMpe3JldHVybiB0PzA6QyhlLGks"
+    "cyl9ZnVuY3Rpb24gVGEodCxlLGkscyl7dmFyIGE9bnVsbD09PWUsbj1udWxsPT09aSx0PXQmJiEoYSYmbikmJk9hKHQscyk7cmV0"
+    "dXJuIHQmJihhfHxjKGUsdC5sZWZ0LHQucmlnaHQpKSYmKG58fGMoaSx0LnRvcCx0LmJvdHRvbSkpfWZ1bmN0aW9uIExhKHQsZSl7"
+    "dC5yZWN0KGUueCxlLnksZS53LGUuaCl9ZnVuY3Rpb24gRWEodCxlLGk9e30pe3ZhciBzPXQueCE9PWkueD8tZTowLGE9dC55IT09"
+    "aS55Py1lOjAsbj0odC54K3QudyE9PWkueCtpLnc/ZTowKS1zLGk9KHQueSt0LmghPT1pLnkraS5oP2U6MCktYTtyZXR1cm57eDp0"
+    "Lngrcyx5OnQueSthLHc6dC53K24saDp0LmgraSxyYWRpdXM6dC5yYWRpdXN9fXZhciBSYT1PYmplY3QuZnJlZXplKHtfX3Byb3Rv"
+    "X186bnVsbCxBcmNFbGVtZW50OmNsYXNzIGV4dGVuZHMgZXtzdGF0aWMgaWQ9ImFyYyI7c3RhdGljIGRlZmF1bHRzPXtib3JkZXJB"
+    "bGlnbjoiY2VudGVyIixib3JkZXJDb2xvcjoiI2ZmZiIsYm9yZGVyRGFzaDpbXSxib3JkZXJEYXNoT2Zmc2V0OjAsYm9yZGVySm9p"
+    "blN0eWxlOnZvaWQgMCxib3JkZXJSYWRpdXM6MCxib3JkZXJXaWR0aDoyLG9mZnNldDowLHNwYWNpbmc6MCxhbmdsZTp2b2lkIDAs"
+    "Y2lyY3VsYXI6ITB9O3N0YXRpYyBkZWZhdWx0Um91dGVzPXtiYWNrZ3JvdW5kQ29sb3I6ImJhY2tncm91bmRDb2xvciJ9O3N0YXRp"
+    "YyBkZXNjcmlwdG9ycz17X3NjcmlwdGFibGU6ITAsX2luZGV4YWJsZTp0PT4iYm9yZGVyRGFzaCIhPT10fTtjaXJjdW1mZXJlbmNl"
+    "O2VuZEFuZ2xlO2Z1bGxDaXJjbGVzO2lubmVyUmFkaXVzO291dGVyUmFkaXVzO3BpeGVsTWFyZ2luO3N0YXJ0QW5nbGU7Y29uc3Ry"
+    "dWN0b3IodCl7c3VwZXIoKSx0aGlzLm9wdGlvbnM9dm9pZCAwLHRoaXMuY2lyY3VtZmVyZW5jZT12b2lkIDAsdGhpcy5zdGFydEFu"
+    "Z2xlPXZvaWQgMCx0aGlzLmVuZEFuZ2xlPXZvaWQgMCx0aGlzLmlubmVyUmFkaXVzPXZvaWQgMCx0aGlzLm91dGVyUmFkaXVzPXZv"
+    "aWQgMCx0aGlzLnBpeGVsTWFyZ2luPTAsdGhpcy5mdWxsQ2lyY2xlcz0wLHQmJk9iamVjdC5hc3NpZ24odGhpcyx0KX1pblJhbmdl"
+    "KHQsZSxpKXt2YXJ7YW5nbGU6dCxkaXN0YW5jZTplfT11dCh0aGlzLmdldFByb3BzKFsieCIsInkiXSxpKSx7eDp0LHk6ZX0pLHtz"
+    "dGFydEFuZ2xlOmksZW5kQW5nbGU6cyxpbm5lclJhZGl1czphLG91dGVyUmFkaXVzOm4sY2lyY3VtZmVyZW5jZTpvfT10aGlzLmdl"
+    "dFByb3BzKFsic3RhcnRBbmdsZSIsImVuZEFuZ2xlIiwiaW5uZXJSYWRpdXMiLCJvdXRlclJhZGl1cyIsImNpcmN1bWZlcmVuY2Ui"
+    "XSxpKSxyPSh0aGlzLm9wdGlvbnMuc3BhY2luZyt0aGlzLm9wdGlvbnMuYm9yZGVyV2lkdGgpLzIsbz1UKG8scy1pKT49X3x8cHQo"
+    "dCxpLHMpLHQ9YyhlLGErcixuK3IpO3JldHVybiBvJiZ0fWdldENlbnRlclBvaW50KHQpe3Zhcnt4OnQseTplLHN0YXJ0QW5nbGU6"
+    "aSxlbmRBbmdsZTpzLGlubmVyUmFkaXVzOmEsb3V0ZXJSYWRpdXM6bn09dGhpcy5nZXRQcm9wcyhbIngiLCJ5Iiwic3RhcnRBbmds"
+    "ZSIsImVuZEFuZ2xlIiwiaW5uZXJSYWRpdXMiLCJvdXRlclJhZGl1cyJdLHQpLHtvZmZzZXQ6byxzcGFjaW5nOnJ9PXRoaXMub3B0"
+    "aW9ucyxpPShpK3MpLzIscz0oYStuK3IrbykvMjtyZXR1cm57eDp0K01hdGguY29zKGkpKnMseTplK01hdGguc2luKGkpKnN9fXRv"
+    "b2x0aXBQb3NpdGlvbih0KXtyZXR1cm4gdGhpcy5nZXRDZW50ZXJQb2ludCh0KX1kcmF3KGUpe3ZhcntvcHRpb25zOmksY2lyY3Vt"
+    "ZmVyZW5jZTpzfT10aGlzLGE9KGkub2Zmc2V0fHwwKS80LG49KGkuc3BhY2luZ3x8MCkvMixvPWkuY2lyY3VsYXI7aWYodGhpcy5w"
+    "aXhlbE1hcmdpbj0iaW5uZXIiPT09aS5ib3JkZXJBbGlnbj8uMzM6MCx0aGlzLmZ1bGxDaXJjbGVzPXM+Xz9NYXRoLmZsb29yKHMv"
+    "Xyk6MCwhKDA9PT1zfHx0aGlzLmlubmVyUmFkaXVzPDB8fHRoaXMub3V0ZXJSYWRpdXM8MCkpe2Uuc2F2ZSgpO3ZhciByPSh0aGlz"
+    "LnN0YXJ0QW5nbGUrdGhpcy5lbmRBbmdsZSkvMixyPShlLnRyYW5zbGF0ZShNYXRoLmNvcyhyKSphLE1hdGguc2luKHIpKmEpLGEq"
+    "KDEtTWF0aC5zaW4oTWF0aC5taW4oUyxzfHwwKSkpKTtlLmZpbGxTdHlsZT1pLmJhY2tncm91bmRDb2xvcixlLnN0cm9rZVN0eWxl"
+    "PWkuYm9yZGVyQ29sb3I7e3ZhciBsPWU7YT10aGlzO3M9cjtpPW47dmFyIGg9bzt2YXJ7ZnVsbENpcmNsZXM6YyxzdGFydEFuZ2xl"
+    "OmQsY2lyY3VtZmVyZW5jZTp1fT1hO2xldCB0PWEuZW5kQW5nbGU7aWYoYyl7dmEobCxhLHMsaSx0LGgpO2ZvcihsZXQgdD0wO3Q8"
+    "YzsrK3QpbC5maWxsKCk7aXNOYU4odSl8fCh0PWQrKHUlX3x8XykpfXZhKGwsYSxzLGksdCxoKSxsLmZpbGwoKX12YXIgZz1lLGQ9"
+    "dGhpcyx1PXIsYT1uLHM9byx7ZnVsbENpcmNsZXM6ZixzdGFydEFuZ2xlOmksY2lyY3VtZmVyZW5jZTpoLG9wdGlvbnM6cn09ZCx7"
+    "Ym9yZGVyV2lkdGg6bixib3JkZXJKb2luU3R5bGU6byxib3JkZXJEYXNoOnAsYm9yZGVyRGFzaE9mZnNldDptfT1yLHI9ImlubmVy"
+    "Ij09PXIuYm9yZGVyQWxpZ247aWYobil7Zy5zZXRMaW5lRGFzaChwfHxbXSksZy5saW5lRGFzaE9mZnNldD1tLHI/KGcubGluZVdp"
+    "ZHRoPTIqbixnLmxpbmVKb2luPW98fCJyb3VuZCIpOihnLmxpbmVXaWR0aD1uLGcubGluZUpvaW49b3x8ImJldmVsIik7bGV0IHQ9"
+    "ZC5lbmRBbmdsZTtpZihmKXt2YShnLGQsdSxhLHQscyk7Zm9yKGxldCB0PTA7dDxmOysrdClnLnN0cm9rZSgpO2lzTmFOKGgpfHwo"
+    "dD1pKyhoJV98fF8pKX1pZihyKXtwPWc7bT1kO249dDt2YXJ7c3RhcnRBbmdsZTptLHBpeGVsTWFyZ2luOm8seDppLHk6aCxvdXRl"
+    "clJhZGl1czpyLGlubmVyUmFkaXVzOmJ9PW0seD1vL3I7cC5iZWdpblBhdGgoKSxwLmFyYyhpLGgscixtLXgsbit4KSxvPGI/cC5h"
+    "cmMoaSxoLGIsbisoeD1vL2IpLG0teCwhMCk6cC5hcmMoaSxoLG8sbitELG0tRCkscC5jbG9zZVBhdGgoKSxwLmNsaXAoKX1mfHwo"
+    "dmEoZyxkLHUsYSx0LHMpLGcuc3Ryb2tlKCkpfWUucmVzdG9yZSgpfX19LEJhckVsZW1lbnQ6Y2xhc3MgZXh0ZW5kcyBle3N0YXRp"
+    "YyBpZD0iYmFyIjtzdGF0aWMgZGVmYXVsdHM9e2JvcmRlclNraXBwZWQ6InN0YXJ0Iixib3JkZXJXaWR0aDowLGJvcmRlclJhZGl1"
+    "czowLGluZmxhdGVBbW91bnQ6ImF1dG8iLHBvaW50U3R5bGU6dm9pZCAwfTtzdGF0aWMgZGVmYXVsdFJvdXRlcz17YmFja2dyb3Vu"
+    "ZENvbG9yOiJiYWNrZ3JvdW5kQ29sb3IiLGJvcmRlckNvbG9yOiJib3JkZXJDb2xvciJ9O2NvbnN0cnVjdG9yKHQpe3N1cGVyKCks"
+    "dGhpcy5vcHRpb25zPXZvaWQgMCx0aGlzLmhvcml6b250YWw9dm9pZCAwLHRoaXMuYmFzZT12b2lkIDAsdGhpcy53aWR0aD12b2lk"
+    "IDAsdGhpcy5oZWlnaHQ9dm9pZCAwLHRoaXMuaW5mbGF0ZUFtb3VudD12b2lkIDAsdCYmT2JqZWN0LmFzc2lnbih0aGlzLHQpfWRy"
+    "YXcodCl7Y29uc3R7aW5mbGF0ZUFtb3VudDplLG9wdGlvbnM6e2JvcmRlckNvbG9yOmksYmFja2dyb3VuZENvbG9yOnN9fT10aGlz"
+    "LHtpbm5lcjphLG91dGVyOm59PSh1PU9hKHI9dGhpcyksZz11LnJpZ2h0LXUubGVmdCxmPXUuYm90dG9tLXUudG9wLGM9Zy8yLHA9"
+    "Zi8yLGQ9KGg9cikub3B0aW9ucy5ib3JkZXJXaWR0aCxoPWguYm9yZGVyU2tpcHBlZCxkPU1pKGQpLHA9e3Q6QWEoaC50b3AsZC50"
+    "b3AsMCxwKSxyOkFhKGgucmlnaHQsZC5yaWdodCwwLGMpLGI6QWEoaC5ib3R0b20sZC5ib3R0b20sMCxwKSxsOkFhKGgubGVmdCxk"
+    "LmxlZnQsMCxjKX0saD1nLzIsZD1mLzIscj0oYz1yKS5nZXRQcm9wcyhbImVuYWJsZUJvcmRlclJhZGl1cyJdKS5lbmFibGVCb3Jk"
+    "ZXJSYWRpdXMsbT1jLm9wdGlvbnMuYm9yZGVyUmFkaXVzLGw9d2kobSksaD1NYXRoLm1pbihoLGQpLGQ9Yy5ib3JkZXJTa2lwcGVk"
+    "LHI9e3RvcExlZnQ6QWEoIShjPXJ8fEEobSkpfHxkLnRvcHx8ZC5sZWZ0LGwudG9wTGVmdCwwLGgpLHRvcFJpZ2h0OkFhKCFjfHxk"
+    "LnRvcHx8ZC5yaWdodCxsLnRvcFJpZ2h0LDAsaCksYm90dG9tTGVmdDpBYSghY3x8ZC5ib3R0b218fGQubGVmdCxsLmJvdHRvbUxl"
+    "ZnQsMCxoKSxib3R0b21SaWdodDpBYSghY3x8ZC5ib3R0b218fGQucmlnaHQsbC5ib3R0b21SaWdodCwwLGgpfSx7b3V0ZXI6e3g6"
+    "dS5sZWZ0LHk6dS50b3AsdzpnLGg6ZixyYWRpdXM6cn0saW5uZXI6e3g6dS5sZWZ0K3AubCx5OnUudG9wK3AudCx3OmctcC5sLXAu"
+    "cixoOmYtcC50LXAuYixyYWRpdXM6e3RvcExlZnQ6TWF0aC5tYXgoMCxyLnRvcExlZnQtTWF0aC5tYXgocC50LHAubCkpLHRvcFJp"
+    "Z2h0Ok1hdGgubWF4KDAsci50b3BSaWdodC1NYXRoLm1heChwLnQscC5yKSksYm90dG9tTGVmdDpNYXRoLm1heCgwLHIuYm90dG9t"
+    "TGVmdC1NYXRoLm1heChwLmIscC5sKSksYm90dG9tUmlnaHQ6TWF0aC5tYXgoMCxyLmJvdHRvbVJpZ2h0LU1hdGgubWF4KHAuYixw"
+    "LnIpKX19fSksbz0obT1uLnJhZGl1cykudG9wTGVmdHx8bS50b3BSaWdodHx8bS5ib3R0b21MZWZ0fHxtLmJvdHRvbVJpZ2h0P2pl"
+    "OkxhO3ZhciByLGwsaCxjLGQsdSxnLGYscCxtO3Quc2F2ZSgpLG4udz09PWEudyYmbi5oPT09YS5ofHwodC5iZWdpblBhdGgoKSxv"
+    "KHQsRWEobixlLGEpKSx0LmNsaXAoKSxvKHQsRWEoYSwtZSxuKSksdC5maWxsU3R5bGU9aSx0LmZpbGwoImV2ZW5vZGQiKSksdC5i"
+    "ZWdpblBhdGgoKSxvKHQsRWEoYSxlKSksdC5maWxsU3R5bGU9cyx0LmZpbGwoKSx0LnJlc3RvcmUoKX1pblJhbmdlKHQsZSxpKXty"
+    "ZXR1cm4gVGEodGhpcyx0LGUsaSl9aW5YUmFuZ2UodCxlKXtyZXR1cm4gVGEodGhpcyx0LG51bGwsZSl9aW5ZUmFuZ2UodCxlKXty"
+    "ZXR1cm4gVGEodGhpcyxudWxsLHQsZSl9Z2V0Q2VudGVyUG9pbnQodCl7dmFye3g6dCx5OmUsYmFzZTppLGhvcml6b250YWw6c309"
+    "dGhpcy5nZXRQcm9wcyhbIngiLCJ5IiwiYmFzZSIsImhvcml6b250YWwiXSx0KTtyZXR1cm57eDpzPyh0K2kpLzI6dCx5OnM/ZToo"
+    "ZStpKS8yfX1nZXRSYW5nZSh0KXtyZXR1cm4ieCI9PT10P3RoaXMud2lkdGgvMjp0aGlzLmhlaWdodC8yfX0sTGluZUVsZW1lbnQ6"
+    "RGEsUG9pbnRFbGVtZW50OmNsYXNzIGV4dGVuZHMgZXtzdGF0aWMgaWQ9InBvaW50IjtwYXJzZWQ7c2tpcDtzdG9wO3N0YXRpYyBk"
+    "ZWZhdWx0cz17Ym9yZGVyV2lkdGg6MSxoaXRSYWRpdXM6MSxob3ZlckJvcmRlcldpZHRoOjEsaG92ZXJSYWRpdXM6NCxwb2ludFN0"
+    "eWxlOiJjaXJjbGUiLHJhZGl1czozLHJvdGF0aW9uOjB9O3N0YXRpYyBkZWZhdWx0Um91dGVzPXtiYWNrZ3JvdW5kQ29sb3I6ImJh"
+    "Y2tncm91bmRDb2xvciIsYm9yZGVyQ29sb3I6ImJvcmRlckNvbG9yIn07Y29uc3RydWN0b3IodCl7c3VwZXIoKSx0aGlzLm9wdGlv"
+    "bnM9dm9pZCAwLHRoaXMucGFyc2VkPXZvaWQgMCx0aGlzLnNraXA9dm9pZCAwLHRoaXMuc3RvcD12b2lkIDAsdCYmT2JqZWN0LmFz"
+    "c2lnbih0aGlzLHQpfWluUmFuZ2UodCxlLGkpe3ZhciBzPXRoaXMub3B0aW9ucyx7eDppLHk6YX09dGhpcy5nZXRQcm9wcyhbIngi"
+    "LCJ5Il0saSk7cmV0dXJuIE1hdGgucG93KHQtaSwyKStNYXRoLnBvdyhlLWEsMik8TWF0aC5wb3cocy5oaXRSYWRpdXMrcy5yYWRp"
+    "dXMsMil9aW5YUmFuZ2UodCxlKXtyZXR1cm4gQ2EodGhpcyx0LCJ4IixlKX1pbllSYW5nZSh0LGUpe3JldHVybiBDYSh0aGlzLHQs"
+    "InkiLGUpfWdldENlbnRlclBvaW50KHQpe3Zhcnt4OnQseTplfT10aGlzLmdldFByb3BzKFsieCIsInkiXSx0KTtyZXR1cm57eDp0"
+    "LHk6ZX19c2l6ZSh0KXt2YXIgZT0odD10fHx0aGlzLm9wdGlvbnN8fHt9KS5yYWRpdXN8fDA7cmV0dXJuIDIqKChlPU1hdGgubWF4"
+    "KGUsZSYmdC5ob3ZlclJhZGl1c3x8MCkpKyhlJiZ0LmJvcmRlcldpZHRofHwwKSl9ZHJhdyh0LGUpe3ZhciBpPXRoaXMub3B0aW9u"
+    "czt0aGlzLnNraXB8fGkucmFkaXVzPC4xfHwhTSh0aGlzLGUsdGhpcy5zaXplKGkpLzIpfHwodC5zdHJva2VTdHlsZT1pLmJvcmRl"
+    "ckNvbG9yLHQubGluZVdpZHRoPWkuYm9yZGVyV2lkdGgsdC5maWxsU3R5bGU9aS5iYWNrZ3JvdW5kQ29sb3IsemUodCxpLHRoaXMu"
+    "eCx0aGlzLnkpKX1nZXRSYW5nZSgpe3ZhciB0PXRoaXMub3B0aW9uc3x8e307cmV0dXJuIHQucmFkaXVzK3QuaGl0UmFkaXVzfX19"
+    "KTtmdW5jdGlvbiBJYSh0KXt2YXIgZT10aGlzLmdldExhYmVscygpO3JldHVybiAwPD10JiZ0PGUubGVuZ3RoP2VbdF06dH1mdW5j"
+    "dGlvbiB6YSh0LGUse2hvcml6b250YWw6aSxtaW5Sb3RhdGlvbjpzfSl7cz1MKHMpLGk9KGk/TWF0aC5zaW4ocyk6TWF0aC5jb3Mo"
+    "cykpfHwuMDAxO3JldHVybiBNYXRoLm1pbihlL2ksLjc1KmUqKCIiK3QpLmxlbmd0aCl9Y2xhc3MgRmEgZXh0ZW5kcyB6c3tjb25z"
+    "dHJ1Y3Rvcih0KXtzdXBlcih0KSx0aGlzLnN0YXJ0PXZvaWQgMCx0aGlzLmVuZD12b2lkIDAsdGhpcy5fc3RhcnRWYWx1ZT12b2lk"
+    "IDAsdGhpcy5fZW5kVmFsdWU9dm9pZCAwLHRoaXMuX3ZhbHVlUmFuZ2U9MH1wYXJzZSh0LGUpe3JldHVybiBQKHQpfHwoIm51bWJl"
+    "ciI9PXR5cGVvZiB0fHx0IGluc3RhbmNlb2YgTnVtYmVyKSYmIWlzRmluaXRlKCt0KT9udWxsOit0fWhhbmRsZVRpY2tSYW5nZU9w"
+    "dGlvbnMoKXtjb25zdCB0PXRoaXMub3B0aW9uc1siYmVnaW5BdFplcm8iXSx7bWluRGVmaW5lZDplLG1heERlZmluZWQ6aX09dGhp"
+    "cy5nZXRVc2VyQm91bmRzKCk7bGV0e21pbjpzLG1heDphfT10aGlzO3ZhciBuLG89dD0+cz1lP3M6dCxyPXQ9PmE9aT9hOnQ7aWYo"
+    "dCl7Y29uc3QgdD15KHMpLGU9eShhKTt0PDAmJmU8MD9yKDApOjA8dCYmMDxlJiZvKDApfXM9PT1hJiYobj0wPT09YT8xOk1hdGgu"
+    "YWJzKC4wNSphKSxyKGErbiksdHx8byhzLW4pKSx0aGlzLm1pbj1zLHRoaXMubWF4PWF9Z2V0VGlja0xpbWl0KCl7bGV0IHQse21h"
+    "eFRpY2tzTGltaXQ6ZSxzdGVwU2l6ZTppfT10aGlzLm9wdGlvbnMudGlja3M7cmV0dXJuIGk/MWUzPCh0PU1hdGguY2VpbCh0aGlz"
+    "Lm1heC9pKS1NYXRoLmZsb29yKHRoaXMubWluL2kpKzEpJiYoY29uc29sZS53YXJuKGBzY2FsZXMuJHt0aGlzLmlkfS50aWNrcy5z"
+    "dGVwU2l6ZTogJHtpfSB3b3VsZCByZXN1bHQgZ2VuZXJhdGluZyB1cCB0byAke3R9IHRpY2tzLiBMaW1pdGluZyB0byAxMDAwLmAp"
+    "LHQ9MWUzKToodD10aGlzLmNvbXB1dGVUaWNrTGltaXQoKSxlPWV8fDExKSx0PWU/TWF0aC5taW4oZSx0KTp0fWNvbXB1dGVUaWNr"
+    "TGltaXQoKXtyZXR1cm4gTnVtYmVyLlBPU0lUSVZFX0lORklOSVRZfWJ1aWxkVGlja3MoKXt2YXIgdD10aGlzLm9wdGlvbnMsZT10"
+    "LnRpY2tzLGk9dGhpcy5nZXRUaWNrTGltaXQoKTtjb25zdCBzPWZ1bmN0aW9uKHQsZSl7Y29uc3QgaT1bXSx7Ym91bmRzOnMsc3Rl"
+    "cDphLG1pbjpuLG1heDpvLHByZWNpc2lvbjpyLGNvdW50OmwsbWF4VGlja3M6aCxtYXhEaWdpdHM6YyxpbmNsdWRlQm91bmRzOmR9"
+    "PXQsdT1hfHwxLGc9aC0xLHttaW46ZixtYXg6cH09ZSxtPSFQKG4pLGI9IVAobykseD0hUChsKSx2PShwLWYpLyhjKzEpO2xldCBf"
+    "LHksTSx3LGs9bnQoKHAtZikvZy91KSp1O2lmKGs8MWUtMTQmJiFtJiYhYilyZXR1cm5be3ZhbHVlOmZ9LHt2YWx1ZTpwfV07KHc9"
+    "TWF0aC5jZWlsKHAvayktTWF0aC5mbG9vcihmL2spKT5nJiYoaz1udCh3KmsvZy91KSp1KSxQKHIpfHwoXz1NYXRoLnBvdygxMCxy"
+    "KSxrPU1hdGguY2VpbChrKl8pL18pLE09InRpY2tzIj09PXM/KHk9TWF0aC5mbG9vcihmL2spKmssTWF0aC5jZWlsKHAvaykqayk6"
+    "KHk9ZixwKSxtJiZiJiZhJiZsdCgoby1uKS9hLGsvMWUzKT8odz1NYXRoLnJvdW5kKE1hdGgubWluKChvLW4pL2ssaCkpLGs9KG8t"
+    "bikvdyx5PW4sTT1vKTp4Pyh5PW0/bjp5LE09Yj9vOk0sdz1sLTEsaz0oTS15KS93KTp3PWF0KHc9KE0teSkvayxNYXRoLnJvdW5k"
+    "KHcpLGsvMWUzKT9NYXRoLnJvdW5kKHcpOk1hdGguY2VpbCh3KTtlPU1hdGgubWF4KGR0KGspLGR0KHkpKTtfPU1hdGgucG93KDEw"
+    "LFAocik/ZTpyKSx5PU1hdGgucm91bmQoeSpfKS9fLE09TWF0aC5yb3VuZChNKl8pL187bGV0IFM9MDtmb3IobSYmKGQmJnkhPT1u"
+    "PyhpLnB1c2goe3ZhbHVlOm59KSx5PG4mJlMrKyxhdChNYXRoLnJvdW5kKCh5K1MqaykqXykvXyxuLHphKG4sdix0KSkmJlMrKyk6"
+    "eTxuJiZTKyspO1M8dzsrK1Mpe2NvbnN0IHQ9TWF0aC5yb3VuZCgoeStTKmspKl8pL187aWYoYiYmdD5vKWJyZWFrO2kucHVzaCh7"
+    "dmFsdWU6dH0pfXJldHVybiBiJiZkJiZNIT09bz9pLmxlbmd0aCYmYXQoaVtpLmxlbmd0aC0xXS52YWx1ZSxvLHphKG8sdix0KSk/"
+    "aVtpLmxlbmd0aC0xXS52YWx1ZT1vOmkucHVzaCh7dmFsdWU6b30pOmImJk0hPT1vfHxpLnB1c2goe3ZhbHVlOk19KSxpfSh7bWF4"
+    "VGlja3M6TWF0aC5tYXgoMixpKSxib3VuZHM6dC5ib3VuZHMsbWluOnQubWluLG1heDp0Lm1heCxwcmVjaXNpb246ZS5wcmVjaXNp"
+    "b24sc3RlcDplLnN0ZXBTaXplLGNvdW50OmUuY291bnQsbWF4RGlnaXRzOnRoaXMuX21heERpZ2l0cygpLGhvcml6b250YWw6dGhp"
+    "cy5pc0hvcml6b250YWwoKSxtaW5Sb3RhdGlvbjplLm1pblJvdGF0aW9ufHwwLGluY2x1ZGVCb3VuZHM6ITEhPT1lLmluY2x1ZGVC"
+    "b3VuZHN9LHRoaXMuX3JhbmdlfHx0aGlzKTtyZXR1cm4idGlja3MiPT09dC5ib3VuZHMmJmh0KHMsdGhpcywidmFsdWUiKSx0LnJl"
+    "dmVyc2U/KHMucmV2ZXJzZSgpLHRoaXMuc3RhcnQ9dGhpcy5tYXgsdGhpcy5lbmQ9dGhpcy5taW4pOih0aGlzLnN0YXJ0PXRoaXMu"
+    "bWluLHRoaXMuZW5kPXRoaXMubWF4KSxzfWNvbmZpZ3VyZSgpe3ZhciB0PXRoaXMudGlja3M7bGV0IGU9dGhpcy5taW4saT10aGlz"
+    "Lm1heDtzdXBlci5jb25maWd1cmUoKSx0aGlzLm9wdGlvbnMub2Zmc2V0JiZ0Lmxlbmd0aCYmKHQ9KGktZSkvTWF0aC5tYXgodC5s"
+    "ZW5ndGgtMSwxKS8yLGUtPXQsaSs9dCksdGhpcy5fc3RhcnRWYWx1ZT1lLHRoaXMuX2VuZFZhbHVlPWksdGhpcy5fdmFsdWVSYW5n"
+    "ZT1pLWV9Z2V0TGFiZWxGb3JWYWx1ZSh0KXtyZXR1cm4gZGUodCx0aGlzLmNoYXJ0Lm9wdGlvbnMubG9jYWxlLHRoaXMub3B0aW9u"
+    "cy50aWNrcy5mb3JtYXQpfX1jbGFzcyBWYSBleHRlbmRzIEZhe3N0YXRpYyBpZD0ibGluZWFyIjtzdGF0aWMgZGVmYXVsdHM9e3Rp"
+    "Y2tzOntjYWxsYmFjazpnZS5mb3JtYXR0ZXJzLm51bWVyaWN9fTtkZXRlcm1pbmVEYXRhTGltaXRzKCl7dmFye21pbjp0LG1heDpl"
+    "fT10aGlzLmdldE1pbk1heCghMCk7dGhpcy5taW49cCh0KT90OjAsdGhpcy5tYXg9cChlKT9lOjEsdGhpcy5oYW5kbGVUaWNrUmFu"
+    "Z2VPcHRpb25zKCl9Y29tcHV0ZVRpY2tMaW1pdCgpe3ZhciB0PXRoaXMuaXNIb3Jpem9udGFsKCksZT10P3RoaXMud2lkdGg6dGhp"
+    "cy5oZWlnaHQsaT1MKHRoaXMub3B0aW9ucy50aWNrcy5taW5Sb3RhdGlvbiksdD0odD9NYXRoLnNpbihpKTpNYXRoLmNvcyhpKSl8"
+    "fC4wMDEsaT10aGlzLl9yZXNvbHZlVGlja0ZvbnRPcHRpb25zKDApO3JldHVybiBNYXRoLmNlaWwoZS9NYXRoLm1pbig0MCxpLmxp"
+    "bmVIZWlnaHQvdCkpfWdldFBpeGVsRm9yVmFsdWUodCl7cmV0dXJuIG51bGw9PT10P05hTjp0aGlzLmdldFBpeGVsRm9yRGVjaW1h"
+    "bCgodC10aGlzLl9zdGFydFZhbHVlKS90aGlzLl92YWx1ZVJhbmdlKX1nZXRWYWx1ZUZvclBpeGVsKHQpe3JldHVybiB0aGlzLl9z"
+    "dGFydFZhbHVlK3RoaXMuZ2V0RGVjaW1hbEZvclBpeGVsKHQpKnRoaXMuX3ZhbHVlUmFuZ2V9fWNvbnN0IEJhPXQ9Pk1hdGguZmxv"
+    "b3Iocih0KSksV2E9KHQsZSk9Pk1hdGgucG93KDEwLEJhKHQpK2UpO2Z1bmN0aW9uIE5hKHQpe3JldHVybiAxPT10L01hdGgucG93"
+    "KDEwLEJhKHQpKX1mdW5jdGlvbiBIYSh0LGUsaSl7aT1NYXRoLnBvdygxMCxpKSx0PU1hdGguZmxvb3IodC9pKTtyZXR1cm4gTWF0"
+    "aC5jZWlsKGUvaSktdH1jbGFzcyBqYSBleHRlbmRzIHpze3N0YXRpYyBpZD0ibG9nYXJpdGhtaWMiO3N0YXRpYyBkZWZhdWx0cz17"
+    "dGlja3M6e2NhbGxiYWNrOmdlLmZvcm1hdHRlcnMubG9nYXJpdGhtaWMsbWFqb3I6e2VuYWJsZWQ6ITB9fX07Y29uc3RydWN0b3Io"
+    "dCl7c3VwZXIodCksdGhpcy5zdGFydD12b2lkIDAsdGhpcy5lbmQ9dm9pZCAwLHRoaXMuX3N0YXJ0VmFsdWU9dm9pZCAwLHRoaXMu"
+    "X3ZhbHVlUmFuZ2U9MH1wYXJzZSh0LGUpe3Q9RmEucHJvdG90eXBlLnBhcnNlLmFwcGx5KHRoaXMsW3QsZV0pO2lmKDAhPT10KXJl"
+    "dHVybiBwKHQpJiYwPHQ/dDpudWxsO3RoaXMuX3plcm89ITB9ZGV0ZXJtaW5lRGF0YUxpbWl0cygpe3ZhcnttaW46dCxtYXg6ZX09"
+    "dGhpcy5nZXRNaW5NYXgoITApO3RoaXMubWluPXAodCk/TWF0aC5tYXgoMCx0KTpudWxsLHRoaXMubWF4PXAoZSk/TWF0aC5tYXgo"
+    "MCxlKTpudWxsLHRoaXMub3B0aW9ucy5iZWdpbkF0WmVybyYmKHRoaXMuX3plcm89ITApLHRoaXMuX3plcm8mJnRoaXMubWluIT09"
+    "dGhpcy5fc3VnZ2VzdGVkTWluJiYhcCh0aGlzLl91c2VyTWluKSYmKHRoaXMubWluPXQ9PT1XYSh0aGlzLm1pbiwwKT9XYSh0aGlz"
+    "Lm1pbiwtMSk6V2EodGhpcy5taW4sMCkpLHRoaXMuaGFuZGxlVGlja1JhbmdlT3B0aW9ucygpfWhhbmRsZVRpY2tSYW5nZU9wdGlv"
+    "bnMoKXtjb25zdHttaW5EZWZpbmVkOmUsbWF4RGVmaW5lZDppfT10aGlzLmdldFVzZXJCb3VuZHMoKTtsZXQgcz10aGlzLm1pbixh"
+    "PXRoaXMubWF4O3ZhciB0PXQ9PnM9ZT9zOnQsbj10PT5hPWk/YTp0O3M9PT1hJiYoczw9MD8odCgxKSxuKDEwKSk6KHQoV2Eocywt"
+    "MSkpLG4oV2EoYSwxKSkpKSxzPD0wJiZ0KFdhKGEsLTEpKSxhPD0wJiZuKFdhKHMsMSkpLHRoaXMubWluPXMsdGhpcy5tYXg9YX1i"
+    "dWlsZFRpY2tzKCl7Y29uc3QgdD10aGlzLm9wdGlvbnMsZT1mdW5jdGlvbih0LHttaW46ZSxtYXg6aX0pe2U9Zyh0Lm1pbixlKTtj"
+    "b25zdCBzPVtdLGE9QmEoZSk7bGV0IG49ZnVuY3Rpb24odCxlKXtsZXQgaT1CYShlLXQpO2Zvcig7MTA8SGEodCxlLGkpOylpKys7"
+    "Zm9yKDtIYSh0LGUsaSk8MTA7KWktLTtyZXR1cm4gTWF0aC5taW4oaSxCYSh0KSl9KGUsaSksbz1uPDA/TWF0aC5wb3coMTAsTWF0"
+    "aC5hYnMobikpOjE7dmFyIHI9TWF0aC5wb3coMTAsbiksbD1hPm4/TWF0aC5wb3coMTAsYSk6MCxoPU1hdGgucm91bmQoKGUtbCkq"
+    "bykvbyxjPU1hdGguZmxvb3IoKGUtbCkvci8xMCkqcioxMDtsZXQgZD1NYXRoLmZsb29yKChoLWMpL01hdGgucG93KDEwLG4pKSx1"
+    "PWcodC5taW4sTWF0aC5yb3VuZCgobCtjK2QqTWF0aC5wb3coMTAsbikpKm8pL28pO2Zvcig7dTxpOylzLnB1c2goe3ZhbHVlOnUs"
+    "bWFqb3I6TmEodSksc2lnbmlmaWNhbmQ6ZH0pLDEwPD1kP2Q9ZDwxNT8xNToyMDpkKyssMjA8PWQmJihuKyssZD0yLG89MDw9bj8x"
+    "Om8pLHU9TWF0aC5yb3VuZCgobCtjK2QqTWF0aC5wb3coMTAsbikpKm8pL287cmV0dXJuIGU9Zyh0Lm1heCx1KSxzLnB1c2goe3Zh"
+    "bHVlOmUsbWFqb3I6TmEoZSksc2lnbmlmaWNhbmQ6ZH0pLHN9KHttaW46dGhpcy5fdXNlck1pbixtYXg6dGhpcy5fdXNlck1heH0s"
+    "dGhpcyk7cmV0dXJuInRpY2tzIj09PXQuYm91bmRzJiZodChlLHRoaXMsInZhbHVlIiksdC5yZXZlcnNlPyhlLnJldmVyc2UoKSx0"
+    "aGlzLnN0YXJ0PXRoaXMubWF4LHRoaXMuZW5kPXRoaXMubWluKToodGhpcy5zdGFydD10aGlzLm1pbix0aGlzLmVuZD10aGlzLm1h"
+    "eCksZX1nZXRMYWJlbEZvclZhbHVlKHQpe3JldHVybiB2b2lkIDA9PT10PyIwIjpkZSh0LHRoaXMuY2hhcnQub3B0aW9ucy5sb2Nh"
+    "bGUsdGhpcy5vcHRpb25zLnRpY2tzLmZvcm1hdCl9Y29uZmlndXJlKCl7dmFyIHQ9dGhpcy5taW47c3VwZXIuY29uZmlndXJlKCks"
+    "dGhpcy5fc3RhcnRWYWx1ZT1yKHQpLHRoaXMuX3ZhbHVlUmFuZ2U9cih0aGlzLm1heCktcih0KX1nZXRQaXhlbEZvclZhbHVlKHQp"
+    "e3JldHVybiBudWxsPT09KHQ9dm9pZCAwIT09dCYmMCE9PXQ/dDp0aGlzLm1pbil8fGlzTmFOKHQpP05hTjp0aGlzLmdldFBpeGVs"
+    "Rm9yRGVjaW1hbCh0PT09dGhpcy5taW4/MDoocih0KS10aGlzLl9zdGFydFZhbHVlKS90aGlzLl92YWx1ZVJhbmdlKX1nZXRWYWx1"
+    "ZUZvclBpeGVsKHQpe3Q9dGhpcy5nZXREZWNpbWFsRm9yUGl4ZWwodCk7cmV0dXJuIE1hdGgucG93KDEwLHRoaXMuX3N0YXJ0VmFs"
+    "dWUrdCp0aGlzLl92YWx1ZVJhbmdlKX19ZnVuY3Rpb24gWWEodCl7dmFyIGU9dC50aWNrcztpZihlLmRpc3BsYXkmJnQuZGlzcGxh"
+    "eSl7Y29uc3QgdD1JKGUuYmFja2Ryb3BQYWRkaW5nKTtyZXR1cm4gVChlLmZvbnQmJmUuZm9udC5zaXplLFIuZm9udC5zaXplKSt0"
+    "LmhlaWdodH1yZXR1cm4gMH1mdW5jdGlvbiAkYSh0LGUsaSxzLGEpe3JldHVybiB0PT09c3x8dD09PWE/e3N0YXJ0OmUtaS8yLGVu"
+    "ZDplK2kvMn06dDxzfHxhPHQ/e3N0YXJ0OmUtaSxlbmQ6ZX06e3N0YXJ0OmUsZW5kOmUraX19ZnVuY3Rpb24gVWEoZSl7Y29uc3Qg"
+    "aT17bDplLmxlZnQrZS5fcGFkZGluZy5sZWZ0LHI6ZS5yaWdodC1lLl9wYWRkaW5nLnJpZ2h0LHQ6ZS50b3ArZS5fcGFkZGluZy50"
+    "b3AsYjplLmJvdHRvbS1lLl9wYWRkaW5nLmJvdHRvbX0scz1PYmplY3QuYXNzaWduKHt9LGkpLGE9W10sbj1bXSxvPWUuX3BvaW50"
+    "TGFiZWxzLmxlbmd0aCxyPWUub3B0aW9ucy5wb2ludExhYmVscyxsPXIuY2VudGVyUG9pbnRMYWJlbHM/Uy9vOjA7Zm9yKGxldCB0"
+    "PTA7dDxvO3QrKyl7Y29uc3Qgbz1yLnNldENvbnRleHQoZS5nZXRQb2ludExhYmVsQ29udGV4dCh0KSk7blt0XT1vLnBhZGRpbmc7"
+    "dmFyIGg9ZS5nZXRQb2ludFBvc2l0aW9uKHQsZS5kcmF3aW5nQXJlYStuW3RdLGwpLGM9eihvLmZvbnQpLGQ9KGQ9ZS5jdHgsYz1j"
+    "LHU9Tyh1PWUuX3BvaW50TGFiZWxzW3RdKT91Olt1XSx7dzpFZShkLGMuc3RyaW5nLHUpLGg6dS5sZW5ndGgqYy5saW5lSGVpZ2h0"
+    "fSksdT0oYVt0XT1kLHYoZS5nZXRJbmRleEFuZ2xlKHQpK2wpKSxjPU1hdGgucm91bmQoY3QodSkpO3tnPXZvaWQgMDtmPXZvaWQg"
+    "MDtwPXZvaWQgMDttPXZvaWQgMDtiPXZvaWQgMDt4PXZvaWQgMDtwPXZvaWQgMDt2YXIgZz1zO3ZhciBmPWk7dmFyIHA9dTt2YXIg"
+    "bT0kYShjLGgueCxkLncsMCwxODApO3ZhciBiPSRhKGMsaC55LGQuaCw5MCwyNzApO3ZhciB4PU1hdGguYWJzKE1hdGguc2luKHAp"
+    "KSxwPU1hdGguYWJzKE1hdGguY29zKHApKTtsZXQgdD0wLGU9MDttLnN0YXJ0PGYubD8odD0oZi5sLW0uc3RhcnQpL3gsZy5sPU1h"
+    "dGgubWluKGcubCxmLmwtdCkpOm0uZW5kPmYuciYmKHQ9KG0uZW5kLWYucikveCxnLnI9TWF0aC5tYXgoZy5yLGYucit0KSksYi5z"
+    "dGFydDxmLnQ/KGU9KGYudC1iLnN0YXJ0KS9wLGcudD1NYXRoLm1pbihnLnQsZi50LWUpKTpiLmVuZD5mLmImJihlPShiLmVuZC1m"
+    "LmIpL3AsZy5iPU1hdGgubWF4KGcuYixmLmIrZSkpfX12YXIgZCx1O2Uuc2V0Q2VudGVyUG9pbnQoaS5sLXMubCxzLnItaS5yLGku"
+    "dC1zLnQscy5iLWkuYiksZS5fcG9pbnRMYWJlbEl0ZW1zPWZ1bmN0aW9uKGUsaSxzKXtjb25zdCBhPVtdLG49ZS5fcG9pbnRMYWJl"
+    "bHMubGVuZ3RoLHQ9ZS5vcHRpb25zLHtjZW50ZXJQb2ludExhYmVsczpvLGRpc3BsYXk6cn09dC5wb2ludExhYmVscyxsPXtleHRy"
+    "YTpZYSh0KS8yLGFkZGl0aW9uYWxBbmdsZTpvP1MvbjowfTtsZXQgaDtmb3IobGV0IHQ9MDt0PG47dCsrKXtsLnBhZGRpbmc9c1t0"
+    "XSxsLnNpemU9aVt0XTtjb25zdCBuPWZ1bmN0aW9uKHQsZSxpKXtjb25zdCBzPXQuZHJhd2luZ0FyZWEse2V4dHJhOmEsYWRkaXRp"
+    "b25hbEFuZ2xlOm4scGFkZGluZzpvLHNpemU6cn09aSxsPXQuZ2V0UG9pbnRQb3NpdGlvbihlLHMrYStvLG4pLGg9TWF0aC5yb3Vu"
+    "ZChjdCh2KGwuYW5nbGUrRCkpKSxjPWZ1bmN0aW9uKHQsZSl7cmV0dXJuIDkwPT09aHx8MjcwPT09aD90LT1lLzI6KDI3MDxofHxo"
+    "PDkwKSYmKHQtPWUpLHR9KGwueSxyLmgpLGQ9ZnVuY3Rpb24odCl7cmV0dXJuIDA9PT10fHwxODA9PT10PyJjZW50ZXIiOnQ8MTgw"
+    "PyJsZWZ0IjoicmlnaHQifShoKSx1PWZ1bmN0aW9uKHQsZSl7cmV0dXJuInJpZ2h0Ij09PWQ/dC09ZToiY2VudGVyIj09PWQmJih0"
+    "LT1lLzIpLHR9KGwueCxyLncpO3JldHVybnt2aXNpYmxlOiEwLHg6bC54LHk6Yyx0ZXh0QWxpZ246ZCxsZWZ0OnUsdG9wOmMscmln"
+    "aHQ6dStyLncsYm90dG9tOmMrci5ofX0oZSx0LGwpO2EucHVzaChuKSwiYXV0byI9PT1yJiYobi52aXNpYmxlPWZ1bmN0aW9uKHQs"
+    "ZSl7aWYoIWUpcmV0dXJuITA7dmFye2xlZnQ6dCx0b3A6aSxyaWdodDpzLGJvdHRvbTphfT10O3JldHVybiEoTSh7eDp0LHk6aX0s"
+    "ZSl8fE0oe3g6dCx5OmF9LGUpfHxNKHt4OnMseTppfSxlKXx8TSh7eDpzLHk6YX0sZSkpfShuLGgpLG4udmlzaWJsZSYmKGg9bikp"
+    "fXJldHVybiBhfShlLGEsbil9ZnVuY3Rpb24gWGEoZSxpLHQscyl7Y29uc3QgYT1lWyJjdHgiXTtpZih0KWEuYXJjKGUueENlbnRl"
+    "cixlLnlDZW50ZXIsaSwwLF8pO2Vsc2V7dmFyIG49ZS5nZXRQb2ludFBvc2l0aW9uKDAsaSk7YS5tb3ZlVG8obi54LG4ueSk7Zm9y"
+    "KGxldCB0PTE7dDxzO3QrKyluPWUuZ2V0UG9pbnRQb3NpdGlvbih0LGkpLGEubGluZVRvKG4ueCxuLnkpfX1jbGFzcyBxYSBleHRl"
+    "bmRzIEZhe3N0YXRpYyBpZD0icmFkaWFsTGluZWFyIjtzdGF0aWMgZGVmYXVsdHM9e2Rpc3BsYXk6ITAsYW5pbWF0ZTohMCxwb3Np"
+    "dGlvbjoiY2hhcnRBcmVhIixhbmdsZUxpbmVzOntkaXNwbGF5OiEwLGxpbmVXaWR0aDoxLGJvcmRlckRhc2g6W10sYm9yZGVyRGFz"
+    "aE9mZnNldDowfSxncmlkOntjaXJjdWxhcjohMX0sc3RhcnRBbmdsZTowLHRpY2tzOntzaG93TGFiZWxCYWNrZHJvcDohMCxjYWxs"
+    "YmFjazpnZS5mb3JtYXR0ZXJzLm51bWVyaWN9LHBvaW50TGFiZWxzOntiYWNrZHJvcENvbG9yOnZvaWQgMCxiYWNrZHJvcFBhZGRp"
+    "bmc6MixkaXNwbGF5OiEwLGZvbnQ6e3NpemU6MTB9LGNhbGxiYWNrOnQ9PnQscGFkZGluZzo1LGNlbnRlclBvaW50TGFiZWxzOiEx"
+    "fX07c3RhdGljIGRlZmF1bHRSb3V0ZXM9eyJhbmdsZUxpbmVzLmNvbG9yIjoiYm9yZGVyQ29sb3IiLCJwb2ludExhYmVscy5jb2xv"
+    "ciI6ImNvbG9yIiwidGlja3MuY29sb3IiOiJjb2xvciJ9O3N0YXRpYyBkZXNjcmlwdG9ycz17YW5nbGVMaW5lczp7X2ZhbGxiYWNr"
+    "OiJncmlkIn19O2NvbnN0cnVjdG9yKHQpe3N1cGVyKHQpLHRoaXMueENlbnRlcj12b2lkIDAsdGhpcy55Q2VudGVyPXZvaWQgMCx0"
+    "aGlzLmRyYXdpbmdBcmVhPXZvaWQgMCx0aGlzLl9wb2ludExhYmVscz1bXSx0aGlzLl9wb2ludExhYmVsSXRlbXM9W119c2V0RGlt"
+    "ZW5zaW9ucygpe3ZhciB0PXRoaXMuX3BhZGRpbmc9SShZYSh0aGlzLm9wdGlvbnMpLzIpLGU9dGhpcy53aWR0aD10aGlzLm1heFdp"
+    "ZHRoLXQud2lkdGgsaT10aGlzLmhlaWdodD10aGlzLm1heEhlaWdodC10LmhlaWdodDt0aGlzLnhDZW50ZXI9TWF0aC5mbG9vcih0"
+    "aGlzLmxlZnQrZS8yK3QubGVmdCksdGhpcy55Q2VudGVyPU1hdGguZmxvb3IodGhpcy50b3AraS8yK3QudG9wKSx0aGlzLmRyYXdp"
+    "bmdBcmVhPU1hdGguZmxvb3IoTWF0aC5taW4oZSxpKS8yKX1kZXRlcm1pbmVEYXRhTGltaXRzKCl7dmFye21pbjp0LG1heDplfT10"
+    "aGlzLmdldE1pbk1heCghMSk7dGhpcy5taW49cCh0KSYmIWlzTmFOKHQpP3Q6MCx0aGlzLm1heD1wKGUpJiYhaXNOYU4oZSk/ZTow"
+    "LHRoaXMuaGFuZGxlVGlja1JhbmdlT3B0aW9ucygpfWNvbXB1dGVUaWNrTGltaXQoKXtyZXR1cm4gTWF0aC5jZWlsKHRoaXMuZHJh"
+    "d2luZ0FyZWEvWWEodGhpcy5vcHRpb25zKSl9Z2VuZXJhdGVUaWNrTGFiZWxzKHQpe0ZhLnByb3RvdHlwZS5nZW5lcmF0ZVRpY2tM"
+    "YWJlbHMuY2FsbCh0aGlzLHQpLHRoaXMuX3BvaW50TGFiZWxzPXRoaXMuZ2V0TGFiZWxzKCkubWFwKCh0LGUpPT57dD1kKHRoaXMu"
+    "b3B0aW9ucy5wb2ludExhYmVscy5jYWxsYmFjayxbdCxlXSx0aGlzKTtyZXR1cm4gdHx8MD09PXQ/dDoiIn0pLmZpbHRlcigodCxl"
+    "KT0+dGhpcy5jaGFydC5nZXREYXRhVmlzaWJpbGl0eShlKSl9Zml0KCl7dmFyIHQ9dGhpcy5vcHRpb25zO3QuZGlzcGxheSYmdC5w"
+    "b2ludExhYmVscy5kaXNwbGF5P1VhKHRoaXMpOnRoaXMuc2V0Q2VudGVyUG9pbnQoMCwwLDAsMCl9c2V0Q2VudGVyUG9pbnQodCxl"
+    "LGkscyl7dGhpcy54Q2VudGVyKz1NYXRoLmZsb29yKCh0LWUpLzIpLHRoaXMueUNlbnRlcis9TWF0aC5mbG9vcigoaS1zKS8yKSx0"
+    "aGlzLmRyYXdpbmdBcmVhLT1NYXRoLm1pbih0aGlzLmRyYXdpbmdBcmVhLzIsTWF0aC5tYXgodCxlLGkscykpfWdldEluZGV4QW5n"
+    "bGUodCl7cmV0dXJuIHYodCooXy8odGhpcy5fcG9pbnRMYWJlbHMubGVuZ3RofHwxKSkrTCh0aGlzLm9wdGlvbnMuc3RhcnRBbmds"
+    "ZXx8MCkpfWdldERpc3RhbmNlRnJvbUNlbnRlckZvclZhbHVlKHQpe2lmKFAodCkpcmV0dXJuIE5hTjt2YXIgZT10aGlzLmRyYXdp"
+    "bmdBcmVhLyh0aGlzLm1heC10aGlzLm1pbik7cmV0dXJuIHRoaXMub3B0aW9ucy5yZXZlcnNlPyh0aGlzLm1heC10KSplOih0LXRo"
+    "aXMubWluKSplfWdldFZhbHVlRm9yRGlzdGFuY2VGcm9tQ2VudGVyKHQpe2lmKFAodCkpcmV0dXJuIE5hTjt0Lz10aGlzLmRyYXdp"
+    "bmdBcmVhLyh0aGlzLm1heC10aGlzLm1pbik7cmV0dXJuIHRoaXMub3B0aW9ucy5yZXZlcnNlP3RoaXMubWF4LXQ6dGhpcy5taW4r"
+    "dH1nZXRQb2ludExhYmVsQ29udGV4dCh0KXt2YXIgZT10aGlzLl9wb2ludExhYmVsc3x8W107aWYoMDw9dCYmdDxlLmxlbmd0aCly"
+    "ZXR1cm4gZT1lW3RdLFBpKHRoaXMuZ2V0Q29udGV4dCgpLHtsYWJlbDplLGluZGV4OnQsdHlwZToicG9pbnRMYWJlbCJ9KX1nZXRQ"
+    "b2ludFBvc2l0aW9uKHQsZSxpPTApe3Q9dGhpcy5nZXRJbmRleEFuZ2xlKHQpLUQraTtyZXR1cm57eDpNYXRoLmNvcyh0KSplK3Ro"
+    "aXMueENlbnRlcix5Ok1hdGguc2luKHQpKmUrdGhpcy55Q2VudGVyLGFuZ2xlOnR9fWdldFBvaW50UG9zaXRpb25Gb3JWYWx1ZSh0"
+    "LGUpe3JldHVybiB0aGlzLmdldFBvaW50UG9zaXRpb24odCx0aGlzLmdldERpc3RhbmNlRnJvbUNlbnRlckZvclZhbHVlKGUpKX1n"
+    "ZXRCYXNlUG9zaXRpb24odCl7cmV0dXJuIHRoaXMuZ2V0UG9pbnRQb3NpdGlvbkZvclZhbHVlKHR8fDAsdGhpcy5nZXRCYXNlVmFs"
+    "dWUoKSl9Z2V0UG9pbnRMYWJlbFBvc2l0aW9uKHQpe3ZhcntsZWZ0OnQsdG9wOmUscmlnaHQ6aSxib3R0b206c309dGhpcy5fcG9p"
+    "bnRMYWJlbEl0ZW1zW3RdO3JldHVybntsZWZ0OnQsdG9wOmUscmlnaHQ6aSxib3R0b206c319ZHJhd0JhY2tncm91bmQoKXt2YXJ7"
+    "YmFja2dyb3VuZENvbG9yOnQsZ3JpZDp7Y2lyY3VsYXI6ZX19PXRoaXMub3B0aW9ucztpZih0KXtjb25zdCBpPXRoaXMuY3R4O2ku"
+    "c2F2ZSgpLGkuYmVnaW5QYXRoKCksWGEodGhpcyx0aGlzLmdldERpc3RhbmNlRnJvbUNlbnRlckZvclZhbHVlKHRoaXMuX2VuZFZh"
+    "bHVlKSxlLHRoaXMuX3BvaW50TGFiZWxzLmxlbmd0aCksaS5jbG9zZVBhdGgoKSxpLmZpbGxTdHlsZT10LGkuZmlsbCgpLGkucmVz"
+    "dG9yZSgpfX1kcmF3R3JpZCgpe2NvbnN0IHQ9dGhpcy5jdHgsZT10aGlzLm9wdGlvbnMse2FuZ2xlTGluZXM6aSxncmlkOmgsYm9y"
+    "ZGVyOmN9PWUsZD10aGlzLl9wb2ludExhYmVscy5sZW5ndGg7bGV0IHMsdSxhO2lmKGUucG9pbnRMYWJlbHMuZGlzcGxheSl7dmFy"
+    "IG49dGhpcyxvPWQ7Y29uc3R7Y3R4Ol8sb3B0aW9uczp7cG9pbnRMYWJlbHM6eX19PW47Zm9yKGxldCB0PW8tMTswPD10O3QtLSl7"
+    "Y29uc3Qgbz1uLl9wb2ludExhYmVsSXRlbXNbdF07aWYoby52aXNpYmxlKXt2YXIgcixsPXkuc2V0Q29udGV4dChuLmdldFBvaW50"
+    "TGFiZWxDb250ZXh0KHQpKSxnPShtPXg9cj1mPXI9dj14PWI9bT1wPWY9Zz12b2lkIDAsXyksZj1sLHA9byx7bGVmdDptLHRvcDpi"
+    "LHJpZ2h0OngsYm90dG9tOnZ9PXA7aWYoIVAocj1mWyJiYWNrZHJvcENvbG9yIl0pKXtjb25zdCBwPXdpKGYuYm9yZGVyUmFkaXVz"
+    "KSxQPUkoZi5iYWNrZHJvcFBhZGRpbmcpO2cuZmlsbFN0eWxlPXI7Zj1tLVAubGVmdCxyPWItUC50b3AseD14LW0rUC53aWR0aCxt"
+    "PXYtYitQLmhlaWdodDtPYmplY3QudmFsdWVzKHApLnNvbWUodD0+MCE9PXQpPyhnLmJlZ2luUGF0aCgpLGplKGcse3g6Zix5OnIs"
+    "dzp4LGg6bSxyYWRpdXM6cH0pLGcuZmlsbCgpKTpnLmZpbGxSZWN0KGYscix4LG0pfXZhciBwPXoobC5mb250KSx7eDp2LHk6Yix0"
+    "ZXh0QWxpZ246Z309bztIZShfLG4uX3BvaW50TGFiZWxzW3RdLHYsYitwLmxpbmVIZWlnaHQvMixwLHtjb2xvcjpsLmNvbG9yLHRl"
+    "eHRBbGlnbjpnLHRleHRCYXNlbGluZToibWlkZGxlIn0pfX19aWYoaC5kaXNwbGF5JiZ0aGlzLnRpY2tzLmZvckVhY2goKHQsZSk9"
+    "PntpZigwIT09ZSl7dT10aGlzLmdldERpc3RhbmNlRnJvbUNlbnRlckZvclZhbHVlKHQudmFsdWUpO3Q9dGhpcy5nZXRDb250ZXh0"
+    "KGUpLGU9aC5zZXRDb250ZXh0KHQpLHQ9Yy5zZXRDb250ZXh0KHQpO3t2YXIgaT10aGlzLHM9dSxhPWQ7Y29uc3Qgbj1pLmN0eCxv"
+    "PWUuY2lyY3VsYXIse2NvbG9yOnIsbGluZVdpZHRoOmx9PWU7IW8mJiFhfHwhcnx8IWx8fHM8MHx8KG4uc2F2ZSgpLG4uc3Ryb2tl"
+    "U3R5bGU9cixuLmxpbmVXaWR0aD1sLG4uc2V0TGluZURhc2godC5kYXNoKSxuLmxpbmVEYXNoT2Zmc2V0PXQuZGFzaE9mZnNldCxu"
+    "LmJlZ2luUGF0aCgpLFhhKGkscyxvLGEpLG4uY2xvc2VQYXRoKCksbi5zdHJva2UoKSxuLnJlc3RvcmUoKSl9fX0pLGkuZGlzcGxh"
+    "eSl7Zm9yKHQuc2F2ZSgpLHM9ZC0xOzA8PXM7cy0tKXtjb25zdCBoPWkuc2V0Q29udGV4dCh0aGlzLmdldFBvaW50TGFiZWxDb250"
+    "ZXh0KHMpKSx7Y29sb3I6YyxsaW5lV2lkdGg6ZH09aDtkJiZjJiYodC5saW5lV2lkdGg9ZCx0LnN0cm9rZVN0eWxlPWMsdC5zZXRM"
+    "aW5lRGFzaChoLmJvcmRlckRhc2gpLHQubGluZURhc2hPZmZzZXQ9aC5ib3JkZXJEYXNoT2Zmc2V0LHU9dGhpcy5nZXREaXN0YW5j"
+    "ZUZyb21DZW50ZXJGb3JWYWx1ZShlLnRpY2tzLnJldmVyc2U/dGhpcy5taW46dGhpcy5tYXgpLGE9dGhpcy5nZXRQb2ludFBvc2l0"
+    "aW9uKHMsdSksdC5iZWdpblBhdGgoKSx0Lm1vdmVUbyh0aGlzLnhDZW50ZXIsdGhpcy55Q2VudGVyKSx0LmxpbmVUbyhhLngsYS55"
+    "KSx0LnN0cm9rZSgpKX10LnJlc3RvcmUoKX19ZHJhd0JvcmRlcigpe31kcmF3TGFiZWxzKCl7Y29uc3Qgbz10aGlzLmN0eCxyPXRo"
+    "aXMub3B0aW9ucyxsPXIudGlja3M7aWYobC5kaXNwbGF5KXt2YXIgdD10aGlzLmdldEluZGV4QW5nbGUoMCk7bGV0IGEsbjtvLnNh"
+    "dmUoKSxvLnRyYW5zbGF0ZSh0aGlzLnhDZW50ZXIsdGhpcy55Q2VudGVyKSxvLnJvdGF0ZSh0KSxvLnRleHRBbGlnbj0iY2VudGVy"
+    "IixvLnRleHRCYXNlbGluZT0ibWlkZGxlIix0aGlzLnRpY2tzLmZvckVhY2goKHQsZSk9PntpZigwIT09ZXx8ci5yZXZlcnNlKXt2"
+    "YXIgaT1sLnNldENvbnRleHQodGhpcy5nZXRDb250ZXh0KGUpKSxzPXooaS5mb250KTtpZihhPXRoaXMuZ2V0RGlzdGFuY2VGcm9t"
+    "Q2VudGVyRm9yVmFsdWUodGhpcy50aWNrc1tlXS52YWx1ZSksaS5zaG93TGFiZWxCYWNrZHJvcCl7by5mb250PXMuc3RyaW5nLG49"
+    "by5tZWFzdXJlVGV4dCh0LmxhYmVsKS53aWR0aCxvLmZpbGxTdHlsZT1pLmJhY2tkcm9wQ29sb3I7Y29uc3Qgcj1JKGkuYmFja2Ry"
+    "b3BQYWRkaW5nKTtvLmZpbGxSZWN0KC1uLzItci5sZWZ0LC1hLXMuc2l6ZS8yLXIudG9wLG4rci53aWR0aCxzLnNpemUrci5oZWln"
+    "aHQpfUhlKG8sdC5sYWJlbCwwLC1hLHMse2NvbG9yOmkuY29sb3Isc3Ryb2tlQ29sb3I6aS50ZXh0U3Ryb2tlQ29sb3Isc3Ryb2tl"
+    "V2lkdGg6aS50ZXh0U3Ryb2tlV2lkdGh9KX19KSxvLnJlc3RvcmUoKX19ZHJhd1RpdGxlKCl7fX1jb25zdCBLYT17bWlsbGlzZWNv"
+    "bmQ6e2NvbW1vbjohMCxzaXplOjEsc3RlcHM6MWUzfSxzZWNvbmQ6e2NvbW1vbjohMCxzaXplOjFlMyxzdGVwczo2MH0sbWludXRl"
+    "Ontjb21tb246ITAsc2l6ZTo2ZTQsc3RlcHM6NjB9LGhvdXI6e2NvbW1vbjohMCxzaXplOjM2ZTUsc3RlcHM6MjR9LGRheTp7Y29t"
+    "bW9uOiEwLHNpemU6ODY0ZTUsc3RlcHM6MzB9LHdlZWs6e2NvbW1vbjohMSxzaXplOjYwNDhlNSxzdGVwczo0fSxtb250aDp7Y29t"
+    "bW9uOiEwLHNpemU6MjYyOGU2LHN0ZXBzOjEyfSxxdWFydGVyOntjb21tb246ITEsc2l6ZTo3ODg0ZTYsc3RlcHM6NH0seWVhcjp7"
+    "Y29tbW9uOiEwLHNpemU6MzE1NGU3fX0saD1PYmplY3Qua2V5cyhLYSk7ZnVuY3Rpb24gR2EodCxlKXtyZXR1cm4gdC1lfWZ1bmN0"
+    "aW9uIFphKHQsZSl7aWYoUChlKSlyZXR1cm4gbnVsbDtjb25zdCBpPXQuX2FkYXB0ZXIse3BhcnNlcjpzLHJvdW5kOmEsaXNvV2Vl"
+    "a2RheTpufT10Ll9wYXJzZU9wdHM7bGV0IG89ZTtyZXR1cm4gbnVsbD09PShvPXAobz0iZnVuY3Rpb24iPT10eXBlb2Ygcz9zKG8p"
+    "Om8pP286InN0cmluZyI9PXR5cGVvZiBzP2kucGFyc2UobyxzKTppLnBhcnNlKG8pKT9udWxsOisobz1hPyJ3ZWVrIiE9PWF8fCFy"
+    "dChuKSYmITAhPT1uP2kuc3RhcnRPZihvLGEpOmkuc3RhcnRPZihvLCJpc29XZWVrIixuKTpvKX1mdW5jdGlvbiBKYShlLGkscyxh"
+    "KXtjb25zdCBuPWgubGVuZ3RoO2ZvcihsZXQgdD1oLmluZGV4T2YoZSk7dDxuLTE7Kyt0KXtjb25zdCBlPUthW2hbdF1dLG49ZS5z"
+    "dGVwc3x8TnVtYmVyLk1BWF9TQUZFX0lOVEVHRVI7aWYoZS5jb21tb24mJk1hdGguY2VpbCgocy1pKS8obiplLnNpemUpKTw9YSly"
+    "ZXR1cm4gaFt0XX1yZXR1cm4gaFtuLTFdfWZ1bmN0aW9uIFFhKHQsZSxpKXt2YXIgcyxhO2k/aS5sZW5ndGgmJih7bG86cyxoaTph"
+    "fT1idChpLGUpLHRbaVtzXT49ZT9pW3NdOmlbYV1dPSEwKTp0W2VdPSEwfWZ1bmN0aW9uIHRuKGksdCxzKXtjb25zdCBhPVtdLG49"
+    "e30sZT10Lmxlbmd0aDtsZXQgbyxyO2ZvcihvPTA7bzxlOysrbylyPXRbb10sbltyXT1vLGEucHVzaCh7dmFsdWU6cixtYWpvcjoh"
+    "MX0pO2lmKDAhPT1lJiZzKXt2YXIgbD1hLGg9bixjPXM7Y29uc3QgZD1pLl9hZGFwdGVyLHU9K2Quc3RhcnRPZihsWzBdLnZhbHVl"
+    "LGMpLGc9bFtsLmxlbmd0aC0xXS52YWx1ZTtsZXQgdCxlO2Zvcih0PXU7dDw9Zzt0PStkLmFkZCh0LDEsYykpMDw9KGU9aFt0XSkm"
+    "JihsW2VdLm1ham9yPSEwKTtyZXR1cm4gbH1yZXR1cm4gYX1jbGFzcyBlbiBleHRlbmRzIHpze3N0YXRpYyBpZD0idGltZSI7c3Rh"
+    "dGljIGRlZmF1bHRzPXtib3VuZHM6ImRhdGEiLGFkYXB0ZXJzOnt9LHRpbWU6e3BhcnNlcjohMSx1bml0OiExLHJvdW5kOiExLGlz"
+    "b1dlZWtkYXk6ITEsbWluVW5pdDoibWlsbGlzZWNvbmQiLGRpc3BsYXlGb3JtYXRzOnt9fSx0aWNrczp7c291cmNlOiJhdXRvIixj"
+    "YWxsYmFjazohMSxtYWpvcjp7ZW5hYmxlZDohMX19fTtjb25zdHJ1Y3Rvcih0KXtzdXBlcih0KSx0aGlzLl9jYWNoZT17ZGF0YTpb"
+    "XSxsYWJlbHM6W10sYWxsOltdfSx0aGlzLl91bml0PSJkYXkiLHRoaXMuX21ham9yVW5pdD12b2lkIDAsdGhpcy5fb2Zmc2V0cz17"
+    "fSx0aGlzLl9ub3JtYWxpemVkPSExLHRoaXMuX3BhcnNlT3B0cz12b2lkIDB9aW5pdCh0LGU9e30pe2NvbnN0IGk9dC50aW1lfHwo"
+    "dC50aW1lPXt9KSxzPXRoaXMuX2FkYXB0ZXI9bmV3IGhhLl9kYXRlKHQuYWRhcHRlcnMuZGF0ZSk7cy5pbml0KGUpLCQoaS5kaXNw"
+    "bGF5Rm9ybWF0cyxzLmZvcm1hdHMoKSksdGhpcy5fcGFyc2VPcHRzPXtwYXJzZXI6aS5wYXJzZXIscm91bmQ6aS5yb3VuZCxpc29X"
+    "ZWVrZGF5OmkuaXNvV2Vla2RheX0sc3VwZXIuaW5pdCh0KSx0aGlzLl9ub3JtYWxpemVkPWUubm9ybWFsaXplZH1wYXJzZSh0LGUp"
+    "e3JldHVybiB2b2lkIDA9PT10P251bGw6WmEodGhpcyx0KX1iZWZvcmVMYXlvdXQoKXtzdXBlci5iZWZvcmVMYXlvdXQoKSx0aGlz"
+    "Ll9jYWNoZT17ZGF0YTpbXSxsYWJlbHM6W10sYWxsOltdfX1kZXRlcm1pbmVEYXRhTGltaXRzKCl7Y29uc3QgdD10aGlzLm9wdGlv"
+    "bnMsZT10aGlzLl9hZGFwdGVyLGk9dC50aW1lLnVuaXR8fCJkYXkiO2xldHttaW46cyxtYXg6YSxtaW5EZWZpbmVkOm4sbWF4RGVm"
+    "aW5lZDpvfT10aGlzLmdldFVzZXJCb3VuZHMoKTtmdW5jdGlvbiByKHQpe258fGlzTmFOKHQubWluKXx8KHM9TWF0aC5taW4ocyx0"
+    "Lm1pbikpLG98fGlzTmFOKHQubWF4KXx8KGE9TWF0aC5tYXgoYSx0Lm1heCkpfW4mJm98fChyKHRoaXMuX2dldExhYmVsQm91bmRz"
+    "KCkpLCJ0aWNrcyI9PT10LmJvdW5kcyYmImxhYmVscyI9PT10LnRpY2tzLnNvdXJjZXx8cih0aGlzLmdldE1pbk1heCghMSkpKSxz"
+    "PXAocykmJiFpc05hTihzKT9zOitlLnN0YXJ0T2YoRGF0ZS5ub3coKSxpKSxhPXAoYSkmJiFpc05hTihhKT9hOitlLmVuZE9mKERh"
+    "dGUubm93KCksaSkrMSx0aGlzLm1pbj1NYXRoLm1pbihzLGEtMSksdGhpcy5tYXg9TWF0aC5tYXgocysxLGEpfV9nZXRMYWJlbEJv"
+    "dW5kcygpe3ZhciB0PXRoaXMuZ2V0TGFiZWxUaW1lc3RhbXBzKCk7bGV0IGU9TnVtYmVyLlBPU0lUSVZFX0lORklOSVRZLGk9TnVt"
+    "YmVyLk5FR0FUSVZFX0lORklOSVRZO3JldHVybiB0Lmxlbmd0aCYmKGU9dFswXSxpPXRbdC5sZW5ndGgtMV0pLHttaW46ZSxtYXg6"
+    "aX19YnVpbGRUaWNrcygpe3ZhciB0PXRoaXMub3B0aW9ucyxlPXQudGltZSxpPXQudGlja3Mscz0ibGFiZWxzIj09PWkuc291cmNl"
+    "P3RoaXMuZ2V0TGFiZWxUaW1lc3RhbXBzKCk6dGhpcy5fZ2VuZXJhdGUoKTsidGlja3MiPT09dC5ib3VuZHMmJnMubGVuZ3RoJiYo"
+    "dGhpcy5taW49dGhpcy5fdXNlck1pbnx8c1swXSx0aGlzLm1heD10aGlzLl91c2VyTWF4fHxzW3MubGVuZ3RoLTFdKTtjb25zdCBh"
+    "PXRoaXMubWluLG49dnQocyxhLHRoaXMubWF4KTtyZXR1cm4gdGhpcy5fdW5pdD1lLnVuaXR8fChpLmF1dG9Ta2lwP0phKGUubWlu"
+    "VW5pdCx0aGlzLm1pbix0aGlzLm1heCx0aGlzLl9nZXRMYWJlbENhcGFjaXR5KGEpKTpmdW5jdGlvbihlLGkscyxhLG4pe2Zvcihs"
+    "ZXQgdD1oLmxlbmd0aC0xO3Q+PWguaW5kZXhPZihzKTt0LS0pe2NvbnN0IHM9aFt0XTtpZihLYVtzXS5jb21tb24mJmUuX2FkYXB0"
+    "ZXIuZGlmZihuLGEscyk+PWktMSlyZXR1cm4gc31yZXR1cm4gaFtzP2guaW5kZXhPZihzKTowXX0odGhpcyxuLmxlbmd0aCxlLm1p"
+    "blVuaXQsdGhpcy5taW4sdGhpcy5tYXgpKSx0aGlzLl9tYWpvclVuaXQ9aS5tYWpvci5lbmFibGVkJiYieWVhciIhPT10aGlzLl91"
+    "bml0P2Z1bmN0aW9uKGkpe2ZvcihsZXQgdD1oLmluZGV4T2YoaSkrMSxlPWgubGVuZ3RoO3Q8ZTsrK3QpaWYoS2FbaFt0XV0uY29t"
+    "bW9uKXJldHVybiBoW3RdfSh0aGlzLl91bml0KTp2b2lkIDAsdGhpcy5pbml0T2Zmc2V0cyhzKSx0LnJldmVyc2UmJm4ucmV2ZXJz"
+    "ZSgpLHRuKHRoaXMsbix0aGlzLl9tYWpvclVuaXQpfWFmdGVyQXV0b1NraXAoKXt0aGlzLm9wdGlvbnMub2Zmc2V0QWZ0ZXJBdXRv"
+    "c2tpcCYmdGhpcy5pbml0T2Zmc2V0cyh0aGlzLnRpY2tzLm1hcCh0PT4rdC52YWx1ZSkpfWluaXRPZmZzZXRzKHQ9W10pe2xldCBl"
+    "LGkscz0wLGE9MDt0aGlzLm9wdGlvbnMub2Zmc2V0JiZ0Lmxlbmd0aCYmKGU9dGhpcy5nZXREZWNpbWFsRm9yVmFsdWUodFswXSks"
+    "cz0xPT09dC5sZW5ndGg/MS1lOih0aGlzLmdldERlY2ltYWxGb3JWYWx1ZSh0WzFdKS1lKS8yLGk9dGhpcy5nZXREZWNpbWFsRm9y"
+    "VmFsdWUodFt0Lmxlbmd0aC0xXSksYT0xPT09dC5sZW5ndGg/aTooaS10aGlzLmdldERlY2ltYWxGb3JWYWx1ZSh0W3QubGVuZ3Ro"
+    "LTJdKSkvMik7dD10Lmxlbmd0aDwzPy41Oi4yNTtzPUMocywwLHQpLGE9QyhhLDAsdCksdGhpcy5fb2Zmc2V0cz17c3RhcnQ6cyxl"
+    "bmQ6YSxmYWN0b3I6MS8ocysxK2EpfX1fZ2VuZXJhdGUoKXtjb25zdCB0PXRoaXMuX2FkYXB0ZXIsZT10aGlzLm1pbixpPXRoaXMu"
+    "bWF4LHM9dGhpcy5vcHRpb25zLGE9cy50aW1lLG49YS51bml0fHxKYShhLm1pblVuaXQsZSxpLHRoaXMuX2dldExhYmVsQ2FwYWNp"
+    "dHkoZSkpLG89VChzLnRpY2tzLnN0ZXBTaXplLDEpLHI9IndlZWsiPT09biYmYS5pc29XZWVrZGF5LGw9cnQocil8fCEwPT09cixo"
+    "PXt9O2xldCBjLGQsdT1lO2lmKGwmJih1PSt0LnN0YXJ0T2YodSwiaXNvV2VlayIscikpLHU9K3Quc3RhcnRPZih1LGw/ImRheSI6"
+    "biksdC5kaWZmKGksZSxuKT4xZTUqbyl0aHJvdyBuZXcgRXJyb3IoZSsiIGFuZCAiK2krIiBhcmUgdG9vIGZhciBhcGFydCB3aXRo"
+    "IHN0ZXBTaXplIG9mICIrbysiICIrbik7dmFyIGc9ImRhdGEiPT09cy50aWNrcy5zb3VyY2UmJnRoaXMuZ2V0RGF0YVRpbWVzdGFt"
+    "cHMoKTtmb3IoYz11LGQ9MDtjPGk7Yz0rdC5hZGQoYyxvLG4pLGQrKylRYShoLGMsZyk7cmV0dXJuIGMhPT1pJiYidGlja3MiIT09"
+    "cy5ib3VuZHMmJjEhPT1kfHxRYShoLGMsZyksT2JqZWN0LmtleXMoaCkuc29ydChHYSkubWFwKHQ9Pit0KX1nZXRMYWJlbEZvclZh"
+    "bHVlKHQpe2NvbnN0IGU9dGhpcy5fYWRhcHRlcixpPXRoaXMub3B0aW9ucy50aW1lO3JldHVybiBpLnRvb2x0aXBGb3JtYXQ/ZS5m"
+    "b3JtYXQodCxpLnRvb2x0aXBGb3JtYXQpOmUuZm9ybWF0KHQsaS5kaXNwbGF5Rm9ybWF0cy5kYXRldGltZSl9Zm9ybWF0KHQsZSl7"
+    "dmFyIGk9dGhpcy5vcHRpb25zLnRpbWUuZGlzcGxheUZvcm1hdHMscz10aGlzLl91bml0LGU9ZXx8aVtzXTtyZXR1cm4gdGhpcy5f"
+    "YWRhcHRlci5mb3JtYXQodCxlKX1fdGlja0Zvcm1hdEZ1bmN0aW9uKHQsZSxpLHMpe3ZhciBhPXRoaXMub3B0aW9ucyxuPWEudGlj"
+    "a3MuY2FsbGJhY2s7aWYobilyZXR1cm4gZChuLFt0LGUsaV0sdGhpcyk7dmFyIG49YS50aW1lLmRpc3BsYXlGb3JtYXRzLGE9dGhp"
+    "cy5fdW5pdCxvPXRoaXMuX21ham9yVW5pdCxhPWEmJm5bYV0sbj1vJiZuW29dLGk9aVtlXSxlPW8mJm4mJmkmJmkubWFqb3I7cmV0"
+    "dXJuIHRoaXMuX2FkYXB0ZXIuZm9ybWF0KHQsc3x8KGU/bjphKSl9Z2VuZXJhdGVUaWNrTGFiZWxzKHQpe2xldCBlLGkscztmb3Io"
+    "ZT0wLGk9dC5sZW5ndGg7ZTxpOysrZSkocz10W2VdKS5sYWJlbD10aGlzLl90aWNrRm9ybWF0RnVuY3Rpb24ocy52YWx1ZSxlLHQp"
+    "fWdldERlY2ltYWxGb3JWYWx1ZSh0KXtyZXR1cm4gbnVsbD09PXQ/TmFOOih0LXRoaXMubWluKS8odGhpcy5tYXgtdGhpcy5taW4p"
+    "fWdldFBpeGVsRm9yVmFsdWUodCl7dmFyIGU9dGhpcy5fb2Zmc2V0cyx0PXRoaXMuZ2V0RGVjaW1hbEZvclZhbHVlKHQpO3JldHVy"
+    "biB0aGlzLmdldFBpeGVsRm9yRGVjaW1hbCgoZS5zdGFydCt0KSplLmZhY3Rvcil9Z2V0VmFsdWVGb3JQaXhlbCh0KXt2YXIgZT10"
+    "aGlzLl9vZmZzZXRzLHQ9dGhpcy5nZXREZWNpbWFsRm9yUGl4ZWwodCkvZS5mYWN0b3ItZS5lbmQ7cmV0dXJuIHRoaXMubWluK3Qq"
+    "KHRoaXMubWF4LXRoaXMubWluKX1fZ2V0TGFiZWxTaXplKHQpe3ZhciBlPXRoaXMub3B0aW9ucy50aWNrcyx0PXRoaXMuY3R4Lm1l"
+    "YXN1cmVUZXh0KHQpLndpZHRoLGU9TCh0aGlzLmlzSG9yaXpvbnRhbCgpP2UubWF4Um90YXRpb246ZS5taW5Sb3RhdGlvbiksaT1N"
+    "YXRoLmNvcyhlKSxlPU1hdGguc2luKGUpLHM9dGhpcy5fcmVzb2x2ZVRpY2tGb250T3B0aW9ucygwKS5zaXplO3JldHVybnt3OnQq"
+    "aStzKmUsaDp0KmUrcyppfX1fZ2V0TGFiZWxDYXBhY2l0eSh0KXt2YXIgZT10aGlzLm9wdGlvbnMudGltZSxpPWUuZGlzcGxheUZv"
+    "cm1hdHMsZT1pW2UudW5pdF18fGkubWlsbGlzZWNvbmQsaT10aGlzLl90aWNrRm9ybWF0RnVuY3Rpb24odCwwLHRuKHRoaXMsW3Rd"
+    "LHRoaXMuX21ham9yVW5pdCksZSksdD10aGlzLl9nZXRMYWJlbFNpemUoaSksZT1NYXRoLmZsb29yKHRoaXMuaXNIb3Jpem9udGFs"
+    "KCk/dGhpcy53aWR0aC90Lnc6dGhpcy5oZWlnaHQvdC5oKS0xO3JldHVybiAwPGU/ZToxfWdldERhdGFUaW1lc3RhbXBzKCl7bGV0"
+    "IHQsZSxpPXRoaXMuX2NhY2hlLmRhdGF8fFtdO2lmKGkubGVuZ3RoKXJldHVybiBpO2NvbnN0IHM9dGhpcy5nZXRNYXRjaGluZ1Zp"
+    "c2libGVNZXRhcygpO2lmKHRoaXMuX25vcm1hbGl6ZWQmJnMubGVuZ3RoKXJldHVybiB0aGlzLl9jYWNoZS5kYXRhPXNbMF0uY29u"
+    "dHJvbGxlci5nZXRBbGxQYXJzZWRWYWx1ZXModGhpcyk7Zm9yKHQ9MCxlPXMubGVuZ3RoO3Q8ZTsrK3QpaT1pLmNvbmNhdChzW3Rd"
+    "LmNvbnRyb2xsZXIuZ2V0QWxsUGFyc2VkVmFsdWVzKHRoaXMpKTtyZXR1cm4gdGhpcy5fY2FjaGUuZGF0YT10aGlzLm5vcm1hbGl6"
+    "ZShpKX1nZXRMYWJlbFRpbWVzdGFtcHMoKXtjb25zdCB0PXRoaXMuX2NhY2hlLmxhYmVsc3x8W107bGV0IGUsaTtpZih0Lmxlbmd0"
+    "aClyZXR1cm4gdDt2YXIgcz10aGlzLmdldExhYmVscygpO2ZvcihlPTAsaT1zLmxlbmd0aDtlPGk7KytlKXQucHVzaChaYSh0aGlz"
+    "LHNbZV0pKTtyZXR1cm4gdGhpcy5fY2FjaGUubGFiZWxzPXRoaXMuX25vcm1hbGl6ZWQ/dDp0aGlzLm5vcm1hbGl6ZSh0KX1ub3Jt"
+    "YWxpemUodCl7cmV0dXJuIHd0KHQuc29ydChHYSkpfX1mdW5jdGlvbiBzbih0LGUsaSl7bGV0IHMsYSxuLG8scj0wLGw9dC5sZW5n"
+    "dGgtMTtpPyhlPj10W3JdLnBvcyYmZTw9dFtsXS5wb3MmJih7bG86cixoaTpsfT1mKHQsInBvcyIsZSkpLHtwb3M6cyx0aW1lOm59"
+    "PXRbcl0se3BvczphLHRpbWU6b309dFtsXSk6KGU+PXRbcl0udGltZSYmZTw9dFtsXS50aW1lJiYoe2xvOnIsaGk6bH09Zih0LCJ0"
+    "aW1lIixlKSkse3RpbWU6cyxwb3M6bn09dFtyXSx7dGltZTphLHBvczpvfT10W2xdKTtpPWEtcztyZXR1cm4gaT9uKyhvLW4pKihl"
+    "LXMpL2k6bn12YXIgYW49T2JqZWN0LmZyZWV6ZSh7X19wcm90b19fOm51bGwsQ2F0ZWdvcnlTY2FsZTpjbGFzcyBleHRlbmRzIHpz"
+    "e3N0YXRpYyBpZD0iY2F0ZWdvcnkiO3N0YXRpYyBkZWZhdWx0cz17dGlja3M6e2NhbGxiYWNrOklhfX07Y29uc3RydWN0b3IodCl7"
+    "c3VwZXIodCksdGhpcy5fc3RhcnRWYWx1ZT12b2lkIDAsdGhpcy5fdmFsdWVSYW5nZT0wLHRoaXMuX2FkZGVkTGFiZWxzPVtdfWlu"
+    "aXQodCl7dmFyIGU9dGhpcy5fYWRkZWRMYWJlbHM7aWYoZS5sZW5ndGgpe2NvbnN0IHQ9dGhpcy5nZXRMYWJlbHMoKTtmb3IodmFy"
+    "e2luZGV4OmksbGFiZWw6c31vZiBlKXRbaV09PT1zJiZ0LnNwbGljZShpLDEpO3RoaXMuX2FkZGVkTGFiZWxzPVtdfXN1cGVyLmlu"
+    "aXQodCl9cGFyc2UodCxlKXtpZihQKHQpKXJldHVybiBudWxsO3ZhciBpLHMsYSxuLG8scixsPXRoaXMuZ2V0TGFiZWxzKCk7cmV0"
+    "dXJuIGE9ZT1pc0Zpbml0ZShlKSYmbFtlXT09PXQ/ZTooaT1sLHM9VChlLHQ9dCksYT10aGlzLl9hZGRlZExhYmVscywtMT09PShy"
+    "PWkuaW5kZXhPZih0KSk/KG89cyxhPWEsInN0cmluZyI9PXR5cGVvZihuPXQpPyhvPWkucHVzaChuKS0xLGEudW5zaGlmdCh7aW5k"
+    "ZXg6byxsYWJlbDpufSkpOmlzTmFOKG4pJiYobz1udWxsKSxvKTpyIT09aS5sYXN0SW5kZXhPZih0KT9zOnIpLG49bC5sZW5ndGgt"
+    "MSxudWxsPT09YT9udWxsOkMoTWF0aC5yb3VuZChhKSwwLG4pfWRldGVybWluZURhdGFMaW1pdHMoKXt2YXJ7bWluRGVmaW5lZDp0"
+    "LG1heERlZmluZWQ6ZX09dGhpcy5nZXRVc2VyQm91bmRzKCk7bGV0e21pbjppLG1heDpzfT10aGlzLmdldE1pbk1heCghMCk7InRp"
+    "Y2tzIj09PXRoaXMub3B0aW9ucy5ib3VuZHMmJih0fHwoaT0wKSxlfHwocz10aGlzLmdldExhYmVscygpLmxlbmd0aC0xKSksdGhp"
+    "cy5taW49aSx0aGlzLm1heD1zfWJ1aWxkVGlja3MoKXtjb25zdCBlPXRoaXMubWluLGk9dGhpcy5tYXgsdD10aGlzLm9wdGlvbnMu"
+    "b2Zmc2V0LHM9W107bGV0IGE9dGhpcy5nZXRMYWJlbHMoKTthPTA9PT1lJiZpPT09YS5sZW5ndGgtMT9hOmEuc2xpY2UoZSxpKzEp"
+    "LHRoaXMuX3ZhbHVlUmFuZ2U9TWF0aC5tYXgoYS5sZW5ndGgtKHQ/MDoxKSwxKSx0aGlzLl9zdGFydFZhbHVlPXRoaXMubWluLSh0"
+    "Py41OjApO2ZvcihsZXQgdD1lO3Q8PWk7dCsrKXMucHVzaCh7dmFsdWU6dH0pO3JldHVybiBzfWdldExhYmVsRm9yVmFsdWUodCl7"
+    "cmV0dXJuIElhLmNhbGwodGhpcyx0KX1jb25maWd1cmUoKXtzdXBlci5jb25maWd1cmUoKSx0aGlzLmlzSG9yaXpvbnRhbCgpfHwo"
+    "dGhpcy5fcmV2ZXJzZVBpeGVscz0hdGhpcy5fcmV2ZXJzZVBpeGVscyl9Z2V0UGl4ZWxGb3JWYWx1ZSh0KXtyZXR1cm4gbnVsbD09"
+    "PSh0PSJudW1iZXIiIT10eXBlb2YgdD90aGlzLnBhcnNlKHQpOnQpP05hTjp0aGlzLmdldFBpeGVsRm9yRGVjaW1hbCgodC10aGlz"
+    "Ll9zdGFydFZhbHVlKS90aGlzLl92YWx1ZVJhbmdlKX1nZXRQaXhlbEZvclRpY2sodCl7dmFyIGU9dGhpcy50aWNrcztyZXR1cm4g"
+    "dDwwfHx0PmUubGVuZ3RoLTE/bnVsbDp0aGlzLmdldFBpeGVsRm9yVmFsdWUoZVt0XS52YWx1ZSl9Z2V0VmFsdWVGb3JQaXhlbCh0"
+    "KXtyZXR1cm4gTWF0aC5yb3VuZCh0aGlzLl9zdGFydFZhbHVlK3RoaXMuZ2V0RGVjaW1hbEZvclBpeGVsKHQpKnRoaXMuX3ZhbHVl"
+    "UmFuZ2UpfWdldEJhc2VQaXhlbCgpe3JldHVybiB0aGlzLmJvdHRvbX19LExpbmVhclNjYWxlOlZhLExvZ2FyaXRobWljU2NhbGU6"
+    "amEsUmFkaWFsTGluZWFyU2NhbGU6cWEsVGltZVNjYWxlOmVuLFRpbWVTZXJpZXNTY2FsZTpjbGFzcyBleHRlbmRzIGVue3N0YXRp"
+    "YyBpZD0idGltZXNlcmllcyI7c3RhdGljIGRlZmF1bHRzPWVuLmRlZmF1bHRzO2NvbnN0cnVjdG9yKHQpe3N1cGVyKHQpLHRoaXMu"
+    "X3RhYmxlPVtdLHRoaXMuX21pblBvcz12b2lkIDAsdGhpcy5fdGFibGVSYW5nZT12b2lkIDB9aW5pdE9mZnNldHMoKXt2YXIgdD10"
+    "aGlzLl9nZXRUaW1lc3RhbXBzRm9yVGFibGUoKSxlPXRoaXMuX3RhYmxlPXRoaXMuYnVpbGRMb29rdXBUYWJsZSh0KTt0aGlzLl9t"
+    "aW5Qb3M9c24oZSx0aGlzLm1pbiksdGhpcy5fdGFibGVSYW5nZT1zbihlLHRoaXMubWF4KS10aGlzLl9taW5Qb3Msc3VwZXIuaW5p"
+    "dE9mZnNldHModCl9YnVpbGRMb29rdXBUYWJsZSh0KXtjb25zdHttaW46ZSxtYXg6aX09dGhpcyxzPVtdLGE9W107bGV0IG4sbyxy"
+    "LGwsaDtmb3Iobj0wLG89dC5sZW5ndGg7bjxvOysrbikobD10W25dKT49ZSYmbDw9aSYmcy5wdXNoKGwpO2lmKHMubGVuZ3RoPDIp"
+    "cmV0dXJuW3t0aW1lOmUscG9zOjB9LHt0aW1lOmkscG9zOjF9XTtmb3Iobj0wLG89cy5sZW5ndGg7bjxvOysrbiloPXNbbisxXSxy"
+    "PXNbbi0xXSxsPXNbbl0sTWF0aC5yb3VuZCgoaCtyKS8yKSE9PWwmJmEucHVzaCh7dGltZTpsLHBvczpuLyhvLTEpfSk7cmV0dXJu"
+    "IGF9X2dlbmVyYXRlKCl7dmFyIHQ9dGhpcy5taW4sZT10aGlzLm1heDtsZXQgaT1zdXBlci5nZXREYXRhVGltZXN0YW1wcygpO3Jl"
+    "dHVybiBpLmluY2x1ZGVzKHQpJiZpLmxlbmd0aHx8aS5zcGxpY2UoMCwwLHQpLGkuaW5jbHVkZXMoZSkmJjEhPT1pLmxlbmd0aHx8"
+    "aS5wdXNoKGUpLGkuc29ydCgodCxlKT0+dC1lKX1fZ2V0VGltZXN0YW1wc0ZvclRhYmxlKCl7bGV0IHQ9dGhpcy5fY2FjaGUuYWxs"
+    "fHxbXTtpZih0Lmxlbmd0aClyZXR1cm4gdDtjb25zdCBlPXRoaXMuZ2V0RGF0YVRpbWVzdGFtcHMoKSxpPXRoaXMuZ2V0TGFiZWxU"
+    "aW1lc3RhbXBzKCk7cmV0dXJuIHQ9ZS5sZW5ndGgmJmkubGVuZ3RoP3RoaXMubm9ybWFsaXplKGUuY29uY2F0KGkpKTplLmxlbmd0"
+    "aD9lOmksdD10aGlzLl9jYWNoZS5hbGw9dH1nZXREZWNpbWFsRm9yVmFsdWUodCl7cmV0dXJuKHNuKHRoaXMuX3RhYmxlLHQpLXRo"
+    "aXMuX21pblBvcykvdGhpcy5fdGFibGVSYW5nZX1nZXRWYWx1ZUZvclBpeGVsKHQpe3ZhciBlPXRoaXMuX29mZnNldHMsdD10aGlz"
+    "LmdldERlY2ltYWxGb3JQaXhlbCh0KS9lLmZhY3Rvci1lLmVuZDtyZXR1cm4gc24odGhpcy5fdGFibGUsdCp0aGlzLl90YWJsZVJh"
+    "bmdlK3RoaXMuX21pblBvcywhMCl9fX0pO2NvbnN0IG5uPVsicmdiKDU0LCAxNjIsIDIzNSkiLCJyZ2IoMjU1LCA5OSwgMTMyKSIs"
+    "InJnYigyNTUsIDE1OSwgNjQpIiwicmdiKDI1NSwgMjA1LCA4NikiLCJyZ2IoNzUsIDE5MiwgMTkyKSIsInJnYigxNTMsIDEwMiwg"
+    "MjU1KSIsInJnYigyMDEsIDIwMywgMjA3KSJdLG9uPW5uLm1hcCh0PT50LnJlcGxhY2UoInJnYigiLCJyZ2JhKCIpLnJlcGxhY2Uo"
+    "IikiLCIsIDAuNSkiKSk7ZnVuY3Rpb24gcm4odCl7cmV0dXJuIG5uW3Qlbm4ubGVuZ3RoXX1mdW5jdGlvbiBsbih0KXtyZXR1cm4g"
+    "b25bdCVvbi5sZW5ndGhdfWZ1bmN0aW9uIGhuKG4pe2xldCBvPTA7cmV0dXJuKHQsZSk9Pnt2YXIgaSxzLGEsZT1uLmdldERhdGFz"
+    "ZXRNZXRhKGUpLmNvbnRyb2xsZXI7ZSBpbnN0YW5jZW9mIHBhP289KHM9dCxhPW8scy5iYWNrZ3JvdW5kQ29sb3I9cy5kYXRhLm1h"
+    "cCgoKT0+cm4oYSsrKSksYSk6ZSBpbnN0YW5jZW9mIG1hP289KHM9dCxpPW8scy5iYWNrZ3JvdW5kQ29sb3I9cy5kYXRhLm1hcCgo"
+    "KT0+bG4oaSsrKSksaSk6ZSYmKG89KGU9dCx0PW8sZS5ib3JkZXJDb2xvcj1ybih0KSxlLmJhY2tncm91bmRDb2xvcj1sbih0KSwr"
+    "K3QpKX19ZnVuY3Rpb24gY24odCl7bGV0IGU7Zm9yKGUgaW4gdClpZih0W2VdLmJvcmRlckNvbG9yfHx0W2VdLmJhY2tncm91bmRD"
+    "b2xvcilyZXR1cm4gMX12YXIgZG49e2lkOiJjb2xvcnMiLGRlZmF1bHRzOntlbmFibGVkOiEwLGZvcmNlT3ZlcnJpZGU6ITF9LGJl"
+    "Zm9yZUxheW91dCh0LGUsaSl7aWYoaS5lbmFibGVkKXtjb25zdHtkYXRhOntkYXRhc2V0czpzfSxvcHRpb25zOmF9PXQuY29uZmln"
+    "LG49YVsiZWxlbWVudHMiXTshaS5mb3JjZU92ZXJyaWRlJiYoY24ocyl8fGEmJihhLmJvcmRlckNvbG9yfHxhLmJhY2tncm91bmRD"
+    "b2xvcil8fG4mJmNuKG4pKXx8KGk9aG4odCkscy5mb3JFYWNoKGkpKX19fTtmdW5jdGlvbiB1bih0KXt2YXIgZTt0Ll9kZWNpbWF0"
+    "ZWQmJihlPXQuX2RhdGEsZGVsZXRlIHQuX2RlY2ltYXRlZCxkZWxldGUgdC5fZGF0YSxPYmplY3QuZGVmaW5lUHJvcGVydHkodCwi"
+    "ZGF0YSIse2NvbmZpZ3VyYWJsZTohMCxlbnVtZXJhYmxlOiEwLHdyaXRhYmxlOiEwLHZhbHVlOmV9KSl9ZnVuY3Rpb24gZ24odCl7"
+    "dC5kYXRhLmRhdGFzZXRzLmZvckVhY2godD0+e3VuKHQpfSl9dmFyIGZuPXtpZDoiZGVjaW1hdGlvbiIsZGVmYXVsdHM6e2FsZ29y"
+    "aXRobToibWluLW1heCIsZW5hYmxlZDohMX0sYmVmb3JlRWxlbWVudHNVcGRhdGU6KHIsdCxNKT0+e2lmKE0uZW5hYmxlZCl7Y29u"
+    "c3QgbD1yLndpZHRoO3IuZGF0YS5kYXRhc2V0cy5mb3JFYWNoKChlLHQpPT57dmFye19kYXRhOmksaW5kZXhBeGlzOnN9PWUsaD1y"
+    "LmdldERhdGFzZXRNZXRhKHQpLGE9aXx8ZS5kYXRhO2lmKCJ5IiE9PWtpKFtzLHIub3B0aW9ucy5pbmRleEF4aXNdKSYmaC5jb250"
+    "cm9sbGVyLnN1cHBvcnRzRGVjaW1hdGlvbil7dD1yLnNjYWxlc1toLnhBeGlzSURdO2lmKCgibGluZWFyIj09PXQudHlwZXx8InRp"
+    "bWUiPT09dC50eXBlKSYmIXIub3B0aW9ucy5wYXJzaW5nKXt2YXJ7c3RhcnQ6bixjb3VudDpvfT1mdW5jdGlvbih0KXt2YXIgZT10"
+    "Lmxlbmd0aDtsZXQgaSxzPTA7Y29uc3QgYT1oWyJpU2NhbGUiXSx7bWluOm4sbWF4Om8sbWluRGVmaW5lZDpyLG1heERlZmluZWQ6"
+    "bH09YS5nZXRVc2VyQm91bmRzKCk7cmV0dXJuIHImJihzPUMoZih0LGEuYXhpcyxuKS5sbywwLGUtMSkpLGk9bD9DKGYodCxhLmF4"
+    "aXMsbykuaGkrMSxzLGUpLXM6ZS1zLHtzdGFydDpzLGNvdW50Oml9fShhKTtpZihvPD0oTS50aHJlc2hvbGR8fDQqbCkpdW4oZSk7"
+    "ZWxzZXtsZXQgdDtzd2l0Y2goUChpKSYmKGUuX2RhdGE9YSxkZWxldGUgZS5kYXRhLE9iamVjdC5kZWZpbmVQcm9wZXJ0eShlLCJk"
+    "YXRhIix7Y29uZmlndXJhYmxlOiEwLGVudW1lcmFibGU6ITAsZ2V0OmZ1bmN0aW9uKCl7cmV0dXJuIHRoaXMuX2RlY2ltYXRlZH0s"
+    "c2V0OmZ1bmN0aW9uKHQpe3RoaXMuX2RhdGE9dH19KSksTS5hbGdvcml0aG0pe2Nhc2UibHR0YiI6dD1mdW5jdGlvbihzLGEsbix0"
+    "KXt2YXIgZT1NLnNhbXBsZXN8fHQ7aWYobjw9ZSlyZXR1cm4gcy5zbGljZShhLGErbik7Y29uc3Qgbz1bXSxyPShuLTIpLyhlLTIp"
+    "O2xldCBsPTA7Y29uc3QgaD1hK24tMTtsZXQgYyxkLHUsZyxmLHA9YTtmb3Iob1tsKytdPXNbcF0sYz0wO2M8ZS0yO2MrKyl7bGV0"
+    "IHQsZT0wLGk9MDtjb25zdCBoPU1hdGguZmxvb3IoKGMrMSkqcikrMSthLF89TWF0aC5taW4oTWF0aC5mbG9vcigoYysyKSpyKSsx"
+    "LG4pK2EseT1fLWg7Zm9yKHQ9aDt0PF87dCsrKWUrPXNbdF0ueCxpKz1zW3RdLnk7ZS89eSxpLz15O3ZhciBtPU1hdGguZmxvb3Io"
+    "YypyKSsxK2EsYj1NYXRoLm1pbihNYXRoLmZsb29yKChjKzEpKnIpKzEsbikrYSx7eCx5OnZ9PXNbcF07Zm9yKHU9LTEsdD1tO3Q8"
+    "Yjt0KyspKGc9LjUqTWF0aC5hYnMoKHgtZSkqKHNbdF0ueS12KS0oeC1zW3RdLngpKihpLXYpKSk+dSYmKHU9ZyxkPXNbdF0sZj10"
+    "KTtvW2wrK109ZCxwPWZ9cmV0dXJuIG9bbCsrXT1zW2hdLG99KGEsbixvLGwpO2JyZWFrO2Nhc2UibWluLW1heCI6dD1mdW5jdGlv"
+    "bih0LGUsaSxzKXtsZXQgYSxuLG8scixsLGgsYyxkLHUsZyxmPTAscD0wO2NvbnN0IG09W10sYj1lK2ktMSx4PXRbZV0ueCx2PXRb"
+    "Yl0ueC14O2ZvcihhPWU7YTxlK2k7KythKXtvPSgobj10W2FdKS54LXgpL3YqcyxyPW4ueTtjb25zdCBlPTB8bztpZihlPT09bCly"
+    "PHU/KHU9cixoPWEpOnI+ZyYmKGc9cixjPWEpLGY9KHAqZituLngpLysrcDtlbHNle2NvbnN0IGk9YS0xO2lmKCFQKGgpJiYhUChj"
+    "KSl7Y29uc3QgZT1NYXRoLm1pbihoLGMpLFA9TWF0aC5tYXgoaCxjKTtlIT09ZCYmZSE9PWkmJm0ucHVzaCh7Li4udFtlXSx4OmZ9"
+    "KSxQIT09ZCYmUCE9PWkmJm0ucHVzaCh7Li4udFtQXSx4OmZ9KX0wPGEmJmkhPT1kJiZtLnB1c2godFtpXSksbS5wdXNoKG4pLGw9"
+    "ZSxwPTAsdT1nPXIsaD1jPWQ9YX19cmV0dXJuIG19KGEsbixvLGwpO2JyZWFrO2RlZmF1bHQ6dGhyb3cgbmV3IEVycm9yKGBVbnN1"
+    "cHBvcnRlZCBkZWNpbWF0aW9uIGFsZ29yaXRobSAnJHtNLmFsZ29yaXRobX0nYCl9ZS5fZGVjaW1hdGVkPXR9fX19KX1lbHNlIGdu"
+    "KHIpfSxkZXN0cm95KHQpe2duKHQpfX07ZnVuY3Rpb24gcG4oaSxzLGEsdCl7aWYoIXQpe2xldCB0PXNbaV0sZT1hW2ldO3JldHVy"
+    "biJhbmdsZSI9PT1pJiYodD12KHQpLGU9dihlKSkse3Byb3BlcnR5Omksc3RhcnQ6dCxlbmQ6ZX19fWZ1bmN0aW9uIG1uKHQsZSxp"
+    "KXtmb3IoO3Q8ZTtlLS0pe2NvbnN0IHQ9aVtlXTtpZighaXNOYU4odC54KSYmIWlzTmFOKHQueSkpYnJlYWt9cmV0dXJuIGV9ZnVu"
+    "Y3Rpb24gYm4odCxlLGkscyl7cmV0dXJuIHQmJmU/cyh0W2ldLGVbaV0pOnQ/dFtpXTplP2VbaV06MH1mdW5jdGlvbiB4bihlLHQp"
+    "e2xldCBpPVtdLHM9ITE7cmV0dXJuKGk9TyhlKT8ocz0hMCxlKTpmdW5jdGlvbih0KXtjb25zdHt4Omk9bnVsbCx5OnM9bnVsbH09"
+    "ZXx8e30sYT10LnBvaW50cyxuPVtdO3JldHVybiB0LnNlZ21lbnRzLmZvckVhY2goKHtzdGFydDp0LGVuZDplfSk9PntlPW1uKHQs"
+    "ZSxhKTt0PWFbdF0sZT1hW2VdO251bGwhPT1zPyhuLnB1c2goe3g6dC54LHk6c30pLG4ucHVzaCh7eDplLngseTpzfSkpOm51bGwh"
+    "PT1pJiYobi5wdXNoKHt4OmkseTp0Lnl9KSxuLnB1c2goe3g6aSx5OmUueX0pKX0pLG59KHQpKS5sZW5ndGg/bmV3IERhKHtwb2lu"
+    "dHM6aSxvcHRpb25zOnt0ZW5zaW9uOjB9LF9sb29wOnMsX2Z1bGxMb29wOnN9KTpudWxsfWZ1bmN0aW9uIHZuKHQpe3JldHVybiB0"
+    "JiYhMSE9PXQuZmlsbH1mdW5jdGlvbiBfbihlLGkscyl7Y29uc3QgYT1bXTtmb3IobGV0IHQ9MDt0PHMubGVuZ3RoO3QrKyl7dmFy"
+    "e2ZpcnN0Om4sbGFzdDpvLHBvaW50OnJ9PWZ1bmN0aW9uKHQsZSxpKXtjb25zdCBzPXQuaW50ZXJwb2xhdGUoZSxpKTtpZighcyly"
+    "ZXR1cm57fTt2YXIgYT1zW2ldLG49dC5zZWdtZW50cyxvPXQucG9pbnRzO2xldCByPSExLGw9ITE7Zm9yKGxldCB0PTA7dDxuLmxl"
+    "bmd0aDt0Kyspe2NvbnN0IGU9blt0XSxzPW9bZS5zdGFydF1baV0saD1vW2UuZW5kXVtpXTtpZihjKGEscyxoKSl7cj1hPT09cyxs"
+    "PWE9PT1oO2JyZWFrfX1yZXR1cm57Zmlyc3Q6cixsYXN0OmwscG9pbnQ6c319KHNbdF0saSwieCIpO2lmKCEoIXJ8fG4mJm8pKWlm"
+    "KG4pYS51bnNoaWZ0KHIpO2Vsc2UgaWYoZS5wdXNoKHIpLCFvKWJyZWFrfWUucHVzaCguLi5hKX1jbGFzcyB5bntjb25zdHJ1Y3Rv"
+    "cih0KXt0aGlzLng9dC54LHRoaXMueT10LnksdGhpcy5yYWRpdXM9dC5yYWRpdXN9cGF0aFNlZ21lbnQodCxlLGkpe3Zhcnt4OnMs"
+    "eTphLHJhZGl1czpufT10aGlzO3JldHVybiBlPWV8fHtzdGFydDowLGVuZDpffSx0LmFyYyhzLGEsbixlLmVuZCxlLnN0YXJ0LCEw"
+    "KSwhaS5ib3VuZHN9aW50ZXJwb2xhdGUodCl7dmFye3g6ZSx5OmkscmFkaXVzOnN9PXRoaXMsdD10LmFuZ2xlO3JldHVybnt4OmUr"
+    "TWF0aC5jb3ModCkqcyx5OmkrTWF0aC5zaW4odCkqcyxhbmdsZTp0fX19ZnVuY3Rpb24gTW4odCl7dmFyIGUsaSx7Y2hhcnQ6cyxm"
+    "aWxsOmEsbGluZTpufT10O2lmKHAoYSkpcmV0dXJuIGU9YSwoaT0ocz1zKS5nZXREYXRhc2V0TWV0YShlKSkmJnMuaXNEYXRhc2V0"
+    "VmlzaWJsZShlKT9pLmRhdGFzZXQ6bnVsbDtpZigic3RhY2siPT09YSl7Y29uc3R7c2NhbGU6byxpbmRleDpyLGxpbmU6bH09dCxo"
+    "PVtdLGM9bC5zZWdtZW50cyxkPWwucG9pbnRzLHU9ZnVuY3Rpb24odCxlKXtjb25zdCBpPVtdLHM9dC5nZXRNYXRjaGluZ1Zpc2li"
+    "bGVNZXRhcygibGluZSIpO2ZvcihsZXQgdD0wO3Q8cy5sZW5ndGg7dCsrKXt2YXIgYT1zW3RdO2lmKGEuaW5kZXg9PT1lKWJyZWFr"
+    "O2EuaGlkZGVufHxpLnVuc2hpZnQoYS5kYXRhc2V0KX1yZXR1cm4gaX0obyxyKTt1LnB1c2goeG4oe3g6bnVsbCx5Om8uYm90dG9t"
+    "fSxsKSk7Zm9yKGxldCB0PTA7dDxjLmxlbmd0aDt0Kyspe2NvbnN0IG89Y1t0XTtmb3IobGV0IHQ9by5zdGFydDt0PD1vLmVuZDt0"
+    "KyspX24oaCxkW3RdLHUpfXJldHVybiBuZXcgRGEoe3BvaW50czpoLG9wdGlvbnM6e319KX1pZigic2hhcGUiPT09YSlyZXR1cm4h"
+    "MDtzPWZ1bmN0aW9uKHQpe3ZhciBlPXQuc2NhbGV8fHt9O2lmKGUuZ2V0UG9pbnRQb3NpdGlvbkZvclZhbHVlKXt2YXIgaT10O2Nv"
+    "bnN0e3NjYWxlOmEsZmlsbDpufT1pLG89YS5vcHRpb25zLHI9YS5nZXRMYWJlbHMoKS5sZW5ndGgsbD1vLnJldmVyc2U/YS5tYXg6"
+    "YS5taW4saD0oaT1uLGU9YSwic3RhcnQiPT09aT9sOiJlbmQiPT09aT9lLm9wdGlvbnMucmV2ZXJzZT9lLm1pbjplLm1heDpBKGkp"
+    "P2kudmFsdWU6ZS5nZXRCYXNlVmFsdWUoKSksYz1bXTtpZihvLmdyaWQuY2lyY3VsYXIpe2NvbnN0IGk9YS5nZXRQb2ludFBvc2l0"
+    "aW9uRm9yVmFsdWUoMCxsKTtyZXR1cm4gbmV3IHluKHt4OmkueCx5OmkueSxyYWRpdXM6YS5nZXREaXN0YW5jZUZyb21DZW50ZXJG"
+    "b3JWYWx1ZShoKX0pfWZvcihsZXQgdD0wO3Q8cjsrK3QpYy5wdXNoKGEuZ2V0UG9pbnRQb3NpdGlvbkZvclZhbHVlKHQsaCkpO3Jl"
+    "dHVybiBjfXt2YXIgcz10O2NvbnN0e3NjYWxlOmQ9e30sZmlsbDp1fT1zLGc9ZnVuY3Rpb24odCxlKXtsZXQgaT1udWxsO3JldHVy"
+    "biJzdGFydCI9PT10P2k9ZS5ib3R0b206ImVuZCI9PT10P2k9ZS50b3A6QSh0KT9pPWUuZ2V0UGl4ZWxGb3JWYWx1ZSh0LnZhbHVl"
+    "KTplLmdldEJhc2VQaXhlbCYmKGk9ZS5nZXRCYXNlUGl4ZWwoKSksaX0odSxkKTtpZihwKGcpKXtjb25zdCBzPWQuaXNIb3Jpem9u"
+    "dGFsKCk7cmV0dXJue3g6cz9nOm51bGwseTpzP251bGw6Z319cmV0dXJuIG51bGx9fSh0KTtyZXR1cm4gcyBpbnN0YW5jZW9mIHlu"
+    "P3M6eG4ocyxuKX1mdW5jdGlvbiB3bih0LGUsaSl7dmFyIHMsYT1NbihlKSx7bGluZTplLHNjYWxlOm4sYXhpczpvfT1lLHI9ZS5v"
+    "cHRpb25zLGw9ci5maWxsLHI9ci5iYWNrZ3JvdW5kQ29sb3Ise2Fib3ZlOmw9cixiZWxvdzpyPXJ9PWx8fHt9O2EmJmUucG9pbnRz"
+    "Lmxlbmd0aCYmKFZlKHQsaSkscz10LHtsaW5lOmEsdGFyZ2V0OmwsYWJvdmU6cixiZWxvdzppLGFyZWE6bixzY2FsZTpvfT1lPXts"
+    "aW5lOmUsdGFyZ2V0OmEsYWJvdmU6bCxiZWxvdzpyLGFyZWE6aSxzY2FsZTpuLGF4aXM6b30sZT1hLl9sb29wPyJhbmdsZSI6ZS5h"
+    "eGlzLHMuc2F2ZSgpLCJ4Ij09PWUmJmkhPT1yJiYoa24ocyxsLG4udG9wKSxTbihzLHtsaW5lOmEsdGFyZ2V0OmwsY29sb3I6cixz"
+    "Y2FsZTpvLHByb3BlcnR5OmV9KSxzLnJlc3RvcmUoKSxzLnNhdmUoKSxrbihzLGwsbi5ib3R0b20pKSxTbihzLHtsaW5lOmEsdGFy"
+    "Z2V0OmwsY29sb3I6aSxzY2FsZTpvLHByb3BlcnR5OmV9KSxzLnJlc3RvcmUoKSxCZSh0KSl9ZnVuY3Rpb24ga24odCxlLGkpe2Nv"
+    "bnN0e3NlZ21lbnRzOnMscG9pbnRzOmF9PWU7bGV0IG49ITAsbz0hMTt0LmJlZ2luUGF0aCgpO2Zvcihjb25zdCByIG9mIHMpe2Nv"
+    "bnN0e3N0YXJ0OnMsZW5kOmx9PXIsaD1hW3NdLGM9YVttbihzLGwsYSldO24/KHQubW92ZVRvKGgueCxoLnkpLG49ITEpOih0Lmxp"
+    "bmVUbyhoLngsaSksdC5saW5lVG8oaC54LGgueSkpLChvPSEhZS5wYXRoU2VnbWVudCh0LHIse21vdmU6b30pKT90LmNsb3NlUGF0"
+    "aCgpOnQubGluZVRvKGMueCxpKX10LmxpbmVUbyhlLmZpcnN0KCkueCxpKSx0LmNsb3NlUGF0aCgpLHQuY2xpcCgpfWZ1bmN0aW9u"
+    "IFNuKGUsaSl7Y29uc3R7bGluZTpzLHRhcmdldDphLHByb3BlcnR5Om4sY29sb3I6byxzY2FsZTpyfT1pLGw9ZnVuY3Rpb24odCxl"
+    "LGkpe2NvbnN0IHM9dC5zZWdtZW50cyxhPXQucG9pbnRzLG49ZS5wb2ludHMsbz1bXTtmb3IoY29uc3QgdCBvZiBzKXt2YXJ7c3Rh"
+    "cnQ6cixlbmQ6bH09dCxsPW1uKHIsbCxhKSxoPXBuKGksYVtyXSxhW2xdLHQubG9vcCk7aWYoZS5zZWdtZW50cyl7dmFyIGM9RWko"
+    "ZSxoKTtmb3IoY29uc3QgZSBvZiBjKXtjb25zdCBzPXBuKGksbltlLnN0YXJ0XSxuW2UuZW5kXSxlLmxvb3ApLGQ9TGkodCxhLHMp"
+    "O2Zvcihjb25zdCB0IG9mIGQpby5wdXNoKHtzb3VyY2U6dCx0YXJnZXQ6ZSxzdGFydDp7W2ldOmJuKGgscywic3RhcnQiLE1hdGgu"
+    "bWF4KX0sZW5kOntbaV06Ym4oaCxzLCJlbmQiLE1hdGgubWluKX19KX19ZWxzZSBvLnB1c2goe3NvdXJjZTp0LHRhcmdldDpoLHN0"
+    "YXJ0OmFbcl0sZW5kOmFbbF19KX1yZXR1cm4gb30ocyxhLG4pO2Zvcihjb25zdHtzb3VyY2U6aSx0YXJnZXQ6cCxzdGFydDptLGVu"
+    "ZDpifW9mIGwpe2NvbnN0e3N0eWxlOntiYWNrZ3JvdW5kQ29sb3I6bD1vfT17fX09aSx4PSEwIT09YTtlLnNhdmUoKSxlLmZpbGxT"
+    "dHlsZT1sLGY9Zz1kPXU9Yz1kPWM9aD12b2lkIDA7dmFyIGg9ZSxjPXIsZD14JiZwbihuLG0sYikse3RvcDpjLGJvdHRvbTp1fT1j"
+    "LmNoYXJ0LmNoYXJ0QXJlYSx7cHJvcGVydHk6ZCxzdGFydDpnLGVuZDpmfT1kfHx7fSxkPSgieCI9PT1kJiYoaC5iZWdpblBhdGgo"
+    "KSxoLnJlY3QoZyxjLGYtZyx1LWMpLGguY2xpcCgpKSxlLmJlZ2luUGF0aCgpLCEhcy5wYXRoU2VnbWVudChlLGkpKTtsZXQgdDtp"
+    "Zih4KXtkP2UuY2xvc2VQYXRoKCk6UG4oZSxhLGIsbik7Y29uc3QgaT0hIWEucGF0aFNlZ21lbnQoZSxwLHttb3ZlOmQscmV2ZXJz"
+    "ZTohMH0pOyh0PWQmJmkpfHxQbihlLGEsbSxuKX1lLmNsb3NlUGF0aCgpLGUuZmlsbCh0PyJldmVub2RkIjoibm9uemVybyIpLGUu"
+    "cmVzdG9yZSgpfX1mdW5jdGlvbiBQbih0LGUsaSxzKXtlPWUuaW50ZXJwb2xhdGUoaSxzKTtlJiZ0LmxpbmVUbyhlLngsZS55KX12"
+    "YXIgRG49e2lkOiJmaWxsZXIiLGFmdGVyRGF0YXNldHNVcGRhdGUodCxlLGkpe2NvbnN0IHM9KHQuZGF0YS5kYXRhc2V0c3x8W10p"
+    "Lmxlbmd0aCxhPVtdO2xldCBuLG8scixsO2ZvcihvPTA7bzxzOysrbylyPShuPXQuZ2V0RGF0YXNldE1ldGEobykpLmRhdGFzZXQs"
+    "bD1udWxsLHImJnIub3B0aW9ucyYmciBpbnN0YW5jZW9mIERhJiYobD17dmlzaWJsZTp0LmlzRGF0YXNldFZpc2libGUobyksaW5k"
+    "ZXg6byxmaWxsOmZ1bmN0aW9uKHMsdCxlKXt2YXIgaT1mdW5jdGlvbigpe3ZhciB0PXMub3B0aW9ucyxlPXQuZmlsbDtsZXQgaT1U"
+    "KGUmJmUudGFyZ2V0LGUpO3JldHVybiExIT09KGk9dm9pZCAwPT09aT8hIXQuYmFja2dyb3VuZENvbG9yOmkpJiZudWxsIT09aSYm"
+    "KCEwPT09aT8ib3JpZ2luIjppKX0oKTtpZihBKGkpKXJldHVybiFpc05hTihpLnZhbHVlKSYmaTt2YXIgYSxuPXBhcnNlRmxvYXQo"
+    "aSk7cmV0dXJuIHAobikmJk1hdGguZmxvb3Iobik9PT1uPyhhPWlbMF0sbj1uLCEoKG49Ii0iIT09YSYmIisiIT09YT9uOnQrbik9"
+    "PT10fHxuPDB8fGU8PW4pJiZuKTowPD1bIm9yaWdpbiIsInN0YXJ0IiwiZW5kIiwic3RhY2siLCJzaGFwZSJdLmluZGV4T2YoaSkm"
+    "Jml9KHIsbyxzKSxjaGFydDp0LGF4aXM6bi5jb250cm9sbGVyLm9wdGlvbnMuaW5kZXhBeGlzLHNjYWxlOm4udlNjYWxlLGxpbmU6"
+    "cn0pLG4uJGZpbGxlcj1sLGEucHVzaChsKTtmb3Iobz0wO288czsrK28pKGw9YVtvXSkmJiExIT09bC5maWxsJiYobC5maWxsPWZ1"
+    "bmN0aW9uKHQsZSxpKXtsZXQgcz10W2VdLmZpbGw7Y29uc3QgYT1bZV07dmFyIG47aWYoIWkpcmV0dXJuIHM7Zm9yKDshMSE9PXMm"
+    "Ji0xPT09YS5pbmRleE9mKHMpOyl7aWYoIXAocykpcmV0dXJuIHM7aWYoIShuPXRbc10pKXJldHVybiExO2lmKG4udmlzaWJsZSly"
+    "ZXR1cm4gczthLnB1c2gocykscz1uLmZpbGx9cmV0dXJuITF9KGEsbyxpLnByb3BhZ2F0ZSkpfSxiZWZvcmVEcmF3KGUsdCxpKXt2"
+    "YXIgcz0iYmVmb3JlRHJhdyI9PT1pLmRyYXdUaW1lLGE9ZS5nZXRTb3J0ZWRWaXNpYmxlRGF0YXNldE1ldGFzKCksbj1lLmNoYXJ0"
+    "QXJlYTtmb3IobGV0IHQ9YS5sZW5ndGgtMTswPD10Oy0tdCl7Y29uc3QgaT1hW3RdLiRmaWxsZXI7aSYmKGkubGluZS51cGRhdGVD"
+    "b250cm9sUG9pbnRzKG4saS5heGlzKSxzJiZpLmZpbGwmJnduKGUuY3R4LGksbikpfX0sYmVmb3JlRGF0YXNldHNEcmF3KGUsdCxp"
+    "KXtpZigiYmVmb3JlRGF0YXNldHNEcmF3Ij09PWkuZHJhd1RpbWUpe3ZhciBzPWUuZ2V0U29ydGVkVmlzaWJsZURhdGFzZXRNZXRh"
+    "cygpO2ZvcihsZXQgdD1zLmxlbmd0aC0xOzA8PXQ7LS10KXtjb25zdCBpPXNbdF0uJGZpbGxlcjt2bihpKSYmd24oZS5jdHgsaSxl"
+    "LmNoYXJ0QXJlYSl9fX0sYmVmb3JlRGF0YXNldERyYXcodCxlLGkpe2U9ZS5tZXRhLiRmaWxsZXI7dm4oZSkmJiJiZWZvcmVEYXRh"
+    "c2V0RHJhdyI9PT1pLmRyYXdUaW1lJiZ3bih0LmN0eCxlLHQuY2hhcnRBcmVhKX0sZGVmYXVsdHM6e3Byb3BhZ2F0ZTohMCxkcmF3"
+    "VGltZToiYmVmb3JlRGF0YXNldERyYXcifX07Y29uc3QgQ249KHQsZSk9PntsZXR7Ym94SGVpZ2h0Omk9ZSxib3hXaWR0aDpzPWV9"
+    "PXQ7cmV0dXJuIHQudXNlUG9pbnRTdHlsZSYmKGk9TWF0aC5taW4oaSxlKSxzPXQucG9pbnRTdHlsZVdpZHRofHxNYXRoLm1pbihz"
+    "LGUpKSx7Ym94V2lkdGg6cyxib3hIZWlnaHQ6aSxpdGVtSGVpZ2h0Ok1hdGgubWF4KGUsaSl9fTtjbGFzcyBPbiBleHRlbmRzIGV7"
+    "Y29uc3RydWN0b3IodCl7c3VwZXIoKSx0aGlzLl9hZGRlZD0hMSx0aGlzLmxlZ2VuZEhpdEJveGVzPVtdLHRoaXMuX2hvdmVyZWRJ"
+    "dGVtPW51bGwsdGhpcy5kb3VnaG51dE1vZGU9ITEsdGhpcy5jaGFydD10LmNoYXJ0LHRoaXMub3B0aW9ucz10Lm9wdGlvbnMsdGhp"
+    "cy5jdHg9dC5jdHgsdGhpcy5sZWdlbmRJdGVtcz12b2lkIDAsdGhpcy5jb2x1bW5TaXplcz12b2lkIDAsdGhpcy5saW5lV2lkdGhz"
+    "PXZvaWQgMCx0aGlzLm1heEhlaWdodD12b2lkIDAsdGhpcy5tYXhXaWR0aD12b2lkIDAsdGhpcy50b3A9dm9pZCAwLHRoaXMuYm90"
+    "dG9tPXZvaWQgMCx0aGlzLmxlZnQ9dm9pZCAwLHRoaXMucmlnaHQ9dm9pZCAwLHRoaXMuaGVpZ2h0PXZvaWQgMCx0aGlzLndpZHRo"
+    "PXZvaWQgMCx0aGlzLl9tYXJnaW5zPXZvaWQgMCx0aGlzLnBvc2l0aW9uPXZvaWQgMCx0aGlzLndlaWdodD12b2lkIDAsdGhpcy5m"
+    "dWxsU2l6ZT12b2lkIDB9dXBkYXRlKHQsZSxpKXt0aGlzLm1heFdpZHRoPXQsdGhpcy5tYXhIZWlnaHQ9ZSx0aGlzLl9tYXJnaW5z"
+    "PWksdGhpcy5zZXREaW1lbnNpb25zKCksdGhpcy5idWlsZExhYmVscygpLHRoaXMuZml0KCl9c2V0RGltZW5zaW9ucygpe3RoaXMu"
+    "aXNIb3Jpem9udGFsKCk/KHRoaXMud2lkdGg9dGhpcy5tYXhXaWR0aCx0aGlzLmxlZnQ9dGhpcy5fbWFyZ2lucy5sZWZ0LHRoaXMu"
+    "cmlnaHQ9dGhpcy53aWR0aCk6KHRoaXMuaGVpZ2h0PXRoaXMubWF4SGVpZ2h0LHRoaXMudG9wPXRoaXMuX21hcmdpbnMudG9wLHRo"
+    "aXMuYm90dG9tPXRoaXMuaGVpZ2h0KX1idWlsZExhYmVscygpe2NvbnN0IGk9dGhpcy5vcHRpb25zLmxhYmVsc3x8e307bGV0IHQ9"
+    "ZChpLmdlbmVyYXRlTGFiZWxzLFt0aGlzLmNoYXJ0XSx0aGlzKXx8W107aS5maWx0ZXImJih0PXQuZmlsdGVyKHQ9PmkuZmlsdGVy"
+    "KHQsdGhpcy5jaGFydC5kYXRhKSkpLGkuc29ydCYmKHQ9dC5zb3J0KCh0LGUpPT5pLnNvcnQodCxlLHRoaXMuY2hhcnQuZGF0YSkp"
+    "KSx0aGlzLm9wdGlvbnMucmV2ZXJzZSYmdC5yZXZlcnNlKCksdGhpcy5sZWdlbmRJdGVtcz10fWZpdCgpe2NvbnN0e29wdGlvbnM6"
+    "aSxjdHg6c309dGhpcztpZihpLmRpc3BsYXkpe3ZhciBhPWkubGFiZWxzLG49eihhLmZvbnQpLG89bi5zaXplLHI9dGhpcy5fY29t"
+    "cHV0ZVRpdGxlSGVpZ2h0KCkse2JveFdpZHRoOmEsaXRlbUhlaWdodDpsfT1DbihhLG8pO2xldCB0LGU7cy5mb250PW4uc3RyaW5n"
+    "LHRoaXMuaXNIb3Jpem9udGFsKCk/KHQ9dGhpcy5tYXhXaWR0aCxlPXRoaXMuX2ZpdFJvd3MocixvLGEsbCkrMTApOihlPXRoaXMu"
+    "bWF4SGVpZ2h0LHQ9dGhpcy5fZml0Q29scyhyLG4sYSxsKSsxMCksdGhpcy53aWR0aD1NYXRoLm1pbih0LGkubWF4V2lkdGh8fHRo"
+    "aXMubWF4V2lkdGgpLHRoaXMuaGVpZ2h0PU1hdGgubWluKGUsaS5tYXhIZWlnaHR8fHRoaXMubWF4SGVpZ2h0KX1lbHNlIHRoaXMu"
+    "d2lkdGg9dGhpcy5oZWlnaHQ9MH1fZml0Um93cyh0LGkscyxhKXtjb25zdHtjdHg6bixtYXhXaWR0aDpvLG9wdGlvbnM6e2xhYmVs"
+    "czp7cGFkZGluZzpyfX19PXRoaXMsbD10aGlzLmxlZ2VuZEhpdEJveGVzPVtdLGg9dGhpcy5saW5lV2lkdGhzPVswXSxjPWErcjts"
+    "ZXQgZD10LHU9KG4udGV4dEFsaWduPSJsZWZ0IixuLnRleHRCYXNlbGluZT0ibWlkZGxlIiwtMSksZz0tYztyZXR1cm4gdGhpcy5s"
+    "ZWdlbmRJdGVtcy5mb3JFYWNoKCh0LGUpPT57dD1zK2kvMituLm1lYXN1cmVUZXh0KHQudGV4dCkud2lkdGg7KDA9PT1lfHxoW2gu"
+    "bGVuZ3RoLTFdK3QrMipyPm8pJiYoZCs9YyxoW2gubGVuZ3RoLSgwPGU/MDoxKV09MCxnKz1jLHUrKyksbFtlXT17bGVmdDowLHRv"
+    "cDpnLHJvdzp1LHdpZHRoOnQsaGVpZ2h0OmF9LGhbaC5sZW5ndGgtMV0rPXQrcn0pLGR9X2ZpdENvbHModCxyLGwsaCl7Y29uc3R7"
+    "Y3R4OmMsbWF4SGVpZ2h0OmUsb3B0aW9uczp7bGFiZWxzOntwYWRkaW5nOmR9fX09dGhpcyx1PXRoaXMubGVnZW5kSGl0Qm94ZXM9"
+    "W10sZz10aGlzLmNvbHVtblNpemVzPVtdLGY9ZS10O2xldCBwPWQsbT0wLGI9MCx4PTAsdj0wO3JldHVybiB0aGlzLmxlZ2VuZEl0"
+    "ZW1zLmZvckVhY2goKHQsZSk9PntvPWwsaT1yLHM9YyxhPXQsbj1oO3ZhciBpLHMsYSxuLHtpdGVtV2lkdGg6dCxpdGVtSGVpZ2h0"
+    "Om99PXtpdGVtV2lkdGg6ZnVuY3Rpb24odCxlLGkpe2xldCBzPWEudGV4dDtyZXR1cm4gcyYmInN0cmluZyIhPXR5cGVvZiBzJiYo"
+    "cz1zLnJlZHVjZSgodCxlKT0+dC5sZW5ndGg+ZS5sZW5ndGg/dDplKSksdCtlLnNpemUvMitpLm1lYXN1cmVUZXh0KHMpLndpZHRo"
+    "fShvLGkscyksaXRlbUhlaWdodDpmdW5jdGlvbih0KXtsZXQgZT1uO3JldHVybiBlPSJzdHJpbmciIT10eXBlb2YgYS50ZXh0P0Fu"
+    "KGEsdCk6ZX0oaS5saW5lSGVpZ2h0KX07MDxlJiZiK28rMipkPmYmJihwKz1tK2QsZy5wdXNoKHt3aWR0aDptLGhlaWdodDpifSks"
+    "eCs9bStkLHYrKyxtPWI9MCksdVtlXT17bGVmdDp4LHRvcDpiLGNvbDp2LHdpZHRoOnQsaGVpZ2h0Om99LG09TWF0aC5tYXgobSx0"
+    "KSxiKz1vK2R9KSxwKz1tLGcucHVzaCh7d2lkdGg6bSxoZWlnaHQ6Yn0pLHB9YWRqdXN0SGl0Qm94ZXMoKXtpZih0aGlzLm9wdGlv"
+    "bnMuZGlzcGxheSl7Y29uc3QgaT10aGlzLl9jb21wdXRlVGl0bGVIZWlnaHQoKSx7bGVnZW5kSGl0Qm94ZXM6cyxvcHRpb25zOnth"
+    "bGlnbjphLGxhYmVsczp7cGFkZGluZzpufSxydGw6dH19PXRoaXMsbz1EaSh0LHRoaXMubGVmdCx0aGlzLndpZHRoKTtpZih0aGlz"
+    "LmlzSG9yaXpvbnRhbCgpKXtsZXQgdD0wLGU9RShhLHRoaXMubGVmdCtuLHRoaXMucmlnaHQtdGhpcy5saW5lV2lkdGhzW3RdKTtm"
+    "b3IoY29uc3QgciBvZiBzKXQhPT1yLnJvdyYmKHQ9ci5yb3csZT1FKGEsdGhpcy5sZWZ0K24sdGhpcy5yaWdodC10aGlzLmxpbmVX"
+    "aWR0aHNbdF0pKSxyLnRvcCs9dGhpcy50b3AraStuLHIubGVmdD1vLmxlZnRGb3JMdHIoby54KGUpLHIud2lkdGgpLGUrPXIud2lk"
+    "dGgrbn1lbHNle2xldCB0PTAsZT1FKGEsdGhpcy50b3AraStuLHRoaXMuYm90dG9tLXRoaXMuY29sdW1uU2l6ZXNbdF0uaGVpZ2h0"
+    "KTtmb3IoY29uc3QgbCBvZiBzKWwuY29sIT09dCYmKHQ9bC5jb2wsZT1FKGEsdGhpcy50b3AraStuLHRoaXMuYm90dG9tLXRoaXMu"
+    "Y29sdW1uU2l6ZXNbdF0uaGVpZ2h0KSksbC50b3A9ZSxsLmxlZnQrPXRoaXMubGVmdCtuLGwubGVmdD1vLmxlZnRGb3JMdHIoby54"
+    "KGwubGVmdCksbC53aWR0aCksZSs9bC5oZWlnaHQrbn19fWlzSG9yaXpvbnRhbCgpe3JldHVybiJ0b3AiPT09dGhpcy5vcHRpb25z"
+    "LnBvc2l0aW9ufHwiYm90dG9tIj09PXRoaXMub3B0aW9ucy5wb3NpdGlvbn1kcmF3KCl7dmFyIHQ7dGhpcy5vcHRpb25zLmRpc3Bs"
+    "YXkmJihWZSh0PXRoaXMuY3R4LHRoaXMpLHRoaXMuX2RyYXcoKSxCZSh0KSl9X2RyYXcoKXtjb25zdHtvcHRpb25zOmgsY29sdW1u"
+    "U2l6ZXM6YyxsaW5lV2lkdGhzOmQsY3R4OnV9PXRoaXMse2FsaWduOmcsbGFiZWxzOmZ9PWgscD1SLmNvbG9yLG09RGkoaC5ydGws"
+    "dGhpcy5sZWZ0LHRoaXMud2lkdGgpLGI9eihmLmZvbnQpLHg9ZlsicGFkZGluZyJdLHY9Yi5zaXplLF89di8yO2xldCB5O3RoaXMu"
+    "ZHJhd1RpdGxlKCksdS50ZXh0QWxpZ249bS50ZXh0QWxpZ24oImxlZnQiKSx1LnRleHRCYXNlbGluZT0ibWlkZGxlIix1LmxpbmVX"
+    "aWR0aD0uNSx1LmZvbnQ9Yi5zdHJpbmc7Y29uc3R7Ym94V2lkdGg6TSxib3hIZWlnaHQ6dyxpdGVtSGVpZ2h0Omt9PUNuKGYsdiks"
+    "Uz10aGlzLmlzSG9yaXpvbnRhbCgpLFA9dGhpcy5fY29tcHV0ZVRpdGxlSGVpZ2h0KCksRD0oeT1TP3t4OkUoZyx0aGlzLmxlZnQr"
+    "eCx0aGlzLnJpZ2h0LWRbMF0pLHk6dGhpcy50b3AreCtQLGxpbmU6MH06e3g6dGhpcy5sZWZ0K3gseTpFKGcsdGhpcy50b3ArUCt4"
+    "LHRoaXMuYm90dG9tLWNbMF0uaGVpZ2h0KSxsaW5lOjB9LENpKHRoaXMuY3R4LGgudGV4dERpcmVjdGlvbiksayt4KTt0aGlzLmxl"
+    "Z2VuZEl0ZW1zLmZvckVhY2goKHQsZSk9Pnt1LnN0cm9rZVN0eWxlPXQuZm9udENvbG9yLHUuZmlsbFN0eWxlPXQuZm9udENvbG9y"
+    "O3ZhciBpPXUubWVhc3VyZVRleHQodC50ZXh0KS53aWR0aCxzPW0udGV4dEFsaWduKHQudGV4dEFsaWdufHwodC50ZXh0QWxpZ249"
+    "Zi50ZXh0QWxpZ24pKSxpPU0rXytpO2xldCBhPXkueCxuPXkueTttLnNldFdpZHRoKHRoaXMud2lkdGgpLFM/MDxlJiZhK2kreD50"
+    "aGlzLnJpZ2h0JiYobj15LnkrPUQseS5saW5lKyssYT15Lng9RShnLHRoaXMubGVmdCt4LHRoaXMucmlnaHQtZFt5LmxpbmVdKSk6"
+    "MDxlJiZuK0Q+dGhpcy5ib3R0b20mJihhPXkueD1hK2NbeS5saW5lXS53aWR0aCt4LHkubGluZSsrLG49eS55PUUoZyx0aGlzLnRv"
+    "cCtQK3gsdGhpcy5ib3R0b20tY1t5LmxpbmVdLmhlaWdodCkpO3ZhciBlPW0ueChhKSxvPW4scj10O2lmKCEoaXNOYU4oTSl8fE08"
+    "PTB8fGlzTmFOKHcpfHx3PDApKXt1LnNhdmUoKTt2YXIgbD1UKHIubGluZVdpZHRoLDEpO2lmKHUuZmlsbFN0eWxlPVQoci5maWxs"
+    "U3R5bGUscCksdS5saW5lQ2FwPVQoci5saW5lQ2FwLCJidXR0IiksdS5saW5lRGFzaE9mZnNldD1UKHIubGluZURhc2hPZmZzZXQs"
+    "MCksdS5saW5lSm9pbj1UKHIubGluZUpvaW4sIm1pdGVyIiksdS5saW5lV2lkdGg9bCx1LnN0cm9rZVN0eWxlPVQoci5zdHJva2VT"
+    "dHlsZSxwKSx1LnNldExpbmVEYXNoKFQoci5saW5lRGFzaCxbXSkpLGYudXNlUG9pbnRTdHlsZSl7Y29uc3QgcD17cmFkaXVzOncq"
+    "TWF0aC5TUVJUMi8yLHBvaW50U3R5bGU6ci5wb2ludFN0eWxlLHJvdGF0aW9uOnIucm90YXRpb24sYm9yZGVyV2lkdGg6bH0sVD1t"
+    "LnhQbHVzKGUsTS8yKTtGZSh1LHAsVCxvK18sZi5wb2ludFN0eWxlV2lkdGgmJk0pfWVsc2V7Y29uc3QgZj1vK01hdGgubWF4KCh2"
+    "LXcpLzIsMCkscD1tLmxlZnRGb3JMdHIoZSxNKSxUPXdpKHIuYm9yZGVyUmFkaXVzKTt1LmJlZ2luUGF0aCgpLE9iamVjdC52YWx1"
+    "ZXMoVCkuc29tZSh0PT4wIT09dCk/amUodSx7eDpwLHk6Zix3Ok0saDp3LHJhZGl1czpUfSk6dS5yZWN0KHAsZixNLHcpLHUuZmls"
+    "bCgpLDAhPT1sJiZ1LnN0cm9rZSgpfXUucmVzdG9yZSgpfWlmKGE9Q3QocyxhK00rXyxTP2EraTp0aGlzLnJpZ2h0LGgucnRsKSxv"
+    "PW0ueChhKSxlPW4scj10LEhlKHUsci50ZXh0LG8sZStrLzIsYix7c3RyaWtldGhyb3VnaDpyLmhpZGRlbix0ZXh0QWxpZ246bS50"
+    "ZXh0QWxpZ24oci50ZXh0QWxpZ24pfSksUyl5LngrPWkreDtlbHNlIGlmKCJzdHJpbmciIT10eXBlb2YgdC50ZXh0KXtjb25zdCBo"
+    "PWIubGluZUhlaWdodDt5LnkrPUFuKHQsaCkreH1lbHNlIHkueSs9RH0pLE9pKHRoaXMuY3R4LGgudGV4dERpcmVjdGlvbil9ZHJh"
+    "d1RpdGxlKCl7Y29uc3Qgcz10aGlzLm9wdGlvbnMsYT1zLnRpdGxlLG49eihhLmZvbnQpLG89SShhLnBhZGRpbmcpO2lmKGEuZGlz"
+    "cGxheSl7Y29uc3QgbD1EaShzLnJ0bCx0aGlzLmxlZnQsdGhpcy53aWR0aCksaD10aGlzLmN0eCxjPWEucG9zaXRpb24sZD1uLnNp"
+    "emUvMix1PW8udG9wK2Q7bGV0IHQsZT10aGlzLmxlZnQsaT10aGlzLndpZHRoO2lmKHRoaXMuaXNIb3Jpem9udGFsKCkpaT1NYXRo"
+    "Lm1heCguLi50aGlzLmxpbmVXaWR0aHMpLHQ9dGhpcy50b3ArdSxlPUUocy5hbGlnbixlLHRoaXMucmlnaHQtaSk7ZWxzZXtjb25z"
+    "dCBhPXRoaXMuY29sdW1uU2l6ZXMucmVkdWNlKCh0LGUpPT5NYXRoLm1heCh0LGUuaGVpZ2h0KSwwKTt0PXUrRShzLmFsaWduLHRo"
+    "aXMudG9wLHRoaXMuYm90dG9tLWEtcy5sYWJlbHMucGFkZGluZy10aGlzLl9jb21wdXRlVGl0bGVIZWlnaHQoKSl9dmFyIHI9RShj"
+    "LGUsZStpKTtoLnRleHRBbGlnbj1sLnRleHRBbGlnbihEdChjKSksaC50ZXh0QmFzZWxpbmU9Im1pZGRsZSIsaC5zdHJva2VTdHls"
+    "ZT1hLmNvbG9yLGguZmlsbFN0eWxlPWEuY29sb3IsaC5mb250PW4uc3RyaW5nLEhlKGgsYS50ZXh0LHIsdCxuKX19X2NvbXB1dGVU"
+    "aXRsZUhlaWdodCgpe3ZhciB0PXRoaXMub3B0aW9ucy50aXRsZSxlPXoodC5mb250KSxpPUkodC5wYWRkaW5nKTtyZXR1cm4gdC5k"
+    "aXNwbGF5P2UubGluZUhlaWdodCtpLmhlaWdodDowfV9nZXRMZWdlbmRJdGVtQXQodCxlKXtsZXQgaSxzLGE7aWYoYyh0LHRoaXMu"
+    "bGVmdCx0aGlzLnJpZ2h0KSYmYyhlLHRoaXMudG9wLHRoaXMuYm90dG9tKSlmb3IoYT10aGlzLmxlZ2VuZEhpdEJveGVzLGk9MDtp"
+    "PGEubGVuZ3RoOysraSlpZihjKHQsKHM9YVtpXSkubGVmdCxzLmxlZnQrcy53aWR0aCkmJmMoZSxzLnRvcCxzLnRvcCtzLmhlaWdo"
+    "dCkpcmV0dXJuIHRoaXMubGVnZW5kSXRlbXNbaV07cmV0dXJuIG51bGx9aGFuZGxlRXZlbnQodCl7dmFyIGUsaSxzLGE9dGhpcy5v"
+    "cHRpb25zOygibW91c2Vtb3ZlIiE9PShlPXQudHlwZSkmJiJtb3VzZW91dCIhPT1lfHwhYS5vbkhvdmVyJiYhYS5vbkxlYXZlKSYm"
+    "KCFhLm9uQ2xpY2t8fCJjbGljayIhPT1lJiYibW91c2V1cCIhPT1lKXx8KGU9dGhpcy5fZ2V0TGVnZW5kSXRlbUF0KHQueCx0Lnkp"
+    "LCJtb3VzZW1vdmUiPT09dC50eXBlfHwibW91c2VvdXQiPT09dC50eXBlPyhzPW51bGwhPT0oaT10aGlzLl9ob3ZlcmVkSXRlbSkm"
+    "Jm51bGwhPT1lJiZpLmRhdGFzZXRJbmRleD09PWUuZGF0YXNldEluZGV4JiZpLmluZGV4PT09ZS5pbmRleCxpJiYhcyYmZChhLm9u"
+    "TGVhdmUsW3QsaSx0aGlzXSx0aGlzKSwodGhpcy5faG92ZXJlZEl0ZW09ZSkmJiFzJiZkKGEub25Ib3ZlcixbdCxlLHRoaXNdLHRo"
+    "aXMpKTplJiZkKGEub25DbGljayxbdCxlLHRoaXNdLHRoaXMpKX19ZnVuY3Rpb24gQW4odCxlKXtyZXR1cm4gZSoodC50ZXh0P3Qu"
+    "dGV4dC5sZW5ndGg6MCl9dmFyIFRuPXtpZDoibGVnZW5kIixfZWxlbWVudDpPbixzdGFydCh0LGUsaSl7dmFyIHM9dC5sZWdlbmQ9"
+    "bmV3IE9uKHtjdHg6dC5jdHgsb3B0aW9uczppLGNoYXJ0OnR9KTthLmNvbmZpZ3VyZSh0LHMsaSksYS5hZGRCb3godCxzKX0sc3Rv"
+    "cCh0KXthLnJlbW92ZUJveCh0LHQubGVnZW5kKSxkZWxldGUgdC5sZWdlbmR9LGJlZm9yZVVwZGF0ZSh0LGUsaSl7Y29uc3Qgcz10"
+    "LmxlZ2VuZDthLmNvbmZpZ3VyZSh0LHMsaSkscy5vcHRpb25zPWl9LGFmdGVyVXBkYXRlKHQpe2NvbnN0IGU9dC5sZWdlbmQ7ZS5i"
+    "dWlsZExhYmVscygpLGUuYWRqdXN0SGl0Qm94ZXMoKX0sYWZ0ZXJFdmVudCh0LGUpe2UucmVwbGF5fHx0LmxlZ2VuZC5oYW5kbGVF"
+    "dmVudChlLmV2ZW50KX0sZGVmYXVsdHM6e2Rpc3BsYXk6ITAscG9zaXRpb246InRvcCIsYWxpZ246ImNlbnRlciIsZnVsbFNpemU6"
+    "ITAscmV2ZXJzZTohMSx3ZWlnaHQ6MWUzLG9uQ2xpY2sodCxlLGkpe2NvbnN0IHM9ZS5kYXRhc2V0SW5kZXgsYT1pLmNoYXJ0O2Eu"
+    "aXNEYXRhc2V0VmlzaWJsZShzKT8oYS5oaWRlKHMpLGUuaGlkZGVuPSEwKTooYS5zaG93KHMpLGUuaGlkZGVuPSExKX0sb25Ib3Zl"
+    "cjpudWxsLG9uTGVhdmU6bnVsbCxsYWJlbHM6e2NvbG9yOnQ9PnQuY2hhcnQub3B0aW9ucy5jb2xvcixib3hXaWR0aDo0MCxwYWRk"
+    "aW5nOjEwLGdlbmVyYXRlTGFiZWxzKHQpe2NvbnN0IHM9dC5kYXRhLmRhdGFzZXRzLHt1c2VQb2ludFN0eWxlOmEscG9pbnRTdHls"
+    "ZTpuLHRleHRBbGlnbjpvLGNvbG9yOnIsdXNlQm9yZGVyUmFkaXVzOmwsYm9yZGVyUmFkaXVzOmh9PXQubGVnZW5kLm9wdGlvbnNb"
+    "ImxhYmVscyJdO3JldHVybiB0Ll9nZXRTb3J0ZWREYXRhc2V0TWV0YXMoKS5tYXAodD0+e3ZhciBlPXQuY29udHJvbGxlci5nZXRT"
+    "dHlsZShhPzA6dm9pZCAwKSxpPUkoZS5ib3JkZXJXaWR0aCk7cmV0dXJue3RleHQ6c1t0LmluZGV4XS5sYWJlbCxmaWxsU3R5bGU6"
+    "ZS5iYWNrZ3JvdW5kQ29sb3IsZm9udENvbG9yOnIsaGlkZGVuOiF0LnZpc2libGUsbGluZUNhcDplLmJvcmRlckNhcFN0eWxlLGxp"
+    "bmVEYXNoOmUuYm9yZGVyRGFzaCxsaW5lRGFzaE9mZnNldDplLmJvcmRlckRhc2hPZmZzZXQsbGluZUpvaW46ZS5ib3JkZXJKb2lu"
+    "U3R5bGUsbGluZVdpZHRoOihpLndpZHRoK2kuaGVpZ2h0KS80LHN0cm9rZVN0eWxlOmUuYm9yZGVyQ29sb3IscG9pbnRTdHlsZTpu"
+    "fHxlLnBvaW50U3R5bGUscm90YXRpb246ZS5yb3RhdGlvbix0ZXh0QWxpZ246b3x8ZS50ZXh0QWxpZ24sYm9yZGVyUmFkaXVzOmwm"
+    "JihofHxlLmJvcmRlclJhZGl1cyksZGF0YXNldEluZGV4OnQuaW5kZXh9fSx0aGlzKX19LHRpdGxlOntjb2xvcjp0PT50LmNoYXJ0"
+    "Lm9wdGlvbnMuY29sb3IsZGlzcGxheTohMSxwb3NpdGlvbjoiY2VudGVyIix0ZXh0OiIifX0sZGVzY3JpcHRvcnM6e19zY3JpcHRh"
+    "YmxlOnQ9PiF0LnN0YXJ0c1dpdGgoIm9uIiksbGFiZWxzOntfc2NyaXB0YWJsZTp0PT4hWyJnZW5lcmF0ZUxhYmVscyIsImZpbHRl"
+    "ciIsInNvcnQiXS5pbmNsdWRlcyh0KX19fTtjbGFzcyBMbiBleHRlbmRzIGV7Y29uc3RydWN0b3IodCl7c3VwZXIoKSx0aGlzLmNo"
+    "YXJ0PXQuY2hhcnQsdGhpcy5vcHRpb25zPXQub3B0aW9ucyx0aGlzLmN0eD10LmN0eCx0aGlzLl9wYWRkaW5nPXZvaWQgMCx0aGlz"
+    "LnRvcD12b2lkIDAsdGhpcy5ib3R0b209dm9pZCAwLHRoaXMubGVmdD12b2lkIDAsdGhpcy5yaWdodD12b2lkIDAsdGhpcy53aWR0"
+    "aD12b2lkIDAsdGhpcy5oZWlnaHQ9dm9pZCAwLHRoaXMucG9zaXRpb249dm9pZCAwLHRoaXMud2VpZ2h0PXZvaWQgMCx0aGlzLmZ1"
+    "bGxTaXplPXZvaWQgMH11cGRhdGUodCxlKXt2YXIgaT10aGlzLm9wdGlvbnM7dGhpcy5sZWZ0PTAsdGhpcy50b3A9MCxpLmRpc3Bs"
+    "YXk/KHRoaXMud2lkdGg9dGhpcy5yaWdodD10LHRoaXMuaGVpZ2h0PXRoaXMuYm90dG9tPWUsdD1PKGkudGV4dCk/aS50ZXh0Lmxl"
+    "bmd0aDoxLHRoaXMuX3BhZGRpbmc9SShpLnBhZGRpbmcpLGU9dCp6KGkuZm9udCkubGluZUhlaWdodCt0aGlzLl9wYWRkaW5nLmhl"
+    "aWdodCx0aGlzLmlzSG9yaXpvbnRhbCgpP3RoaXMuaGVpZ2h0PWU6dGhpcy53aWR0aD1lKTp0aGlzLndpZHRoPXRoaXMuaGVpZ2h0"
+    "PXRoaXMucmlnaHQ9dGhpcy5ib3R0b209MH1pc0hvcml6b250YWwoKXt2YXIgdD10aGlzLm9wdGlvbnMucG9zaXRpb247cmV0dXJu"
+    "InRvcCI9PT10fHwiYm90dG9tIj09PXR9X2RyYXdBcmdzKHQpe3Zhcnt0b3A6ZSxsZWZ0OmksYm90dG9tOnMscmlnaHQ6YSxvcHRp"
+    "b25zOm59PXRoaXMsbz1uLmFsaWduO2xldCByLGwsaCxjPTA7cmV0dXJuIHI9dGhpcy5pc0hvcml6b250YWwoKT8obD1FKG8saSxh"
+    "KSxoPWUrdCxhLWkpOihjPSJsZWZ0Ij09PW4ucG9zaXRpb24/KGw9aSt0LGg9RShvLHMsZSksLS41KlMpOihsPWEtdCxoPUUobyxl"
+    "LHMpLC41KlMpLHMtZSkse3RpdGxlWDpsLHRpdGxlWTpoLG1heFdpZHRoOnIscm90YXRpb246Y319ZHJhdygpe3ZhciB0LGUsaSxz"
+    "LGEsbj10aGlzLmN0eCxvPXRoaXMub3B0aW9ucztvLmRpc3BsYXkmJihlPSh0PXooby5mb250KSkubGluZUhlaWdodC8yK3RoaXMu"
+    "X3BhZGRpbmcudG9wLHt0aXRsZVg6ZSx0aXRsZVk6aSxtYXhXaWR0aDpzLHJvdGF0aW9uOmF9PXRoaXMuX2RyYXdBcmdzKGUpLEhl"
+    "KG4sby50ZXh0LDAsMCx0LHtjb2xvcjpvLmNvbG9yLG1heFdpZHRoOnMscm90YXRpb246YSx0ZXh0QWxpZ246RHQoby5hbGlnbiks"
+    "dGV4dEJhc2VsaW5lOiJtaWRkbGUiLHRyYW5zbGF0aW9uOltlLGldfSkpfX12YXIgRW49e2lkOiJ0aXRsZSIsX2VsZW1lbnQ6TG4s"
+    "c3RhcnQodCxlLGkpe3ZhciBzO3Q9dCxpPWkscz1uZXcgTG4oe2N0eDp0LmN0eCxvcHRpb25zOmksY2hhcnQ6dH0pLGEuY29uZmln"
+    "dXJlKHQscyxpKSxhLmFkZEJveCh0LHMpLHQudGl0bGVCbG9jaz1zfSxzdG9wKHQpe3ZhciBlPXQudGl0bGVCbG9jazthLnJlbW92"
+    "ZUJveCh0LGUpLGRlbGV0ZSB0LnRpdGxlQmxvY2t9LGJlZm9yZVVwZGF0ZSh0LGUsaSl7Y29uc3Qgcz10LnRpdGxlQmxvY2s7YS5j"
+    "b25maWd1cmUodCxzLGkpLHMub3B0aW9ucz1pfSxkZWZhdWx0czp7YWxpZ246ImNlbnRlciIsZGlzcGxheTohMSxmb250Ont3ZWln"
+    "aHQ6ImJvbGQifSxmdWxsU2l6ZTohMCxwYWRkaW5nOjEwLHBvc2l0aW9uOiJ0b3AiLHRleHQ6IiIsd2VpZ2h0OjJlM30sZGVmYXVs"
+    "dFJvdXRlczp7Y29sb3I6ImNvbG9yIn0sZGVzY3JpcHRvcnM6e19zY3JpcHRhYmxlOiEwLF9pbmRleGFibGU6ITF9fTtjb25zdCBS"
+    "bj1uZXcgV2Vha01hcDt2YXIgSW49e2lkOiJzdWJ0aXRsZSIsc3RhcnQodCxlLGkpe3ZhciBzPW5ldyBMbih7Y3R4OnQuY3R4LG9w"
+    "dGlvbnM6aSxjaGFydDp0fSk7YS5jb25maWd1cmUodCxzLGkpLGEuYWRkQm94KHQscyksUm4uc2V0KHQscyl9LHN0b3AodCl7YS5y"
+    "ZW1vdmVCb3godCxSbi5nZXQodCkpLFJuLmRlbGV0ZSh0KX0sYmVmb3JlVXBkYXRlKHQsZSxpKXtjb25zdCBzPVJuLmdldCh0KTth"
+    "LmNvbmZpZ3VyZSh0LHMsaSkscy5vcHRpb25zPWl9LGRlZmF1bHRzOnthbGlnbjoiY2VudGVyIixkaXNwbGF5OiExLGZvbnQ6e3dl"
+    "aWdodDoibm9ybWFsIn0sZnVsbFNpemU6ITAscGFkZGluZzowLHBvc2l0aW9uOiJ0b3AiLHRleHQ6IiIsd2VpZ2h0OjE1MDB9LGRl"
+    "ZmF1bHRSb3V0ZXM6e2NvbG9yOiJjb2xvciJ9LGRlc2NyaXB0b3JzOntfc2NyaXB0YWJsZTohMCxfaW5kZXhhYmxlOiExfX07Y29u"
+    "c3Qgem49e2F2ZXJhZ2UodCl7aWYoIXQubGVuZ3RoKXJldHVybiExO2xldCBlLGkscz0wLGE9MCxuPTA7Zm9yKGU9MCxpPXQubGVu"
+    "Z3RoO2U8aTsrK2Upe2NvbnN0IGk9dFtlXS5lbGVtZW50O2lmKGkmJmkuaGFzVmFsdWUoKSl7Y29uc3QgdD1pLnRvb2x0aXBQb3Np"
+    "dGlvbigpO3MrPXQueCxhKz10LnksKytufX1yZXR1cm57eDpzL24seTphL259fSxuZWFyZXN0KHQsZSl7aWYoIXQubGVuZ3RoKXJl"
+    "dHVybiExO2xldCBpLHMsYSxuPWUueCxvPWUueSxyPU51bWJlci5QT1NJVElWRV9JTkZJTklUWTtmb3IoaT0wLHM9dC5sZW5ndGg7"
+    "aTxzOysraSl7Y29uc3Qgcz10W2ldLmVsZW1lbnQ7aWYocyYmcy5oYXNWYWx1ZSgpKXtjb25zdCB0PWd0KGUscy5nZXRDZW50ZXJQ"
+    "b2ludCgpKTt0PHImJihyPXQsYT1zKX19aWYoYSl7Y29uc3QgdD1hLnRvb2x0aXBQb3NpdGlvbigpO249dC54LG89dC55fXJldHVy"
+    "bnt4Om4seTpvfX19O2Z1bmN0aW9uIHgodCxlKXtyZXR1cm4gZSYmKE8oZSk/QXJyYXkucHJvdG90eXBlLnB1c2guYXBwbHkodCxl"
+    "KTp0LnB1c2goZSkpLHR9ZnVuY3Rpb24gRm4odCl7cmV0dXJuKCJzdHJpbmciPT10eXBlb2YgdHx8dCBpbnN0YW5jZW9mIFN0cmlu"
+    "ZykmJi0xPHQuaW5kZXhPZigiXG4iKT90LnNwbGl0KCJcbiIpOnR9ZnVuY3Rpb24gVm4odCxlKXtjb25zdCBpPXQuY2hhcnQuY3R4"
+    "LHtib2R5OnMsZm9vdGVyOmEsdGl0bGU6bn09dCx7Ym94V2lkdGg6byxib3hIZWlnaHQ6cn09ZSxsPXooZS5ib2R5Rm9udCksaD16"
+    "KGUudGl0bGVGb250KSxjPXooZS5mb290ZXJGb250KSxkPW4ubGVuZ3RoLHU9YS5sZW5ndGgsZz1zLmxlbmd0aCxmPUkoZS5wYWRk"
+    "aW5nKTtsZXQgcD1mLmhlaWdodCxtPTAsYj1zLnJlZHVjZSgodCxlKT0+dCtlLmJlZm9yZS5sZW5ndGgrZS5saW5lcy5sZW5ndGgr"
+    "ZS5hZnRlci5sZW5ndGgsMCkseD0oYis9dC5iZWZvcmVCb2R5Lmxlbmd0aCt0LmFmdGVyQm9keS5sZW5ndGgsZCYmKHArPWQqaC5s"
+    "aW5lSGVpZ2h0KyhkLTEpKmUudGl0bGVTcGFjaW5nK2UudGl0bGVNYXJnaW5Cb3R0b20pLGImJihwKz1nKihlLmRpc3BsYXlDb2xv"
+    "cnM/TWF0aC5tYXgocixsLmxpbmVIZWlnaHQpOmwubGluZUhlaWdodCkrKGItZykqbC5saW5lSGVpZ2h0KyhiLTEpKmUuYm9keVNw"
+    "YWNpbmcpLHUmJihwKz1lLmZvb3Rlck1hcmdpblRvcCt1KmMubGluZUhlaWdodCsodS0xKSplLmZvb3RlclNwYWNpbmcpLDApO2Z1"
+    "bmN0aW9uIHYodCl7bT1NYXRoLm1heChtLGkubWVhc3VyZVRleHQodCkud2lkdGgreCl9cmV0dXJuIGkuc2F2ZSgpLGkuZm9udD1o"
+    "LnN0cmluZyxrKHQudGl0bGUsdiksaS5mb250PWwuc3RyaW5nLGsodC5iZWZvcmVCb2R5LmNvbmNhdCh0LmFmdGVyQm9keSksdiks"
+    "eD1lLmRpc3BsYXlDb2xvcnM/bysyK2UuYm94UGFkZGluZzowLGsocyx0PT57ayh0LmJlZm9yZSx2KSxrKHQubGluZXMsdiksayh0"
+    "LmFmdGVyLHYpfSkseD0wLGkuZm9udD1jLnN0cmluZyxrKHQuZm9vdGVyLHYpLGkucmVzdG9yZSgpLHt3aWR0aDptKz1mLndpZHRo"
+    "LGhlaWdodDpwfX1mdW5jdGlvbiBCbihpLHQscyl7dmFyIGU9cy55QWxpZ258fHQueUFsaWdufHxmdW5jdGlvbigpe3Zhcnt5OnQs"
+    "aGVpZ2h0OmV9PXM7cmV0dXJuIHQ8ZS8yPyJ0b3AiOnQ+aS5oZWlnaHQtZS8yPyJib3R0b20iOiJjZW50ZXIifSgpO3JldHVybnt4"
+    "QWxpZ246cy54QWxpZ258fHQueEFsaWdufHxmdW5jdGlvbihhLG4sbyx0KXt2YXJ7eDplLHdpZHRoOml9PW8se3dpZHRoOnMsY2hh"
+    "cnRBcmVhOntsZWZ0OnIscmlnaHQ6bH19PWE7bGV0IGg9ImNlbnRlciI7cmV0dXJuImNlbnRlciI9PT10P2g9ZTw9KHIrbCkvMj8i"
+    "bGVmdCI6InJpZ2h0IjplPD1pLzI/aD0ibGVmdCI6cy1pLzI8PWUmJihoPSJyaWdodCIpLGg9ZnVuY3Rpb24odCl7dmFye3g6ZSx3"
+    "aWR0aDppfT1vLHM9bi5jYXJldFNpemUrbi5jYXJldFBhZGRpbmc7cmV0dXJuImxlZnQiPT09dCYmZStpK3M+YS53aWR0aHx8InJp"
+    "Z2h0Ij09PXQmJmUtaS1zPDB9KGgpPyJjZW50ZXIiOmh9KGksdCxzLGUpLHlBbGlnbjplfX1mdW5jdGlvbiBXbih0LGksZSxzKXt2"
+    "YXJ7Y2FyZXRTaXplOnQsY2FyZXRQYWRkaW5nOmEsY29ybmVyUmFkaXVzOm59PXQse3hBbGlnbjpvLHlBbGlnbjpyfT1lLGw9dCth"
+    "LHt0b3BMZWZ0OmUsdG9wUmlnaHQ6YSxib3R0b21MZWZ0Om4sYm90dG9tUmlnaHQ6aH09d2kobik7bGV0IGM9ZnVuY3Rpb24oKXts"
+    "ZXR7eDp0LHdpZHRoOmV9PWk7cmV0dXJuInJpZ2h0Ij09PW8/dC09ZToiY2VudGVyIj09PW8mJih0LT1lLzIpLHR9KCk7dmFyIGQ9"
+    "ZnVuY3Rpb24oKXtsZXR7eTp0LGhlaWdodDplfT1pO3JldHVybiJ0b3AiPT09cj90Kz1sOnQtPSJib3R0b20iPT09cj9lK2w6ZS8y"
+    "LHR9KCk7cmV0dXJuImNlbnRlciI9PT1yPyJsZWZ0Ij09PW8/Yys9bDoicmlnaHQiPT09byYmKGMtPWwpOiJsZWZ0Ij09PW8/Yy09"
+    "TWF0aC5tYXgoZSxuKSt0OiJyaWdodCI9PT1vJiYoYys9TWF0aC5tYXgoYSxoKSt0KSx7eDpDKGMsMCxzLndpZHRoLWkud2lkdGgp"
+    "LHk6QyhkLDAscy5oZWlnaHQtaS5oZWlnaHQpfX1mdW5jdGlvbiBObih0LGUsaSl7aT1JKGkucGFkZGluZyk7cmV0dXJuImNlbnRl"
+    "ciI9PT1lP3QueCt0LndpZHRoLzI6InJpZ2h0Ij09PWU/dC54K3Qud2lkdGgtaS5yaWdodDp0LngraS5sZWZ0fWZ1bmN0aW9uIEhu"
+    "KHQpe3JldHVybiB4KFtdLEZuKHQpKX1mdW5jdGlvbiBqbih0LGUpe2U9ZSYmZS5kYXRhc2V0JiZlLmRhdGFzZXQudG9vbHRpcCYm"
+    "ZS5kYXRhc2V0LnRvb2x0aXAuY2FsbGJhY2tzO3JldHVybiBlP3Qub3ZlcnJpZGUoZSk6dH1jb25zdCBZbj17YmVmb3JlVGl0bGU6"
+    "dCx0aXRsZSh0KXtpZigwPHQubGVuZ3RoKXt2YXIgdD10WzBdLGU9dC5jaGFydC5kYXRhLmxhYmVscyxpPWU/ZS5sZW5ndGg6MDtp"
+    "Zih0aGlzJiZ0aGlzLm9wdGlvbnMmJiJkYXRhc2V0Ij09PXRoaXMub3B0aW9ucy5tb2RlKXJldHVybiB0LmRhdGFzZXQubGFiZWx8"
+    "fCIiO2lmKHQubGFiZWwpcmV0dXJuIHQubGFiZWw7aWYoMDxpJiZ0LmRhdGFJbmRleDxpKXJldHVybiBlW3QuZGF0YUluZGV4XX1y"
+    "ZXR1cm4iIn0sYWZ0ZXJUaXRsZTp0LGJlZm9yZUJvZHk6dCxiZWZvcmVMYWJlbDp0LGxhYmVsKHQpe2lmKHRoaXMmJnRoaXMub3B0"
+    "aW9ucyYmImRhdGFzZXQiPT09dGhpcy5vcHRpb25zLm1vZGUpcmV0dXJuIHQubGFiZWwrIjogIit0LmZvcm1hdHRlZFZhbHVlfHx0"
+    "LmZvcm1hdHRlZFZhbHVlO2xldCBlPXQuZGF0YXNldC5sYWJlbHx8IiI7ZSYmKGUrPSI6ICIpO3Q9dC5mb3JtYXR0ZWRWYWx1ZTty"
+    "ZXR1cm4gUCh0KXx8KGUrPXQpLGV9LGxhYmVsQ29sb3IodCl7dD10LmNoYXJ0LmdldERhdGFzZXRNZXRhKHQuZGF0YXNldEluZGV4"
+    "KS5jb250cm9sbGVyLmdldFN0eWxlKHQuZGF0YUluZGV4KTtyZXR1cm57Ym9yZGVyQ29sb3I6dC5ib3JkZXJDb2xvcixiYWNrZ3Jv"
+    "dW5kQ29sb3I6dC5iYWNrZ3JvdW5kQ29sb3IsYm9yZGVyV2lkdGg6dC5ib3JkZXJXaWR0aCxib3JkZXJEYXNoOnQuYm9yZGVyRGFz"
+    "aCxib3JkZXJEYXNoT2Zmc2V0OnQuYm9yZGVyRGFzaE9mZnNldCxib3JkZXJSYWRpdXM6MH19LGxhYmVsVGV4dENvbG9yKCl7cmV0"
+    "dXJuIHRoaXMub3B0aW9ucy5ib2R5Q29sb3J9LGxhYmVsUG9pbnRTdHlsZSh0KXt0PXQuY2hhcnQuZ2V0RGF0YXNldE1ldGEodC5k"
+    "YXRhc2V0SW5kZXgpLmNvbnRyb2xsZXIuZ2V0U3R5bGUodC5kYXRhSW5kZXgpO3JldHVybntwb2ludFN0eWxlOnQucG9pbnRTdHls"
+    "ZSxyb3RhdGlvbjp0LnJvdGF0aW9ufX0sYWZ0ZXJMYWJlbDp0LGFmdGVyQm9keTp0LGJlZm9yZUZvb3Rlcjp0LGZvb3Rlcjp0LGFm"
+    "dGVyRm9vdGVyOnR9O2Z1bmN0aW9uIHcodCxlLGkscyl7dD10W2VdLmNhbGwoaSxzKTtyZXR1cm4gdm9pZCAwPT09dD9ZbltlXS5j"
+    "YWxsKGkscyk6dH1jbGFzcyAkbiBleHRlbmRzIGV7c3RhdGljIHBvc2l0aW9uZXJzPXpuO2NvbnN0cnVjdG9yKHQpe3N1cGVyKCks"
+    "dGhpcy5vcGFjaXR5PTAsdGhpcy5fYWN0aXZlPVtdLHRoaXMuX2V2ZW50UG9zaXRpb249dm9pZCAwLHRoaXMuX3NpemU9dm9pZCAw"
+    "LHRoaXMuX2NhY2hlZEFuaW1hdGlvbnM9dm9pZCAwLHRoaXMuX3Rvb2x0aXBJdGVtcz1bXSx0aGlzLiRhbmltYXRpb25zPXZvaWQg"
+    "MCx0aGlzLiRjb250ZXh0PXZvaWQgMCx0aGlzLmNoYXJ0PXQuY2hhcnQsdGhpcy5vcHRpb25zPXQub3B0aW9ucyx0aGlzLmRhdGFQ"
+    "b2ludHM9dm9pZCAwLHRoaXMudGl0bGU9dm9pZCAwLHRoaXMuYmVmb3JlQm9keT12b2lkIDAsdGhpcy5ib2R5PXZvaWQgMCx0aGlz"
+    "LmFmdGVyQm9keT12b2lkIDAsdGhpcy5mb290ZXI9dm9pZCAwLHRoaXMueEFsaWduPXZvaWQgMCx0aGlzLnlBbGlnbj12b2lkIDAs"
+    "dGhpcy54PXZvaWQgMCx0aGlzLnk9dm9pZCAwLHRoaXMuaGVpZ2h0PXZvaWQgMCx0aGlzLndpZHRoPXZvaWQgMCx0aGlzLmNhcmV0"
+    "WD12b2lkIDAsdGhpcy5jYXJldFk9dm9pZCAwLHRoaXMubGFiZWxDb2xvcnM9dm9pZCAwLHRoaXMubGFiZWxQb2ludFN0eWxlcz12"
+    "b2lkIDAsdGhpcy5sYWJlbFRleHRDb2xvcnM9dm9pZCAwfWluaXRpYWxpemUodCl7dGhpcy5vcHRpb25zPXQsdGhpcy5fY2FjaGVk"
+    "QW5pbWF0aW9ucz12b2lkIDAsdGhpcy4kY29udGV4dD12b2lkIDB9X3Jlc29sdmVBbmltYXRpb25zKCl7dmFyIHQ9dGhpcy5fY2Fj"
+    "aGVkQW5pbWF0aW9ucztpZih0KXJldHVybiB0O3ZhciB0PXRoaXMuY2hhcnQsZT10aGlzLm9wdGlvbnMuc2V0Q29udGV4dCh0aGlz"
+    "LmdldENvbnRleHQoKSksdD1lLmVuYWJsZWQmJnQub3B0aW9ucy5hbmltYXRpb24mJmUuYW5pbWF0aW9ucyxlPW5ldyB4cyh0aGlz"
+    "LmNoYXJ0LHQpO3JldHVybiB0Ll9jYWNoZWFibGUmJih0aGlzLl9jYWNoZWRBbmltYXRpb25zPU9iamVjdC5mcmVlemUoZSkpLGV9"
+    "Z2V0Q29udGV4dCgpe3JldHVybiB0aGlzLiRjb250ZXh0fHwodGhpcy4kY29udGV4dD0odD10aGlzLmNoYXJ0LmdldENvbnRleHQo"
+    "KSxQaSh0LHt0b29sdGlwOnRoaXMsdG9vbHRpcEl0ZW1zOnRoaXMuX3Rvb2x0aXBJdGVtcyx0eXBlOiJ0b29sdGlwIn0pKSk7dmFy"
+    "IHR9Z2V0VGl0bGUodCxlKXt2YXIgZT1lWyJjYWxsYmFja3MiXSxpPXcoZSwiYmVmb3JlVGl0bGUiLHRoaXMsdCkscz13KGUsInRp"
+    "dGxlIix0aGlzLHQpLGU9dyhlLCJhZnRlclRpdGxlIix0aGlzLHQpLHQ9eChbXSxGbihpKSk7cmV0dXJuIHQ9eCh0LEZuKHMpKSx4"
+    "KHQsRm4oZSkpfWdldEJlZm9yZUJvZHkodCxlKXtyZXR1cm4gSG4odyhlLmNhbGxiYWNrcywiYmVmb3JlQm9keSIsdGhpcyx0KSl9"
+    "Z2V0Qm9keSh0LGUpe2NvbnN0IHM9ZVsiY2FsbGJhY2tzIl0sYT1bXTtyZXR1cm4gayh0LHQ9Pnt2YXIgZT17YmVmb3JlOltdLGxp"
+    "bmVzOltdLGFmdGVyOltdfSxpPWpuKHMsdCk7eChlLmJlZm9yZSxGbih3KGksImJlZm9yZUxhYmVsIix0aGlzLHQpKSkseChlLmxp"
+    "bmVzLHcoaSwibGFiZWwiLHRoaXMsdCkpLHgoZS5hZnRlcixGbih3KGksImFmdGVyTGFiZWwiLHRoaXMsdCkpKSxhLnB1c2goZSl9"
+    "KSxhfWdldEFmdGVyQm9keSh0LGUpe3JldHVybiBIbih3KGUuY2FsbGJhY2tzLCJhZnRlckJvZHkiLHRoaXMsdCkpfWdldEZvb3Rl"
+    "cih0LGUpe3ZhciBlPWVbImNhbGxiYWNrcyJdLGk9dyhlLCJiZWZvcmVGb290ZXIiLHRoaXMsdCkscz13KGUsImZvb3RlciIsdGhp"
+    "cyx0KSxlPXcoZSwiYWZ0ZXJGb290ZXIiLHRoaXMsdCksdD14KFtdLEZuKGkpKTtyZXR1cm4gdD14KHQsRm4ocykpLHgodCxGbihl"
+    "KSl9X2NyZWF0ZUl0ZW1zKHMpe2NvbnN0IHQ9dGhpcy5fYWN0aXZlLGE9dGhpcy5jaGFydC5kYXRhLGk9W10sbj1bXSxvPVtdO2xl"
+    "dCBlLHIsbD1bXTtmb3IoZT0wLHI9dC5sZW5ndGg7ZTxyOysrZSlsLnB1c2goZnVuY3Rpb24odCxlKXtjb25zdHtlbGVtZW50Omks"
+    "ZGF0YXNldEluZGV4OnMsaW5kZXg6YX09ZSxuPXQuZ2V0RGF0YXNldE1ldGEocykuY29udHJvbGxlcix7bGFiZWw6byx2YWx1ZTpy"
+    "fT1uLmdldExhYmVsQW5kVmFsdWUoYSk7cmV0dXJue2NoYXJ0OnQsbGFiZWw6byxwYXJzZWQ6bi5nZXRQYXJzZWQoYSkscmF3OnQu"
+    "ZGF0YS5kYXRhc2V0c1tzXS5kYXRhW2FdLGZvcm1hdHRlZFZhbHVlOnIsZGF0YXNldDpuLmdldERhdGFzZXQoKSxkYXRhSW5kZXg6"
+    "YSxkYXRhc2V0SW5kZXg6cyxlbGVtZW50Oml9fSh0aGlzLmNoYXJ0LHRbZV0pKTtyZXR1cm4gcy5maWx0ZXImJihsPWwuZmlsdGVy"
+    "KCh0LGUsaSk9PnMuZmlsdGVyKHQsZSxpLGEpKSksayhsPXMuaXRlbVNvcnQ/bC5zb3J0KCh0LGUpPT5zLml0ZW1Tb3J0KHQsZSxh"
+    "KSk6bCx0PT57dmFyIGU9am4ocy5jYWxsYmFja3MsdCk7aS5wdXNoKHcoZSwibGFiZWxDb2xvciIsdGhpcyx0KSksbi5wdXNoKHco"
+    "ZSwibGFiZWxQb2ludFN0eWxlIix0aGlzLHQpKSxvLnB1c2godyhlLCJsYWJlbFRleHRDb2xvciIsdGhpcyx0KSl9KSx0aGlzLmxh"
+    "YmVsQ29sb3JzPWksdGhpcy5sYWJlbFBvaW50U3R5bGVzPW4sdGhpcy5sYWJlbFRleHRDb2xvcnM9byx0aGlzLmRhdGFQb2ludHM9"
+    "bH11cGRhdGUodCxlKXtjb25zdCBpPXRoaXMub3B0aW9ucy5zZXRDb250ZXh0KHRoaXMuZ2V0Q29udGV4dCgpKSxzPXRoaXMuX2Fj"
+    "dGl2ZTtsZXQgYSxuPVtdO2lmKHMubGVuZ3RoKXtjb25zdCB0PXpuW2kucG9zaXRpb25dLmNhbGwodGhpcyxzLHRoaXMuX2V2ZW50"
+    "UG9zaXRpb24pLGU9KG49dGhpcy5fY3JlYXRlSXRlbXMoaSksdGhpcy50aXRsZT10aGlzLmdldFRpdGxlKG4saSksdGhpcy5iZWZv"
+    "cmVCb2R5PXRoaXMuZ2V0QmVmb3JlQm9keShuLGkpLHRoaXMuYm9keT10aGlzLmdldEJvZHkobixpKSx0aGlzLmFmdGVyQm9keT10"
+    "aGlzLmdldEFmdGVyQm9keShuLGkpLHRoaXMuZm9vdGVyPXRoaXMuZ2V0Rm9vdGVyKG4saSksdGhpcy5fc2l6ZT1Wbih0aGlzLGkp"
+    "KSxvPU9iamVjdC5hc3NpZ24oe30sdCxlKSxyPUJuKHRoaXMuY2hhcnQsaSxvKSxsPVduKGksbyxyLHRoaXMuY2hhcnQpO3RoaXMu"
+    "eEFsaWduPXIueEFsaWduLHRoaXMueUFsaWduPXIueUFsaWduLGE9e29wYWNpdHk6MSx4OmwueCx5OmwueSx3aWR0aDplLndpZHRo"
+    "LGhlaWdodDplLmhlaWdodCxjYXJldFg6dC54LGNhcmV0WTp0Lnl9fWVsc2UgMCE9PXRoaXMub3BhY2l0eSYmKGE9e29wYWNpdHk6"
+    "MH0pO3RoaXMuX3Rvb2x0aXBJdGVtcz1uLHRoaXMuJGNvbnRleHQ9dm9pZCAwLGEmJnRoaXMuX3Jlc29sdmVBbmltYXRpb25zKCku"
+    "dXBkYXRlKHRoaXMsYSksdCYmaS5leHRlcm5hbCYmaS5leHRlcm5hbC5jYWxsKHRoaXMse2NoYXJ0OnRoaXMuY2hhcnQsdG9vbHRp"
+    "cDp0aGlzLHJlcGxheTplfSl9ZHJhd0NhcmV0KHQsZSxpLHMpe3Q9dGhpcy5nZXRDYXJldFBvc2l0aW9uKHQsaSxzKTtlLmxpbmVU"
+    "byh0LngxLHQueTEpLGUubGluZVRvKHQueDIsdC55MiksZS5saW5lVG8odC54Myx0LnkzKX1nZXRDYXJldFBvc2l0aW9uKHQsZSxp"
+    "KXt2YXJ7eEFsaWduOnMseUFsaWduOmF9PXRoaXMse2NhcmV0U2l6ZTppLGNvcm5lclJhZGl1czpufT1pLHt0b3BMZWZ0Om4sdG9w"
+    "UmlnaHQ6byxib3R0b21MZWZ0OnIsYm90dG9tUmlnaHQ6bH09d2kobikse3g6dCx5Omh9PXQse3dpZHRoOmUsaGVpZ2h0OmN9PWU7"
+    "bGV0IGQsdSxnLGYscCxtO3JldHVybiJjZW50ZXIiPT09YT8ocD1oK2MvMixtPSJsZWZ0Ij09PXM/KGQ9dCx1PWQtaSxmPXAraSxw"
+    "LWkpOihkPXQrZSx1PWQraSxmPXAtaSxwK2kpLGc9ZCk6KHU9ImxlZnQiPT09cz90K01hdGgubWF4KG4scikraToicmlnaHQiPT09"
+    "cz90K2UtTWF0aC5tYXgobyxsKS1pOnRoaXMuY2FyZXRYLGc9InRvcCI9PT1hPyhmPWgscD1mLWksZD11LWksdStpKTooZj1oK2Ms"
+    "cD1mK2ksZD11K2ksdS1pKSxtPWYpLHt4MTpkLHgyOnUseDM6Zyx5MTpmLHkyOnAseTM6bX19ZHJhd1RpdGxlKHQsZSxpKXt2YXIg"
+    "cz10aGlzLnRpdGxlLGE9cy5sZW5ndGg7bGV0IG4sbyxyO2lmKGEpe2NvbnN0IGw9RGkoaS5ydGwsdGhpcy54LHRoaXMud2lkdGgp"
+    "O2Zvcih0Lng9Tm4odGhpcyxpLnRpdGxlQWxpZ24saSksZS50ZXh0QWxpZ249bC50ZXh0QWxpZ24oaS50aXRsZUFsaWduKSxlLnRl"
+    "eHRCYXNlbGluZT0ibWlkZGxlIixuPXooaS50aXRsZUZvbnQpLG89aS50aXRsZVNwYWNpbmcsZS5maWxsU3R5bGU9aS50aXRsZUNv"
+    "bG9yLGUuZm9udD1uLnN0cmluZyxyPTA7cjxhOysrcillLmZpbGxUZXh0KHNbcl0sbC54KHQueCksdC55K24ubGluZUhlaWdodC8y"
+    "KSx0LnkrPW4ubGluZUhlaWdodCtvLHIrMT09PWEmJih0LnkrPWkudGl0bGVNYXJnaW5Cb3R0b20tbyl9fV9kcmF3Q29sb3JCb3go"
+    "dCxlLGkscyxhKXtjb25zdCBuPXRoaXMubGFiZWxDb2xvcnNbaV0sbz10aGlzLmxhYmVsUG9pbnRTdHlsZXNbaV0se2JveEhlaWdo"
+    "dDpyLGJveFdpZHRoOmx9PWEsaD16KGEuYm9keUZvbnQpLGM9Tm4odGhpcywibGVmdCIsYSksZD1zLngoYyksdT1yPGgubGluZUhl"
+    "aWdodD8oaC5saW5lSGVpZ2h0LXIpLzI6MCxnPWUueSt1O2lmKGEudXNlUG9pbnRTdHlsZSl7Y29uc3QgZT17cmFkaXVzOk1hdGgu"
+    "bWluKGwscikvMixwb2ludFN0eWxlOm8ucG9pbnRTdHlsZSxyb3RhdGlvbjpvLnJvdGF0aW9uLGJvcmRlcldpZHRoOjF9LGk9cy5s"
+    "ZWZ0Rm9yTHRyKGQsbCkrbC8yLEE9ZytyLzI7dC5zdHJva2VTdHlsZT1hLm11bHRpS2V5QmFja2dyb3VuZCx0LmZpbGxTdHlsZT1h"
+    "Lm11bHRpS2V5QmFja2dyb3VuZCx6ZSh0LGUsaSxBKSx0LnN0cm9rZVN0eWxlPW4uYm9yZGVyQ29sb3IsdC5maWxsU3R5bGU9bi5i"
+    "YWNrZ3JvdW5kQ29sb3IsemUodCxlLGksQSl9ZWxzZXt0LmxpbmVXaWR0aD1BKG4uYm9yZGVyV2lkdGgpP01hdGgubWF4KC4uLk9i"
+    "amVjdC52YWx1ZXMobi5ib3JkZXJXaWR0aCkpOm4uYm9yZGVyV2lkdGh8fDEsdC5zdHJva2VTdHlsZT1uLmJvcmRlckNvbG9yLHQu"
+    "c2V0TGluZURhc2gobi5ib3JkZXJEYXNofHxbXSksdC5saW5lRGFzaE9mZnNldD1uLmJvcmRlckRhc2hPZmZzZXR8fDA7Y29uc3Qg"
+    "ZT1zLmxlZnRGb3JMdHIoZCxsKSxpPXMubGVmdEZvckx0cihzLnhQbHVzKGQsMSksbC0yKSxvPXdpKG4uYm9yZGVyUmFkaXVzKTtP"
+    "YmplY3QudmFsdWVzKG8pLnNvbWUodD0+MCE9PXQpPyh0LmJlZ2luUGF0aCgpLHQuZmlsbFN0eWxlPWEubXVsdGlLZXlCYWNrZ3Jv"
+    "dW5kLGplKHQse3g6ZSx5OmcsdzpsLGg6cixyYWRpdXM6b30pLHQuZmlsbCgpLHQuc3Ryb2tlKCksdC5maWxsU3R5bGU9bi5iYWNr"
+    "Z3JvdW5kQ29sb3IsdC5iZWdpblBhdGgoKSxqZSh0LHt4OmkseTpnKzEsdzpsLTIsaDpyLTIscmFkaXVzOm99KSx0LmZpbGwoKSk6"
+    "KHQuZmlsbFN0eWxlPWEubXVsdGlLZXlCYWNrZ3JvdW5kLHQuZmlsbFJlY3QoZSxnLGwsciksdC5zdHJva2VSZWN0KGUsZyxsLHIp"
+    "LHQuZmlsbFN0eWxlPW4uYmFja2dyb3VuZENvbG9yLHQuZmlsbFJlY3QoaSxnKzEsbC0yLHItMikpfXQuZmlsbFN0eWxlPXRoaXMu"
+    "bGFiZWxUZXh0Q29sb3JzW2ldfWRyYXdCb2R5KGUsaSx0KXtjb25zdCBzPXRoaXNbImJvZHkiXSx7Ym9keVNwYWNpbmc6YSxib2R5"
+    "QWxpZ246bixkaXNwbGF5Q29sb3JzOm8sYm94SGVpZ2h0OnIsYm94V2lkdGg6bCxib3hQYWRkaW5nOmh9PXQsYz16KHQuYm9keUZv"
+    "bnQpO2xldCBkPWMubGluZUhlaWdodCx1PTA7ZnVuY3Rpb24gZyh0KXtpLmZpbGxUZXh0KHQsZi54KGUueCt1KSxlLnkrZC8yKSxl"
+    "LnkrPWQrYX1jb25zdCBmPURpKHQucnRsLHRoaXMueCx0aGlzLndpZHRoKSxwPWYudGV4dEFsaWduKG4pO2xldCBtLGIseCx2LF8s"
+    "eSxNO2ZvcihpLnRleHRBbGlnbj1uLGkudGV4dEJhc2VsaW5lPSJtaWRkbGUiLGkuZm9udD1jLnN0cmluZyxlLng9Tm4odGhpcyxw"
+    "LHQpLGkuZmlsbFN0eWxlPXQuYm9keUNvbG9yLGsodGhpcy5iZWZvcmVCb2R5LGcpLHU9byYmInJpZ2h0IiE9PXA/ImNlbnRlciI9"
+    "PT1uP2wvMitoOmwrMitoOjAsdj0wLHk9cy5sZW5ndGg7djx5Oysrdil7Zm9yKG09c1t2XSxiPXRoaXMubGFiZWxUZXh0Q29sb3Jz"
+    "W3ZdLGkuZmlsbFN0eWxlPWIsayhtLmJlZm9yZSxnKSx4PW0ubGluZXMsbyYmeC5sZW5ndGgmJih0aGlzLl9kcmF3Q29sb3JCb3go"
+    "aSxlLHYsZix0KSxkPU1hdGgubWF4KGMubGluZUhlaWdodCxyKSksXz0wLE09eC5sZW5ndGg7XzxNOysrXylnKHhbX10pLGQ9Yy5s"
+    "aW5lSGVpZ2h0O2sobS5hZnRlcixnKX11PTAsZD1jLmxpbmVIZWlnaHQsayh0aGlzLmFmdGVyQm9keSxnKSxlLnktPWF9ZHJhd0Zv"
+    "b3Rlcih0LGUsaSl7dmFyIHM9dGhpcy5mb290ZXIsYT1zLmxlbmd0aDtsZXQgbixvO2lmKGEpe2NvbnN0IHI9RGkoaS5ydGwsdGhp"
+    "cy54LHRoaXMud2lkdGgpO2Zvcih0Lng9Tm4odGhpcyxpLmZvb3RlckFsaWduLGkpLHQueSs9aS5mb290ZXJNYXJnaW5Ub3AsZS50"
+    "ZXh0QWxpZ249ci50ZXh0QWxpZ24oaS5mb290ZXJBbGlnbiksZS50ZXh0QmFzZWxpbmU9Im1pZGRsZSIsbj16KGkuZm9vdGVyRm9u"
+    "dCksZS5maWxsU3R5bGU9aS5mb290ZXJDb2xvcixlLmZvbnQ9bi5zdHJpbmcsbz0wO288YTsrK28pZS5maWxsVGV4dChzW29dLHIu"
+    "eCh0LngpLHQueStuLmxpbmVIZWlnaHQvMiksdC55Kz1uLmxpbmVIZWlnaHQraS5mb290ZXJTcGFjaW5nfX1kcmF3QmFja2dyb3Vu"
+    "ZCh0LGUsaSxzKXt2YXJ7eEFsaWduOmEseUFsaWduOm59PXRoaXMse3g6byx5OnJ9PXQse3dpZHRoOmwsaGVpZ2h0Omh9PWkse3Rv"
+    "cExlZnQ6Yyx0b3BSaWdodDpkLGJvdHRvbUxlZnQ6dSxib3R0b21SaWdodDpnfT13aShzLmNvcm5lclJhZGl1cyk7ZS5maWxsU3R5"
+    "bGU9cy5iYWNrZ3JvdW5kQ29sb3IsZS5zdHJva2VTdHlsZT1zLmJvcmRlckNvbG9yLGUubGluZVdpZHRoPXMuYm9yZGVyV2lkdGgs"
+    "ZS5iZWdpblBhdGgoKSxlLm1vdmVUbyhvK2MsciksInRvcCI9PT1uJiZ0aGlzLmRyYXdDYXJldCh0LGUsaSxzKSxlLmxpbmVUbyhv"
+    "K2wtZCxyKSxlLnF1YWRyYXRpY0N1cnZlVG8obytsLHIsbytsLHIrZCksImNlbnRlciI9PT1uJiYicmlnaHQiPT09YSYmdGhpcy5k"
+    "cmF3Q2FyZXQodCxlLGkscyksZS5saW5lVG8obytsLHIraC1nKSxlLnF1YWRyYXRpY0N1cnZlVG8obytsLHIraCxvK2wtZyxyK2gp"
+    "LCJib3R0b20iPT09biYmdGhpcy5kcmF3Q2FyZXQodCxlLGkscyksZS5saW5lVG8obyt1LHIraCksZS5xdWFkcmF0aWNDdXJ2ZVRv"
+    "KG8scitoLG8scitoLXUpLCJjZW50ZXIiPT09biYmImxlZnQiPT09YSYmdGhpcy5kcmF3Q2FyZXQodCxlLGkscyksZS5saW5lVG8o"
+    "byxyK2MpLGUucXVhZHJhdGljQ3VydmVUbyhvLHIsbytjLHIpLGUuY2xvc2VQYXRoKCksZS5maWxsKCksMDxzLmJvcmRlcldpZHRo"
+    "JiZlLnN0cm9rZSgpfV91cGRhdGVBbmltYXRpb25UYXJnZXQodCl7Y29uc3QgZT10aGlzLmNoYXJ0LGk9dGhpcy4kYW5pbWF0aW9u"
+    "cyxzPWkmJmkueCxhPWkmJmkueTtpZihzfHxhKXtjb25zdCBpPXpuW3QucG9zaXRpb25dLmNhbGwodGhpcyx0aGlzLl9hY3RpdmUs"
+    "dGhpcy5fZXZlbnRQb3NpdGlvbik7dmFyIG4sbztpJiYobj10aGlzLl9zaXplPVZuKHRoaXMsdCksbz1Xbih0LG89T2JqZWN0LmFz"
+    "c2lnbih7fSxpLHRoaXMuX3NpemUpLHQ9Qm4oZSx0LG8pLGUpLHMuX3RvPT09by54JiZhLl90bz09PW8ueXx8KHRoaXMueEFsaWdu"
+    "PXQueEFsaWduLHRoaXMueUFsaWduPXQueUFsaWduLHRoaXMud2lkdGg9bi53aWR0aCx0aGlzLmhlaWdodD1uLmhlaWdodCx0aGlz"
+    "LmNhcmV0WD1pLngsdGhpcy5jYXJldFk9aS55LHRoaXMuX3Jlc29sdmVBbmltYXRpb25zKCkudXBkYXRlKHRoaXMsbykpKX19X3dp"
+    "bGxSZW5kZXIoKXtyZXR1cm4hIXRoaXMub3BhY2l0eX1kcmF3KHQpe3ZhciBlPXRoaXMub3B0aW9ucy5zZXRDb250ZXh0KHRoaXMu"
+    "Z2V0Q29udGV4dCgpKTtsZXQgaT10aGlzLm9wYWNpdHk7aWYoaSl7dGhpcy5fdXBkYXRlQW5pbWF0aW9uVGFyZ2V0KGUpO2NvbnN0"
+    "IG49e3dpZHRoOnRoaXMud2lkdGgsaGVpZ2h0OnRoaXMuaGVpZ2h0fSxvPXt4OnRoaXMueCx5OnRoaXMueX07aT1NYXRoLmFicyhp"
+    "KTwuMDAxPzA6aTt2YXIgcz1JKGUucGFkZGluZyksYT10aGlzLnRpdGxlLmxlbmd0aHx8dGhpcy5iZWZvcmVCb2R5Lmxlbmd0aHx8"
+    "dGhpcy5ib2R5Lmxlbmd0aHx8dGhpcy5hZnRlckJvZHkubGVuZ3RofHx0aGlzLmZvb3Rlci5sZW5ndGg7ZS5lbmFibGVkJiZhJiYo"
+    "dC5zYXZlKCksdC5nbG9iYWxBbHBoYT1pLHRoaXMuZHJhd0JhY2tncm91bmQobyx0LG4sZSksQ2kodCxlLnRleHREaXJlY3Rpb24p"
+    "LG8ueSs9cy50b3AsdGhpcy5kcmF3VGl0bGUobyx0LGUpLHRoaXMuZHJhd0JvZHkobyx0LGUpLHRoaXMuZHJhd0Zvb3RlcihvLHQs"
+    "ZSksT2kodCxlLnRleHREaXJlY3Rpb24pLHQucmVzdG9yZSgpKX19Z2V0QWN0aXZlRWxlbWVudHMoKXtyZXR1cm4gdGhpcy5fYWN0"
+    "aXZlfHxbXX1zZXRBY3RpdmVFbGVtZW50cyh0LGUpe3ZhciBpPXRoaXMuX2FjdGl2ZSx0PXQubWFwKCh7ZGF0YXNldEluZGV4OnQs"
+    "aW5kZXg6ZX0pPT57dmFyIGk9dGhpcy5jaGFydC5nZXREYXRhc2V0TWV0YSh0KTtpZihpKXJldHVybntkYXRhc2V0SW5kZXg6dCxl"
+    "bGVtZW50OmkuZGF0YVtlXSxpbmRleDplfTt0aHJvdyBuZXcgRXJyb3IoIkNhbm5vdCBmaW5kIGEgZGF0YXNldCBhdCBpbmRleCAi"
+    "K3QpfSksaT0hVyhpLHQpLHM9dGhpcy5fcG9zaXRpb25DaGFuZ2VkKHQsZSk7KGl8fHMpJiYodGhpcy5fYWN0aXZlPXQsdGhpcy5f"
+    "ZXZlbnRQb3NpdGlvbj1lLHRoaXMuX2lnbm9yZVJlcGxheUV2ZW50cz0hMCx0aGlzLnVwZGF0ZSghMCkpfWhhbmRsZUV2ZW50KHQs"
+    "ZSxpPSEwKXtpZihlJiZ0aGlzLl9pZ25vcmVSZXBsYXlFdmVudHMpcmV0dXJuITE7dGhpcy5faWdub3JlUmVwbGF5RXZlbnRzPSEx"
+    "O3ZhciBzPXRoaXMub3B0aW9ucyxhPXRoaXMuX2FjdGl2ZXx8W10saT10aGlzLl9nZXRBY3RpdmVFbGVtZW50cyh0LGEsZSxpKSxu"
+    "PXRoaXMuX3Bvc2l0aW9uQ2hhbmdlZChpLHQpLGE9ZXx8IVcoaSxhKXx8bjtyZXR1cm4gYSYmKHRoaXMuX2FjdGl2ZT1pLChzLmVu"
+    "YWJsZWR8fHMuZXh0ZXJuYWwpJiYodGhpcy5fZXZlbnRQb3NpdGlvbj17eDp0LngseTp0Lnl9LHRoaXMudXBkYXRlKCEwLGUpKSks"
+    "YX1fZ2V0QWN0aXZlRWxlbWVudHModCxlLGkscyl7dmFyIGE9dGhpcy5vcHRpb25zO2lmKCJtb3VzZW91dCI9PT10LnR5cGUpcmV0"
+    "dXJuW107aWYoIXMpcmV0dXJuIGUuZmlsdGVyKHQ9PnRoaXMuY2hhcnQuZGF0YS5kYXRhc2V0c1t0LmRhdGFzZXRJbmRleF0mJnZv"
+    "aWQgMCE9PXRoaXMuY2hhcnQuZ2V0RGF0YXNldE1ldGEodC5kYXRhc2V0SW5kZXgpLmNvbnRyb2xsZXIuZ2V0UGFyc2VkKHQuaW5k"
+    "ZXgpKTtjb25zdCBuPXRoaXMuY2hhcnQuZ2V0RWxlbWVudHNBdEV2ZW50Rm9yTW9kZSh0LGEubW9kZSxhLGkpO3JldHVybiBhLnJl"
+    "dmVyc2UmJm4ucmV2ZXJzZSgpLG59X3Bvc2l0aW9uQ2hhbmdlZCh0LGUpe3ZhcntjYXJldFg6aSxjYXJldFk6cyxvcHRpb25zOmF9"
+    "PXRoaXMsYT16blthLnBvc2l0aW9uXS5jYWxsKHRoaXMsdCxlKTtyZXR1cm4hMSE9PWEmJihpIT09YS54fHxzIT09YS55KX19dmFy"
+    "IFVuPXtpZDoidG9vbHRpcCIsX2VsZW1lbnQ6JG4scG9zaXRpb25lcnM6em4sYWZ0ZXJJbml0KHQsZSxpKXtpJiYodC50b29sdGlw"
+    "PW5ldyAkbih7Y2hhcnQ6dCxvcHRpb25zOml9KSl9LGJlZm9yZVVwZGF0ZSh0LGUsaSl7dC50b29sdGlwJiZ0LnRvb2x0aXAuaW5p"
+    "dGlhbGl6ZShpKX0scmVzZXQodCxlLGkpe3QudG9vbHRpcCYmdC50b29sdGlwLmluaXRpYWxpemUoaSl9LGFmdGVyRHJhdyh0KXtj"
+    "b25zdCBlPXQudG9vbHRpcDt2YXIgaTtlJiZlLl93aWxsUmVuZGVyKCkmJighKGk9e3Rvb2x0aXA6ZX0pIT09dC5ub3RpZnlQbHVn"
+    "aW5zKCJiZWZvcmVUb29sdGlwRHJhdyIsey4uLmksY2FuY2VsYWJsZTohMH0pJiYoZS5kcmF3KHQuY3R4KSx0Lm5vdGlmeVBsdWdp"
+    "bnMoImFmdGVyVG9vbHRpcERyYXciLGkpKSl9LGFmdGVyRXZlbnQodCxlKXt2YXIgaTt0LnRvb2x0aXAmJihpPWUucmVwbGF5LHQu"
+    "dG9vbHRpcC5oYW5kbGVFdmVudChlLmV2ZW50LGksZS5pbkNoYXJ0QXJlYSkmJihlLmNoYW5nZWQ9ITApKX0sZGVmYXVsdHM6e2Vu"
+    "YWJsZWQ6ITAsZXh0ZXJuYWw6bnVsbCxwb3NpdGlvbjoiYXZlcmFnZSIsYmFja2dyb3VuZENvbG9yOiJyZ2JhKDAsMCwwLDAuOCki"
+    "LHRpdGxlQ29sb3I6IiNmZmYiLHRpdGxlRm9udDp7d2VpZ2h0OiJib2xkIn0sdGl0bGVTcGFjaW5nOjIsdGl0bGVNYXJnaW5Cb3R0"
+    "b206Nix0aXRsZUFsaWduOiJsZWZ0Iixib2R5Q29sb3I6IiNmZmYiLGJvZHlTcGFjaW5nOjIsYm9keUZvbnQ6e30sYm9keUFsaWdu"
+    "OiJsZWZ0Iixmb290ZXJDb2xvcjoiI2ZmZiIsZm9vdGVyU3BhY2luZzoyLGZvb3Rlck1hcmdpblRvcDo2LGZvb3RlckZvbnQ6e3dl"
+    "aWdodDoiYm9sZCJ9LGZvb3RlckFsaWduOiJsZWZ0IixwYWRkaW5nOjYsY2FyZXRQYWRkaW5nOjIsY2FyZXRTaXplOjUsY29ybmVy"
+    "UmFkaXVzOjYsYm94SGVpZ2h0Oih0LGUpPT5lLmJvZHlGb250LnNpemUsYm94V2lkdGg6KHQsZSk9PmUuYm9keUZvbnQuc2l6ZSxt"
+    "dWx0aUtleUJhY2tncm91bmQ6IiNmZmYiLGRpc3BsYXlDb2xvcnM6ITAsYm94UGFkZGluZzowLGJvcmRlckNvbG9yOiJyZ2JhKDAs"
+    "MCwwLDApIixib3JkZXJXaWR0aDowLGFuaW1hdGlvbjp7ZHVyYXRpb246NDAwLGVhc2luZzoiZWFzZU91dFF1YXJ0In0sYW5pbWF0"
+    "aW9uczp7bnVtYmVyczp7dHlwZToibnVtYmVyIixwcm9wZXJ0aWVzOlsieCIsInkiLCJ3aWR0aCIsImhlaWdodCIsImNhcmV0WCIs"
+    "ImNhcmV0WSJdfSxvcGFjaXR5OntlYXNpbmc6ImxpbmVhciIsZHVyYXRpb246MjAwfX0sY2FsbGJhY2tzOllufSxkZWZhdWx0Um91"
+    "dGVzOntib2R5Rm9udDoiZm9udCIsZm9vdGVyRm9udDoiZm9udCIsdGl0bGVGb250OiJmb250In0sZGVzY3JpcHRvcnM6e19zY3Jp"
+    "cHRhYmxlOnQ9PiJmaWx0ZXIiIT09dCYmIml0ZW1Tb3J0IiE9PXQmJiJleHRlcm5hbCIhPT10LF9pbmRleGFibGU6ITEsY2FsbGJh"
+    "Y2tzOntfc2NyaXB0YWJsZTohMSxfaW5kZXhhYmxlOiExfSxhbmltYXRpb246e19mYWxsYmFjazohMX0sYW5pbWF0aW9uczp7X2Zh"
+    "bGxiYWNrOiJhbmltYXRpb24ifX0sYWRkaXRpb25hbE9wdGlvblNjb3BlczpbImludGVyYWN0aW9uIl19O3JldHVybiBpLnJlZ2lz"
+    "dGVyKGJhLGFuLFJhLHMpLGkuaGVscGVycz17Li4uRml9LGkuX2FkYXB0ZXJzPWhhLGkuQW5pbWF0aW9uPWJzLGkuQW5pbWF0aW9u"
+    "cz14cyxpLmFuaW1hdG9yPWwsaS5jb250cm9sbGVycz1iLmNvbnRyb2xsZXJzLml0ZW1zLGkuRGF0YXNldENvbnRyb2xsZXI9T3Ms"
+    "aS5FbGVtZW50PWUsaS5lbGVtZW50cz1SYSxpLkludGVyYWN0aW9uPUhpLGkubGF5b3V0cz1hLGkucGxhdGZvcm1zPU9lLGkuU2Nh"
+    "bGU9enMsaS5UaWNrcz1nZSxPYmplY3QuYXNzaWduKGksYmEsYW4sUmEscyxPZSksaS5DaGFydD1pLCJ1bmRlZmluZWQiIT10eXBl"
+    "b2Ygd2luZG93JiYod2luZG93LkNoYXJ0PWkpLGl9KTs="
+)
+CHARTJS_BYTES = base64.b64decode(CHARTJS_B64)
+
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9932,7 +12619,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>SulgX Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="/static/chart.umd.js"></script>
 <style>
 * {
     margin: 0;
@@ -9986,7 +12673,7 @@ body.light-mode {
   --border2: rgba(0, 0, 0, 0.18);
   --text: #1a1a1a;
   --text2: #4a4a4a;
-  --text3: #888;
+  --text3: #5b6b5e;
   --shadow: 0 12px 36px rgba(0, 0, 0, 0.08);
   --shadow-soft: 0 6px 20px rgba(0, 0, 0, 0.04);
   --shadow-glow: 0 0 30px rgba(46, 125, 50, 0.25);
@@ -10016,6 +12703,34 @@ body.blue-mode {
   --halo-color-1: rgba(59, 130, 246, 0.2);
   --halo-color-2: rgba(59, 130, 246, 0.1);
   --halo-color-3: rgba(59, 130, 246, 0.05);
+}
+
+body.light-mode::before,
+body.light-mode::after {
+  display: none;
+}
+html.light-mode::before {
+  display: none;
+}
+body.light-mode {
+  background: #f5f9f5;
+}
+body.light-mode .header {
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 2px 20px rgba(0, 0, 0, 0.08);
+}
+body.light-mode .page-sub {
+  color: #5b6b5e;
+}
+body.light-mode .glass-btn:hover:not(.active) {
+  background: rgba(0, 0, 0, 0.06);
+}
+body.light-mode ::selection {
+  background: #2e7d32;
+  color: #fff;
+}
+body.light-mode .chart-empty-note {
+  color: #5b6b5e;
 }
 
 
@@ -10187,7 +12902,7 @@ a { text-decoration: none; color: inherit; }
 
 .header {
   min-height: var(--header-h);
-  background: var(--surface);
+  background: var(--surface2);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -10553,7 +13268,8 @@ a { text-decoration: none; color: inherit; }
   padding: 17px 16px;
   border-bottom: 1px solid var(--border);
   font-size: 0.9rem;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: break-word;
   font-weight: 400;
   background: none;
   color: var(--text);
@@ -10777,10 +13493,13 @@ body[dir="rtl"] #login-logs-table td:nth-child(2) {
   background: rgba(0,0,0,0.8);
   z-index: 200;
   display: none;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   backdrop-filter: blur(14px);
   animation: fadeIn 0.3s ease;
+  padding: 20px 12px;
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 .mo.show { display: flex; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
@@ -10790,9 +13509,12 @@ body[dir="rtl"] #login-logs-table td:nth-child(2) {
   border-radius: var(--radius-lg);
   padding: 42px;
   width: 100%;
-  max-width: 640px;
+  min-width: 0;
+  max-width: min(640px, calc(100vw - 32px));
   max-height: 90vh;
   overflow-y: auto;
+  overflow-x: hidden;
+  margin: auto;
   box-shadow: 0 32px 80px rgba(0,0,0,0.7);
   backdrop-filter: blur(36px);
   position: relative;
@@ -10837,7 +13559,7 @@ body[dir="rtl"] #login-logs-table td:nth-child(2) {
 .footer-inner { display: flex; align-items: center; justify-content: center; gap: 36px; flex-wrap: wrap; }
 .footer-inner a { color: var(--primary); text-decoration: none; font-weight: 600; transition: all var(--transition); }
 .footer-inner a:hover { text-shadow: 0 0 18px var(--primary); }
-textarea.fi { resize: vertical; min-height: 130px; }
+textarea.fi { resize: vertical; min-height: 130px; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word; }
 
 
 .chip {
@@ -10976,7 +13698,7 @@ textarea.fi { resize: vertical; min-height: 130px; }
   gap: 20px;
   margin-top: 18px;
 }
-#page-settings .status-cards-grid { justify-items: center; }
+#page-settings .status-cards-grid { justify-items: stretch; }
 .status-glass-card {
   padding: 26px 22px;
   border-radius: var(--radius-md);
@@ -11031,6 +13753,8 @@ textarea.fi { resize: vertical; min-height: 130px; }
   left: 50%;
   transform: translateX(-50%);
   white-space: nowrap;
+  width: max-content;
+  max-width: min(320px, 90vw);
   border: 1px solid rgba(255,255,255,0.2);
   box-shadow: 0 14px 40px rgba(0,0,0,0.6);
   backdrop-filter: blur(20px);
@@ -11040,6 +13764,23 @@ textarea.fi { resize: vertical; min-height: 130px; }
   pointer-events: none;
 }
 .tooltip-container:hover .tooltip-text { visibility: visible; opacity: 1; transform: translateX(-50%) translateY(-8px); }
+
+.num{direction:ltr;unicode-bidi:isolate;white-space:nowrap}
+bdi{unicode-bidi:isolate}
+body[dir="rtl"] .tbl{direction:ltr}
+body[dir="rtl"] .tbl th,body[dir="rtl"] .tbl td{text-align:right}
+body[dir="rtl"] .fl{text-transform:none;letter-spacing:normal}
+body[dir="rtl"] .bulk-actions,body[dir="rtl"] .inbound-tools{direction:rtl}
+.bulk-actions{flex-wrap:wrap}
+.header-nav{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
+.nav-link{white-space:nowrap;flex-shrink:0}
+.nav-link span{white-space:nowrap}
+.mobile-nav .nav-item span{white-space:nowrap}
+.act-icons{flex-wrap:nowrap;justify-content:flex-start}
+body[dir="rtl"] .act-icons{direction:ltr}
+.scan-note{display:none;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.4);color:var(--red);padding:10px 14px;border-radius:10px;margin-top:10px;font-size:0.85rem;line-height:1.5}
+.provider-search{width:100%;margin-bottom:8px}
+
 
 
 .multi-panel-grid { display: flex; flex-wrap: wrap; gap: 20px; }
@@ -11187,7 +13928,7 @@ textarea.fi { resize: vertical; min-height: 130px; }
   .lang-btn { padding: 5px 8px; font-size: 0.68rem; }
   .btn { padding: 8px 14px; }
   .btn-primary { padding: 10px 16px; }
-  .mo-box { padding: 24px 16px; max-width: 100vw; border-radius: var(--radius-sm); }
+  .mo-box { padding: 24px 16px; max-width: calc(100vw - 24px); border-radius: var(--radius-sm); }
   .toast { padding: 14px 20px; font-size: 0.85rem; bottom: 20px; }
 }
 </style>
@@ -11195,15 +13936,23 @@ textarea.fi { resize: vertical; min-height: 130px; }
 html, body { overflow-x: hidden; }
 .main { display: block; width: 100%; max-width: 1440px; margin-left: auto; margin-right: auto; min-width: 0; padding: 24px 16px 120px; }
 .page, .card, .stat-card, .tbl-wrap, .logs-table-container, .chart-container { min-width: 0; }
+.page { scroll-margin-top: 84px; }
+html { scroll-padding-top: 84px; }
 .stats-row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .card { padding: 24px; }
 .card-hd { flex-wrap: wrap; gap: 10px; }
 .page-header { flex-wrap: wrap; gap: 12px; }
 .tbl-wrap, .logs-table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.tbl { border-collapse: collapse; }
-.tbl th, .tbl td { overflow-wrap: anywhere; }
+.tbl { border-collapse: collapse; min-width: 640px; }
+.tbl th, .tbl td { overflow-wrap: break-word; word-break: normal; white-space: normal; }
+#inbound-table { min-width: 880px; }
+#proxy-lines-table { min-width: 760px; }
+#logs-table, #login-logs-table { min-width: 620px; }
+.scanner-tbl { min-width: 560px; }
+.act-btn { min-width: 36px; min-height: 36px; }
 .tooltip-text { white-space: normal; max-width: 220px; overflow-wrap: anywhere; }
 .mo-box .fg { flex-wrap: wrap; }
+.mo-box input[type="color"] { width: 100%; height: 44px; padding: 4px; }
 .fi, .fs { width: 100%; max-width: 100%; }
 .btn { min-height: 44px; }
 .chart-container { max-width: 100%; }
@@ -11249,9 +13998,11 @@ html, body { overflow-x: hidden; }
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
-      <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
-      <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
-      <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
+      <form id="login-form" onsubmit="doLogin();return false;" autocomplete="off">
+      <div class="fg"><label class="fl" data-en="PASSWORD" data-fa="رمز عبور">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" autocomplete="current-password"></div>
+      <button class="btn btn-primary" type="submit" id="login-btn" style="width:100%;justify-content:center;padding:14px;margin-top:16px;" data-en="LOGIN" data-fa="ورود">LOGIN</button>
+      </form>
+      <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none" data-en="Invalid password" data-fa="رمز عبور نامعتبر">Invalid password</div>
       <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:20px;">
         <a href="https://github.com/SulgX" target="_blank" style="color:var(--text3); text-decoration:none; font-size:0.9rem;">
           <span class="icon icon-github"></span> GitHub
@@ -11277,10 +14028,6 @@ html, body { overflow-x: hidden; }
           <button class="nav-link" data-page="inbounds">
             <span class="nav-icon icon-inbounds"></span>
             <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
-          </button>
-          <button class="nav-link" data-page="users">
-            <span class="nav-icon icon-users"></span>
-            <span data-en="Users" data-fa="کاربران">Users</span>
           </button>
           <button class="nav-link" data-page="active-users">
             <span class="nav-icon icon-activity"></span>
@@ -11341,22 +14088,22 @@ html, body { overflow-x: hidden; }
         <div class="stat-card" style="font-size:0.8rem;">
           <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
           <div class="status-cards-grid" id="settings-status">
-            <div class="status-glass-card inactive" id="st-log" data-en="Logging" data-fa="لاگ">
+            <div class="status-glass-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Logging" data-fa="لاگ">
               <span class="status-icon icon-logging"></span> Logging
             </div>
-            <div class="status-glass-card inactive" id="st-auto" data-en="Auto Disable" data-fa="غیرفعال‌سازی">
+            <div class="status-glass-card inactive" id="st-auto" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Auto Disable" data-fa="غیرفعال‌سازی">
               <span class="status-icon icon-auto-disable"></span> Auto Disable
             </div>
-            <div class="status-glass-card inactive" id="st-tgrep" data-en="TG Reports" data-fa="گزارش تلگرام">
+            <div class="status-glass-card inactive" id="st-tgrep" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Reports" data-fa="گزارش تلگرام">
               <span class="status-icon icon-tg-reports"></span> TG Reports
             </div>
-            <div class="status-glass-card inactive" id="st-tgnot" data-en="TG Notify" data-fa="اعلان تلگرام">
+            <div class="status-glass-card inactive" id="st-tgnot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Notify" data-fa="اعلان تلگرام">
               <span class="status-icon icon-tg-notify"></span> TG Notify
             </div>
-            <div class="status-glass-card inactive" id="st-bot" data-en="Bot" data-fa="ربات">
+            <div class="status-glass-card inactive" id="st-bot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Bot" data-fa="ربات">
               <span class="status-icon icon-bot"></span> Bot
             </div>
-            <div class="status-glass-card inactive" id="st-stealth" data-en="Stealth" data-fa="استتار">
+            <div class="status-glass-card inactive" id="st-stealth" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Stealth" data-fa="استتار">
               <span class="status-icon icon-stealth"></span> Stealth
             </div>
           </div>
@@ -11401,13 +14148,13 @@ html, body { overflow-x: hidden; }
           <input type="file" id="import-file" style="display:none" accept=".json" onchange="importLinks(this)">
         </div>
       </div>
-      <div style="display:flex;gap:10px;margin-bottom:16px;">
-        <input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
+      <div class="inbound-tools" style="display:flex;gap:10px;margin-bottom:16px;">
+        <input id="srch" placeholder="Search…" data-ph-en="Search…" data-ph-fa="جستجو…" oninput="filterLinks()" class="fi" style="flex:1;">
         <button class="chip active" data-filter="all" data-en="All" data-fa="همه" onclick="setFilter('all',this)">All</button>
         <button class="chip" data-filter="active" data-en="Active" data-fa="فعال" onclick="setFilter('active',this)">Active</button>
         <button class="chip" data-filter="off" data-en="Off" data-fa="خاموش" onclick="setFilter('off',this)">Off</button>
       </div>
-      <div style="display:flex;gap:6px;margin-bottom:10px;">
+      <div class="bulk-actions" style="display:flex;gap:6px;margin-bottom:10px;">
         <button class="btn btn-outline btn-sm" onclick="batchAction('activate')" data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</button>
         <button class="btn btn-outline btn-sm" onclick="batchAction('deactivate')" data-en="Deactivate Selected" data-fa="غیرفعال‌سازی انتخاب">Deactivate Selected</button>
         <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')" data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</button>
@@ -11415,8 +14162,8 @@ html, body { overflow-x: hidden; }
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="tbl-wrap">
-        <table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Conns" data-fa="اتصالات">Conns</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
-        <div class="empty" id="lempty" style="display:none;padding:30px;">No inbounds found</div>
+        <table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Owner" data-fa="مالک">Owner</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Sessions" data-fa="نشست‌ها">Sessions</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
+        <div class="empty" id="lempty" style="display:none;padding:30px;" data-en="No inbounds found" data-fa="اینباندی یافت نشد">No inbounds found</div>
       </div>
 <div class="card" style="margin-top:20px;">
   <div class="card-hd">
@@ -11445,8 +14192,8 @@ html, body { overflow-x: hidden; }
         <tr>
           <th><input type="checkbox" id="select-all-proxies" onchange="toggleSelectAllProxies()"></th>
           <th data-en="Name" data-fa="نام">Name</th>
-          <th>Type</th>
-          <th>Host:Port</th>
+          <th data-en="Type" data-fa="نوع">Type</th>
+          <th data-en="Host:Port" data-fa="هاست:پورت">Host:Port</th>
           <th data-en="Status" data-fa="وضعیت">Status</th>
           <th data-en="Health" data-fa="سلامت">Health</th>
           <th data-en="Actions" data-fa="عملیات">Actions</th>
@@ -11457,42 +14204,14 @@ html, body { overflow-x: hidden; }
   </div>
 </div>
 <div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Inbounds & Outbounds" data-fa="ورودی‌ها و خروجی‌ها">Inbounds &amp; Outbounds</span><button class="btn btn-outline btn-sm" onclick="loadInbOutCard()">Refresh</button></div>
-  <div id="inb-out-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;min-width:0;">Loading…</div>
-</div>
-<div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Regions (SOCKS5 outbounds)" data-fa="مناطق (خروجی‌های SOCKS5)">Regions (SOCKS5 outbounds)</span><button class="btn btn-outline btn-sm" onclick="loadRegionsCard()">Refresh</button></div>
-  <div style="font-size:0.85rem;color:var(--text3);">Each region is a SOCKS5 endpoint provided by the admin.</div>
-  <div id="regions-body">Loading…</div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-    <select class="fs" id="new-region-preset" style="flex:1;min-width:140px;"><option value="">Preset country…</option></select>
-    <input class="fi" id="new-region-code" placeholder="code e.g. au" style="flex:1;min-width:90px;">
-    <input class="fi" id="new-region-name" placeholder="Name e.g. Australia" style="flex:1;min-width:120px;">
-    <input class="fi" id="new-region-host" placeholder="SOCKS host e.g. 127.0.0.1" style="flex:1;min-width:130px;">
-    <input class="fi" id="new-region-port" placeholder="port (blank = auto)" style="flex:1;min-width:110px;">
-    <button class="btn btn-primary btn-sm" onclick="createRegion()">Add Region</button>
-  </div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
-    <button class="btn btn-outline btn-sm" onclick="probeRegions()">Probe live SOCKS ports in range</button>
-    <span id="probe-result" style="font-size:0.85rem;color:var(--text3);align-self:center;"></span>
-  </div>
-</div>
-<div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Routing Rules (inbound → region)" data-fa="قوانین مسیریابی">Routing Rules (inbound → region)</span><button class="btn btn-outline btn-sm" onclick="loadRegionsCard()">Refresh</button></div>
-  <div id="rules-body">Loading…</div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-    <select class="fs" id="new-rule-type" style="flex:1;min-width:110px;"><option value="link">Link UID</option><option value="label">Label contains</option><option value="port">Link port</option><option value="user">Owner user</option><option value="all">All links</option></select>
-    <input class="fi" id="new-rule-value" placeholder="match value (empty for All)" style="flex:1;min-width:130px;">
-    <select class="fs" id="new-rule-region" style="flex:1;min-width:120px;"><option value="">Region…</option></select>
-    <input class="fi" id="new-rule-priority" placeholder="priority 0" type="number" style="flex:1;min-width:80px;">
-    <button class="btn btn-primary btn-sm" onclick="createRoutingRule()">Add Rule</button>
-  </div>
+  <div class="card-hd"><span class="card-title" data-en="Inbounds & Outbounds" data-fa="ورودی‌ها و خروجی‌ها">Inbounds &amp; Outbounds</span><button class="btn btn-outline btn-sm" onclick="refreshInbOutCard(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div>
+  <div id="inb-out-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;min-width:0;" data-en="Loading…" data-fa="در حال بارگذاری…">Loading…</div>
 </div>
     </section>
     <section class="page" id="page-addresses">
       <div class="page-header"><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div></div>
       <div id="profile-tabs" class="pill-group" style="margin-bottom:12px; overflow-x:auto; white-space:nowrap;">
-        <button class="pill-btn active" data-profile="all" onclick="switchProfileView('all')">All</button>
+        <button class="pill-btn active" data-profile="all" onclick="switchProfileView('all')" data-en="All" data-fa="همه">All</button>
       </div>
       <div class="card" id="addresses-card">
         <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8
@@ -11513,7 +14232,7 @@ example.com"></textarea></div>
         <div class="card-hd"><span class="card-title" data-en="IP Profiles" data-fa="پروفایل‌های آی‌پی">IP Profiles</span></div>
         <div class="status-cards-grid" id="ip-profiles-list"></div>
         <div style="display:flex; gap:6px; margin-top:8px;">
-          <input class="fi" id="new-profile-name" placeholder="Profile name" style="flex:1;">
+          <input class="fi" id="new-profile-name" placeholder="Profile name" data-ph-en="Profile name" data-ph-fa="نام پروفایل" style="flex:1;">
           <button class="btn btn-primary btn-sm" onclick="createIpProfile()" data-en="Create" data-fa="ایجاد">Create</button>
         </div>
       </div>
@@ -11526,7 +14245,7 @@ example.com"></textarea></div>
         <div id="railway-note" style="display:none; margin-top:8px; color: #d8b4fe;"><span data-en="ℹ️ Note: For Railway provider, only Railway-related IPs will work." data-fa="نکته: در ارائه دهنده railway فقط آیپی های مربوط به آن کار خواهد کرد."></span></div>
       </div>
       <div class="card">
-        <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
+        <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><input class="fi provider-search" id="provider-search" data-ph-en="Search providers…" data-ph-fa="جستجوی ارائه‌دهنده…" placeholder="Search providers…" oninput="filterProviders(this.value)"><div id="provider-btns" class="pill-group"></div><div style="margin-top:8px;"><button class="btn btn-outline btn-sm" onclick="scanAllProviders()" data-en="Scan all providers" data-fa="اسکن همه ارائه‌دهنده‌ها">Scan all providers</button></div></div>
         <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
         <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="5" placeholder="8.8.8.8
 example.com
@@ -11535,14 +14254,16 @@ example.com
           <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()" data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</button>
           <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
         </div>
+        <div class="scan-note" id="scan-egress-note"><span data-en="Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443)." data-fa="به‌نظر می‌رسد TCP خروجی این سرور مسدود است: هیچ آدرسی پاسخ نداد. اسکنر به یک VPS یا هاستی با TCP خروجی مجاز (پورت ۴۴۳) نیاز دارد.">Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443).</span></div>
+        <div style="color:var(--text3);font-size:0.8rem;margin-top:8px;" data-en="Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead." data-fa="اسکنر از این سرور TCP خروجی باز می‌کند. اگر همه اسکن‌ها در ۰٪ شکست خوردند، هاست خروجی را مسدود کرده است — پنل را روی یک VPS اجرا کنید.">Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead.</div>
         <div class="fg" style="margin-bottom:10px;"><div style="display:flex;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text3);">0%</span></div></div>
         <div class="scanner-location-filter" id="location-filter" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
-          <span style="color:var(--text3); font-size:0.8rem;">Location:</span>
+          <span style="color:var(--text3); font-size:0.8rem;" data-en="Location:" data-fa="موقعیت:">Location:</span>
           <div id="location-checkboxes" style="display:flex; flex-wrap:wrap; gap:4px;"></div>
-          <button class="btn btn-outline btn-sm" onclick="resetLocationFilter()">Show All</button>
+          <button class="btn btn-outline btn-sm" onclick="resetLocationFilter()" data-en="Show All" data-fa="نمایش همه">Show All</button>
         </div>
         <div class="scan-results-container" style="margin-top:8px;">
-          <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th>TCP</th><th>HTTPS</th><th>Location</th></tr></thead><tbody id="scan-tbody"></tbody></table>
+          <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="TCP" data-fa="TCP">TCP</th><th data-en="HTTPS" data-fa="HTTPS">HTTPS</th><th data-en="Location" data-fa="موقعیت">Location</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
         <div style="display:flex;gap:6px;margin-top:8px;">
           <button class="btn btn-outline btn-sm" onclick="sortBestIPs()" data-en="⭐ Sort Best IPs" data-fa="⭐ مرتب‌سازی بهترین‌ها">⭐ Sort Best IPs</button>
@@ -11553,8 +14274,8 @@ example.com
     </section>
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div style="display:flex;gap:10px;margin-bottom:16px;">
-        <input id="log-search" placeholder="Search logs…" oninput="filterLogs()" class="fi" style="flex:1;">
+      <div class="inbound-tools" style="display:flex;gap:10px;margin-bottom:16px;">
+        <input id="log-search" placeholder="Search logs…" data-ph-en="Search logs…" data-ph-fa="جستجوی لاگ‌ها…" oninput="filterLogs()" class="fi" style="flex:1;">
         <button class="btn btn-outline btn-sm" onclick="clearLogSearch()">✕</button>
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
@@ -11564,7 +14285,7 @@ example.com
             <tbody id="logs-tbody"></tbody>
           </table>
         </div>
-        <div class="empty" id="logs-empty" style="display:none;padding:30px;">No events recorded</div>
+        <div class="empty" id="logs-empty" style="display:none;padding:30px;" data-en="No events recorded" data-fa="رویدادی ثبت نشده است">No events recorded</div>
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;">
         <button class="btn btn-outline btn-sm" onclick="refreshLogs()" data-en="🔄 Refresh" data-fa="🔄 بروزرسانی">🔄 Refresh</button>
@@ -11591,50 +14312,32 @@ example.com
           </small>
         </div>
         <div class="fg"><label class="fl" data-en="Report Interval (hours)" data-fa="فاصله گزارش (ساعت)">Report Interval (hours)</label><input class="fi" type="number" id="tg-interval" value="1" min="0.5" step="0.5"></div>
-        <div class="fg"><label class="fl">Telegram Language</label>
+        <div class="fg"><label class="fl" data-en="Telegram Language" data-fa="زبان تلگرام">Telegram Language</label>
           <div class="toggle on" id="tg-lang-toggle" onpointerdown="toggleTgLang()"></div>
-          <span id="tg-lang-label">English</span>
+          <span id="tg-lang-label" data-en="English" data-fa="انگلیسی">English</span>
           <input type="hidden" id="tg-lang-hidden" value="en">
         </div>
-        <div class="fg"><label class="fl">Custom Templates (EN)</label>
-          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+        <div class="fg"><label class="fl" data-en="Custom Templates (EN)" data-fa="قالب‌های سفارشی (EN)">Custom Templates (EN)</label>
+          <textarea class="fi" id="tg-templates-en" rows="4" dir="ltr" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+          <small style="color:var(--text3);font-size:0.8rem;display:block;margin-top:4px;">One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error.</small>
         </div>
-        <div class="fg"><label class="fl">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
+        <div class="fg"><label class="fl" data-en="Custom Templates (FA)" data-fa="قالب‌های سفارشی (FA)">Custom Templates (FA)</label>
+          <textarea class="fi" id="tg-templates-fa" rows="4" dir="auto" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
+          <small style="color:var(--text3);font-size:0.8rem;display:block;margin-top:4px;" dir="auto">یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.</small>
         </div>
         <div style="margin:6px 0;">
-          <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
+          <button class="btn btn-outline btn-sm" onclick="previewTemplate()" data-en="Preview" data-fa="پیش‌نمایش">Preview</button>
           <div id="tg-preview" style="margin-top:6px; padding:8px; background:var(--surface3); border-radius:8px; white-space:pre-wrap;"></div>
         </div>
         <div style="display:flex;gap:6px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
       </div>
 <div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Telegram Proxy (MTProto + SOCKS5)" data-fa="پروکسی تلگرام">Telegram Proxy (MTProto + SOCKS5)</span><button class="btn btn-outline btn-sm" onclick="loadTgProxyCard()">Refresh</button></div>
-  <div id="tg-proxy-body">Loading…</div>
+  <div class="card-hd"><span class="card-title" data-en="Telegram Proxy (MTProto + SOCKS5 + WEB)" data-fa="پروکسی تلگرام">Telegram Proxy (MTProto + SOCKS5 + WEB)</span><button class="btn btn-outline btn-sm" id="tg-proxy-refresh-btn" onclick="loadTgProxyCard()">Refresh</button></div>
+  <div id="tg-proxy-body" data-en="Loading…" data-fa="در حال بارگذاری…">Loading…</div>
 </div>
     </section>
-    <section class="page" id="page-users">
-      <div class="page-header"><div><div class="page-title" data-en="Users" data-fa="کاربران">Users</div><div class="page-sub" data-en="User profiles — assign links to users and see their outputs" data-fa="پروفایل کاربران — لینک‌ها را به کاربران اختصاص دهید و خروجی‌هایشان را ببینید">User profiles</div></div></div>
-      <div class="card">
-        <div class="card-hd"><span class="card-title" data-en="New User" data-fa="کاربر جدید">New User</span></div>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;">
-          <input class="fi" id="new-user-name" placeholder="Name" style="flex:1;min-width:140px;">
-          <input class="fi" id="new-user-chat" placeholder="Telegram chat id (optional)" style="flex:1;min-width:140px;">
-          <input class="fi" id="new-user-notes" placeholder="Notes (optional)" style="flex:1;min-width:140px;">
-          <input class="fi" id="new-user-maxsess" type="number" min="0" value="0" placeholder="Max sessions (0 = unlimited)" style="flex:1;min-width:140px;">
-          <button class="btn btn-primary" onclick="createUser()">+ Create</button>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span class="card-title" data-en="Users" data-fa="کاربران">Users</span></div>
-        <div class="logs-table-container" style="overflow-x:auto;">
-          <table class="tbl"><thead><tr><th>Name</th><th>Links</th><th>Used</th><th>Limit</th><th>Max Sess</th><th>Active</th><th>Actions</th></tr></thead><tbody id="users-tbody"></tbody></table>
-        </div>
-        <div id="user-links-box" style="margin-top:12px;"></div>
-      </div>
-    </section>
     <section class="page" id="page-active-users">
-      <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions</div></div><button class="btn btn-outline btn-sm" onclick="loadActiveUsers()">Refresh</button></div>
+      <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions</div></div><button class="btn btn-outline btn-sm" onclick="refreshActiveUsers(this)">Refresh</button></div>
       <div class="card">
         <div class="card-hd"><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span><span id="active-users-summary" style="color:var(--text2);font-size:0.85rem;"></span></div>
         <div id="active-users-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;"></div>
@@ -11649,37 +14352,37 @@ example.com
         <div class="fg">
           <label class="fl" data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</label>
           <div class="glass-btn-group" id="tz-glass-group">
-            <button type="button" class="glass-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')">UTC (00:00)</button>
-            <button type="button" class="glass-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')">Tehran (+3:30)</button>
-            <button type="button" class="glass-btn" id="btn-tz-custom" onclick="toggleCustomTZInput(true)">Custom</button>
+            <button type="button" class="glass-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')" data-en="UTC (00:00)" data-fa="UTC (۰۰:۰۰)">UTC (00:00)</button>
+            <button type="button" class="glass-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')" data-en="Tehran (+3:30)" data-fa="تهران (+۳:۳۰)">Tehran (+3:30)</button>
+            <button type="button" class="glass-btn" id="btn-tz-custom" onclick="toggleCustomTZInput(true)" data-en="Custom" data-fa="سفارشی">Custom</button>
           </div>
           <div id="custom-tz-container" style="display:none; margin-top:10px;">
-            <input type="text" class="fi" id="custom-tz-value" placeholder="e.g. Asia/Tehran or +3.5" oninput="applyCustomTZ(this.value)">
+            <input type="text" class="fi" id="custom-tz-value" placeholder="e.g. Asia/Tehran or +3.5" data-ph-en="e.g. Asia/Tehran or +3.5" data-ph-fa="مثلاً Asia/Tehran یا +3.5" oninput="applyCustomTZ(this.value)">
           </div>
         </div>
         <div class="fg">
           <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
           <div class="glass-btn-group" id="theme-glass-group">
-            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')">Dark</button>
-            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')">Light</button>
-            <button type="button" class="glass-btn" id="btn-theme-blue-dark" onclick="setPanelTheme('blue-dark')">Blue</button>
+            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')" data-en="Dark" data-fa="تیره">Dark</button>
+            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')" data-en="Light" data-fa="روشن">Light</button>
+            <button type="button" class="glass-btn" id="btn-theme-blue-dark" onclick="setPanelTheme('blue-dark')" data-en="Blue" data-fa="آبی">Blue</button>
           </div>
           <input type="hidden" id="set-theme-color" value="dark">
         </div>
         <div class="fg">
           <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
           <div class="glass-btn-group" id="lang-glass-group">
-            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')">English</button>
+            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')" data-en="English" data-fa="انگلیسی">English</button>
             <button type="button" class="glass-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
           </div>
         </div>
         <div class="fg"><label class="fl" data-en="Keep Alive" data-fa="ضدخواب">Keep Alive</label>
           <div class="glass-btn-group" id="keepalive-mode-group">
-            <button type="button" class="glass-btn active" id="btn-keepalive-simple" onclick="setKeepAliveMode('simple')">Simple</button>
-            <button type="button" class="glass-btn" id="btn-keepalive-advanced" onclick="setKeepAliveMode('advanced')">Advanced</button>
+            <button type="button" class="glass-btn active" id="btn-keepalive-simple" onclick="setKeepAliveMode('simple')" data-en="Simple" data-fa="ساده">Simple</button>
+            <button type="button" class="glass-btn" id="btn-keepalive-advanced" onclick="setKeepAliveMode('advanced')" data-en="Advanced" data-fa="پیشرفته">Advanced</button>
           </div>
           <input type="hidden" id="set-keepalive-mode" value="simple">
-          <div class="status-cards-grid" style="margin-top:8px;">
+          <div class="status-cards-grid" style="margin-top:8px;grid-template-columns:repeat(auto-fit,minmax(200px,260px));justify-content:start;">
             <div class="status-glass-card active" id="card-keepalive" onclick="toggleSettingCard('card-keepalive', 'set-keepalive-enabled')">
               <span style="font-size:1.5rem;">⚡</span><span data-en="Keep-Alive Enabled" data-fa="ضدخواب فعال">Keep-Alive</span>
               <input type="hidden" id="set-keepalive-enabled" value="1">
@@ -11689,34 +14392,32 @@ example.com
         <div class="fg"><label class="fl" data-en="Keep Alive Interval (seconds)" data-fa="فاصله ضدخواب (ثانیه)">Interval</label>
           <input class="fi" type="number" id="set-keep-alive-interval" placeholder="300" min="60">
         </div>
-        <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
         <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
         <div class="fg"><label class="fl" data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</label><input class="fi" type="number" id="set-max-scan-ips" placeholder="256"></div>
-        <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl" data-en="Default Protocol" data-fa="پروتکل پیش‌فرض">Default Protocol</label><select class="fs" id="set-default-protocol"><option value="vless-ws">VLESS + WS</option><option value="vmess-ws">VMess + WS</option><option value="trojan-ws">Trojan + WS</option><option value="ss-ws">Shadowsocks + WS</option><option value="xhttp-auto">XHTTP Auto</option><option value="xhttp-stream-one">XHTTP Stream-One</option><option value="xhttp-stream-up">XHTTP Stream-Up</option><option value="xhttp-packet-up">XHTTP Packet-Up</option><option value="socks5">Telegram SOCKS5</option><option value="mtproto">Telegram MTProto</option><option value="webproxy">Telegram WEB proxy</option><option value="http-proxy">HTTP proxy</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Shadowsocks Method" data-fa="روش شادوساکس پیش‌فرض">Default Shadowsocks Method</label><select class="fs" id="set-default-ss-method"><option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option><option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option><option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option><option value="aes-256-gcm">aes-256-gcm (classic)</option><option value="aes-128-gcm">aes-128-gcm (classic)</option><option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (classic)</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Outbound Mode" data-fa="حالت خروجی پیش‌فرض">Default Outbound Mode</label><select class="fs" id="set-default-outbound-mode"><option value="auto">Auto</option><option value="direct">Direct</option><option value="proxy">Proxy line</option><option value="block">Block</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Gaming Profile" data-fa="پروفایل گیمینگ پیش‌فرض">Default Gaming Profile</label><select class="fs" id="set-default-gaming-profile"><option value="balanced">Balanced</option><option value="gaming">Gaming</option><option value="low-overhead">Low Overhead</option><option value="stealth">Stealth</option></select></div>
+        <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="Default Protocol" data-fa="پروتکل پیش‌فرض">Default Protocol</label><select class="fs" id="set-default-protocol"><option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option><option value="vmess-ws" data-en="VMess + WS" data-fa="VMess + WS">VMess + WS</option><option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option><option value="ss-ws" data-en="Shadowsocks + WS" data-fa="Shadowsocks + WS">Shadowsocks + WS</option><option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option><option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option><option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option><option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option><option value="socks5" data-en="Telegram SOCKS5" data-fa="تلگرام SOCKS5">Telegram SOCKS5</option><option value="mtproto" data-en="Telegram MTProto" data-fa="تلگرام MTProto">Telegram MTProto</option><option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option><option value="http-proxy" data-en="HTTP proxy" data-fa="پروکسی HTTP">HTTP proxy</option></select></div>
+        <div class="fg"><label class="fl" data-en="Default Shadowsocks Method" data-fa="روش شادوساکس پیش‌فرض">Default Shadowsocks Method</label><select class="fs" id="set-default-ss-method"><option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option><option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option><option value="2022-blake3-chacha20-poly1305" data-en="2022-blake3-chacha20-poly1305" data-fa="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option><option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option><option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option><option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option></select></div>
+        <div class="fg"><label class="fl" data-en="Default Outbound Mode" data-fa="حالت خروجی پیش‌فرض">Default Outbound Mode</label><select class="fs" id="set-default-outbound-mode"><option value="auto" data-en="Auto" data-fa="خودکار">Auto</option><option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option><option value="proxy" data-en="Proxy line" data-fa="خط پروکسی">Proxy line</option><option value="block" data-en="Block" data-fa="مسدود">Block</option></select></div>
+        <div class="fg"><label class="fl" data-en="Default Gaming Profile" data-fa="پروفایل گیمینگ پیش‌فرض">Default Gaming Profile</label><select class="fs" id="set-default-gaming-profile"><option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option><option value="gaming" data-en="Gaming" data-fa="گیمینگ">Gaming</option><option value="low-overhead" data-en="Low Overhead" data-fa="سربار کم">Low Overhead</option><option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option></select></div>
         <div class="fg"><label class="fl" data-en="WS Rate Limit (attempts)" data-fa="محدودیت نرخ WS (تلاش)">WS Rate Limit (attempts)</label><input class="fi" type="number" id="set-ws-rate-max" placeholder="20" min="1"></div>
         <div class="fg"><label class="fl" data-en="WS Rate Window (seconds)" data-fa="پنجره نرخ WS (ثانیه)">WS Rate Window (seconds)</label><input class="fi" type="number" id="set-ws-rate-window" placeholder="60" min="5"></div>
         <div class="fg"><label class="fl" data-en="Subscription Update Interval (hours)" data-fa="فاصله به‌روزرسانی اشتراک (ساعت)">Subscription Update Interval (hours)</label><input class="fi" type="number" id="set-sub-update-interval" placeholder="6" min="1"></div>
         <div class="fg"><label class="fl" data-en="Max XHTTP Sessions" data-fa="حداکثر نشست‌های XHTTP">Max XHTTP Sessions</label><input class="fi" type="number" id="set-max-xhttp-sessions" placeholder="200" min="10"></div>
-        <div class="fg"><label class="fl" data-en="Region SOCKS Host" data-fa="هاست SOCKS مناطق">Region SOCKS Host</label><input class="fi" id="set-region-socks-host" placeholder="127.0.0.1"></div>
-        <div class="fg"><label class="fl" data-en="Region SOCKS Port Range" data-fa="بازه پورت SOCKS مناطق">Region SOCKS Port Range</label><input class="fi" id="set-region-socks-range" placeholder="1024-1099"></div>
         <div class="fg">
           <label class="fl" data-en="DoH Upstreams" data-fa="Upstreamهای DoH">DoH Upstreams</label>
           <div class="pill-group" id="doh-presets"></div>
           <div style="margin-top: 8px;">
-            <button class="btn btn-outline btn-sm" onclick="testDohPing()">Test Ping</button>
+            <button class="btn btn-outline btn-sm" onclick="testDohPing()" data-en="Test Ping" data-fa="تست پینگ">Test Ping</button>
             <table class="tbl" id="doh-ping-table" style="display:none; margin-top:8px;">
-                <thead><tr><th>Upstream</th><th>Latency</th><th>Status</th></tr></thead>
+                <thead><tr><th data-en="Upstream" data-fa="آپ‌استریم">Upstream</th><th data-en="Latency" data-fa="تأخیر">Latency</th><th data-en="Status" data-fa="وضعیت">Status</th></tr></thead>
                 <tbody></tbody>
             </table>
           </div>
-          <input class="fi" id="custom-doh-input" placeholder="Custom upstream URL" style="margin-top:6px;">
-          <button class="btn btn-outline btn-sm" onclick="addCustomDoh()">Add</button>
+          <input class="fi" id="custom-doh-input" placeholder="Custom upstream URL" data-ph-en="Custom upstream URL" data-ph-fa="آدرس آپ‌استریم سفارشی" style="margin-top:6px;">
+          <button class="btn btn-outline btn-sm" onclick="addCustomDoh()" data-en="Add" data-fa="افزودن">Add</button>
           <div class="status-cards-grid" style="margin-top:8px;">
             <div class="status-glass-card active" id="card-doh" onclick="toggleSettingCard('card-doh', 'set-doh-enabled')">
               <span style="font-size:1.5rem;">🌐</span><span data-en="DoH Enabled" data-fa="DoH فعال">DoH</span>
@@ -11740,13 +14441,13 @@ example.com
             </div>
           </div>
           <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Landing Redirect (e.g. https://google.com)" data-fa="تغییر مسیر فرود (مثلاً https://google.com)">Landing Redirect (e.g. https://google.com)</label>
-          <input class="fi" id="set-landing-redirect" placeholder="Redirect unauthorized users">
+          <input class="fi" id="set-landing-redirect" placeholder="Redirect unauthorized users" data-ph-en="Redirect unauthorized users" data-ph-fa="تغییر مسیر کاربران غیرمجاز">
           <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Camouflage URL (Reverse Proxy)" data-fa="آدرس استتار (پروکسی معکوس)">Camouflage URL (Reverse Proxy)</label>
           <input class="fi" id="set-camouflage-url" placeholder="e.g. https://news.ycombinator.com">
           <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Subscription Filename" data-fa="نام فایل اشتراک">Subscription Filename</label>
-          <input class="fi" id="set-sub-filename" placeholder="e.g. update.txt">
+          <input class="fi" id="set-sub-filename" placeholder="e.g. update.txt" data-ph-en="e.g. update.txt" data-ph-fa="مثلاً update.txt">
           <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Panel Prefix (Hidden Admin Path)" data-fa="پیشوند پنل (مسیر مخفی ادمین)">Panel Prefix (Hidden Admin Path)</label>
-          <input class="fi" id="set-panel-prefix" placeholder="e.g. mypanel (leave empty for root)">
+          <input class="fi" id="set-panel-prefix" placeholder="e.g. mypanel (leave empty for root)" data-ph-en="e.g. mypanel (leave empty for root)" data-ph-fa="مثلاً mypanel (برای ریشه خالی بگذارید)">
           <div class="fg" style="margin-top:12px;">
             <label class="fl" data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</label>
             <textarea class="fi" id="set-blocked-domains" rows="4" placeholder="example.com
@@ -11795,7 +14496,6 @@ example.com
     <div class="nav-items">
       <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')"><span class="icon icon-dashboard"></span><span data-en="Home" data-fa="خانه">Home</span></div>
       <div class="nav-item" data-page="inbounds" onclick="switchPage('inbounds')"><span class="icon icon-inbounds"></span><span data-en="Inbound" data-fa="اینباند">Inbound</span></div>
-      <div class="nav-item" data-page="users" onclick="switchPage('users')"><span class="icon icon-users"></span><span data-en="Users" data-fa="کاربران">Users</span></div>
       <div class="nav-item" data-page="active-users" onclick="switchPage('active-users')"><span class="icon icon-activity"></span><span data-en="Active" data-fa="فعال">Active</span></div>
       <div class="nav-item" data-page="addresses" onclick="switchPage('addresses')"><span class="icon icon-cleanip"></span><span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span></div>
       <div class="nav-item" data-page="ipscanner" onclick="switchPage('ipscanner')"><span class="icon icon-scanner"></span><span data-en="Scan" data-fa="اسکن">Scan</span></div>
@@ -11807,9 +14507,9 @@ example.com
   <footer class="footer">
     <div class="footer-inner">
       <span id="footer-dedication"></span>
-      <a href="https://t.me/SulgX" target="_blank">Telegram</a>
+      <a href="https://t.me/SulgX" target="_blank" data-en="Telegram" data-fa="Telegram">Telegram</a>
       <a href="https://github.com/SulgX" target="_blank">GitHub</a>
-      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank">Project Repo</a>
+      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank" data-en="Project Repo" data-fa="مخزن پروژه">Project Repo</a>
     </div>
   </footer>
 </div>
@@ -11817,185 +14517,184 @@ example.com
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="Leave empty for random name" maxlength="60"></div>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="Leave empty for random name" data-ph-en="Leave empty for random name" data-ph-fa="برای نام تصادفی خالی بگذارید" maxlength="60"></div>
     <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
       <select class="fs" id="flag-select-create" onchange="applyFlagCreate()">
-        <option value="">None</option>
-        <option value="cn">🇨🇳 China</option>
-        <option value="nl">🇳🇱 Netherlands</option>
-        <option value="ru">🇷🇺 Russia</option>
-        <option value="us">🇺🇸 United States</option>
-        <option value="ca">🇨🇦 Canada</option>
-        <option value="ir">🇮🇷 Iran</option>
-        <option value="de">🇩🇪 Germany</option>
-        <option value="gb">🇬🇧 United Kingdom</option>
-        <option value="it">🇮🇹 Italy</option>
-        <option value="fr">🇫🇷 France</option>
-        <option value="tr">🇹🇷 Turkey</option>
-        <option value="ae">🇦🇪 UAE</option>
-        <option value="custom">Custom (2-letter)</option>
+        <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
+        <option value="cn" data-en="🇨🇳 China" data-fa="🇨🇳 چین">🇨🇳 China</option>
+        <option value="nl" data-en="🇳🇱 Netherlands" data-fa="🇳🇱 هلند">🇳🇱 Netherlands</option>
+        <option value="ru" data-en="🇷🇺 Russia" data-fa="🇷🇺 روسیه">🇷🇺 Russia</option>
+        <option value="us" data-en="🇺🇸 United States" data-fa="🇺🇸 ایالات متحده">🇺🇸 United States</option>
+        <option value="ca" data-en="🇨🇦 Canada" data-fa="🇨🇦 کانادا">🇨🇦 Canada</option>
+        <option value="ir" data-en="🇮🇷 Iran" data-fa="🇮🇷 ایران">🇮🇷 Iran</option>
+        <option value="de" data-en="🇩🇪 Germany" data-fa="🇩🇪 آلمان">🇩🇪 Germany</option>
+        <option value="gb" data-en="🇬🇧 United Kingdom" data-fa="🇬🇧 بریتانیا">🇬🇧 United Kingdom</option>
+        <option value="it" data-en="🇮🇹 Italy" data-fa="🇮🇹 ایتالیا">🇮🇹 Italy</option>
+        <option value="fr" data-en="🇫🇷 France" data-fa="🇫🇷 فرانسه">🇫🇷 France</option>
+        <option value="tr" data-en="🇹🇷 Turkey" data-fa="🇹🇷 ترکیه">🇹🇷 Turkey</option>
+        <option value="ae" data-en="🇦🇪 UAE" data-fa="🇦🇪 امارات">🇦🇪 UAE</option>
+        <option value="custom" data-en="Custom (2-letter)" data-fa="سفارشی (۲ حرفی)">Custom (2-letter)</option>
       </select>
-      <input class="fi" id="flag-custom-create" placeholder="e.g. jp" style="display:none; margin-top:5px;" maxlength="2">
+      <input class="fi" id="flag-custom-create" placeholder="e.g. jp" data-ph-en="e.g. jp" data-ph-fa="مثلاً jp" style="display:none; margin-top:5px;" maxlength="2">
       <input type="hidden" id="flag-code-create" value="">
-      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagCreate()" style="margin-top:4px;">🔍 Auto Detect</button>
+      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagCreate()" style="margin-top:4px;" data-en="🔍 Auto Detect" data-fa="🔍 تشخیص خودکار">🔍 Auto Detect</button>
     </div>
-    <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
+    <div class="fg"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')" data-en="🎲 Generate" data-fa="🎲 تولید">🎲 Generate</button></div></div>
+    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+      <select class="fs" id="aprotocol" onchange="toggleProxyFields('create')">
+        <option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option>
+        <option value="vmess-ws" data-en="VMess + WS (AEAD)" data-fa="VMess + WS (AEAD)">VMess + WS (AEAD)</option>
+        <option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option>
+        <option value="ss-ws" data-en="Shadowsocks + WS (AEAD 2022)" data-fa="Shadowsocks + WS (AEAD 2022)">Shadowsocks + WS (AEAD 2022)</option>
+        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option>
+        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option>
+        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option>
+        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option>
+        <option value="socks5" data-en="Telegram SOCKS5" data-fa="تلگرام SOCKS5">Telegram SOCKS5</option>
+        <option value="mtproto" data-en="Telegram MTProto proxy" data-fa="پروکسی MTProto تلگرام">Telegram MTProto proxy</option>
+        <option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option>
+        <option value="http-proxy" data-en="HTTP proxy (CONNECT)" data-fa="پروکسی HTTP (CONNECT)">HTTP proxy (CONNECT)</option>
+      </select>
+    </div>
+    <div id="proxy-fields-create" style="display:none;">
+      <div class="fg" id="fg-amtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
+        <select class="fs" id="amtproto-variant" onchange="toggleProxyFields('create')">
+          <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
+          <option value="plain" data-en="Plain secret" data-fa="سکرت ساده">Plain secret</option>
+          <option value="faketls" data-en="Fake-TLS (dd + domain)" data-fa="Fake-TLS (dd + دامنه)">Fake-TLS (dd + domain)</option>
+        </select></div>
+      <div class="fg" id="fg-amtproto-domain"><label class="fl" data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</label><input class="fi" id="amtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
+      <div class="fg" id="fg-awebproxy-port"><label class="fl" data-en="WEB Proxy Port (per-port secret)" data-fa="پورت WEB Proxy (سکرت هر پورت)">WEB Proxy Port (per-port secret)</label>
+        <select class="fs" id="awebproxy-port">
+          <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
+        </select></div>
+      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="aproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
+    </div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
     <div class="hint" style="color:var(--text3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-create" class="adv-section">
         <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
-          <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select>
-          <small style="color:var(--text3);font-size:0.75rem;">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
+          <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="youtube" data-en="YouTube" data-fa="YouTube">YouTube</option><option value="instagram" data-en="Instagram" data-fa="Instagram">Instagram</option><option value="twitter" data-en="Twitter" data-fa="Twitter">Twitter</option><option value="tiktok" data-en="TikTok" data-fa="TikTok">TikTok</option><option value="whatsapp" data-en="WhatsApp" data-fa="WhatsApp">WhatsApp</option><option value="telegram" data-en="Telegram" data-fa="Telegram">Telegram</option><option value="netflix" data-en="Netflix" data-fa="Netflix">Netflix</option><option value="spotify" data-en="Spotify" data-fa="Spotify">Spotify</option><option value="google" data-en="Google" data-fa="Google">Google</option></select>
+          <small style="color:var(--text3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
         </div>
-        <div class="fg"><label class="fl">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
-        <div class="fg"><label class="fl">SNI</label><input class="fi" id="asni" placeholder="example.com"></div>
-        <div class="fg"><label class="fl">Host</label><input class="fi" id="ahost" placeholder="example.com"></div>
-        <div class="fg"><label class="fl">Fingerprint</label>
+        <div class="fg"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
+        <div class="fg"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="asni" placeholder="example.com"></div>
+        <div class="fg"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="ahost" placeholder="example.com"></div>
+        <div class="fg"><label class="fl" data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</label>
           <select class="fs" id="afingerprint-sel" onchange="toggleFingerprintCustom('create')">
-    <option value="none" selected>None / Disable</option>
-    <option value="chrome">Chrome</option>
-    <option value="firefox">Firefox</option>
-    <option value="safari">Safari</option>
-    <option value="ios">iOS</option>
-    <option value="android">Android</option>
-    <option value="edge">Edge</option>
+    <option value="none" selected data-en="None / Disable" data-fa="هیچ‌کدام / غیرفعال">None / Disable</option>
+    <option value="chrome" data-en="Chrome" data-fa="Chrome">Chrome</option>
+    <option value="firefox" data-en="Firefox" data-fa="Firefox">Firefox</option>
+    <option value="safari" data-en="Safari" data-fa="Safari">Safari</option>
+    <option value="ios" data-en="iOS" data-fa="iOS">iOS</option>
+    <option value="android" data-en="Android" data-fa="Android">Android</option>
+    <option value="edge" data-en="Edge" data-fa="Edge">Edge</option>
     <option value="360">360</option>
-    <option value="qq">QQ</option>
-    <option value="random">Random</option>
-    <option value="randomized">Randomized</option>
-    <option value="custom">Custom</option>
+    <option value="qq" data-en="QQ" data-fa="QQ">QQ</option>
+    <option value="random" data-en="Random" data-fa="تصادفی">Random</option>
+    <option value="randomized" data-en="Randomized" data-fa="تصادفی‌سازی‌شده">Randomized</option>
+    <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
-          <input class="fi" id="afingerprint-custom" placeholder="Enter custom fingerprint" style="display:none; margin-top:5px;">
+          <input class="fi" id="afingerprint-custom" placeholder="Enter custom fingerprint" data-ph-en="Enter custom fingerprint" data-ph-fa="اثرانگشت سفارشی را وارد کنید" style="display:none; margin-top:5px;">
           <input type="hidden" id="afingerprint" value="">
         </div>
-        <div class="fg"><label class="fl">Fragment</label>
+        <div class="fg"><label class="fl" data-en="Fragment" data-fa="فرگمنت">Fragment</label>
           <select class="fs" id="afrag-mode" onchange="toggleFragmentFields('create')">
-            <option value="off">Off</option>
-            <option value="tlshello">TLS Hello</option>
-            <option value="range">Range</option>
+            <option value="off" data-en="Off" data-fa="خاموش">Off</option>
+            <option value="tlshello" data-en="TLS Hello" data-fa="TLS Hello">TLS Hello</option>
+            <option value="range" data-en="Range" data-fa="بازه">Range</option>
           </select>
           <div id="frag-create-range" style="display:none;">
-            <input class="fi" id="afrag-length" placeholder="Length (e.g. 100-200)" style="margin-top:5px;">
-            <input class="fi" id="afrag-interval" placeholder="Interval (e.g. 10-20)" style="margin-top:5px;">
+            <input class="fi" id="afrag-length" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
+            <input class="fi" id="afrag-interval" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
           </div>
           <input type="hidden" id="afrag" value="">
         </div>
-        <div class="fg"><label class="fl">IP Profile</label><select class="fs" id="aip-profile"></select></div>
+        <div class="fg"><label class="fl" data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</label><select class="fs" id="aip-profile"></select></div>
         <div class="fg"><label class="fl" data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</label>
           <select class="fs" id="anaming-mode">
-            <option value="default">Default (SulgX-Name-Server1)</option>
-            <option value="short">Short (SXP 1, SXP 2, ...)</option>
+            <option value="default" data-en="Default (SulgX-Name-Server1)" data-fa="پیش‌فرض (SulgX-Name-Server1)">Default (SulgX-Name-Server1)</option>
+            <option value="short" data-en="Short (SXP 1, SXP 2, ...)" data-fa="کوتاه (SXP 1, SXP 2, ...)">Short (SXP 1, SXP 2, ...)</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">TCP Fast Open</label><div class="toggle" id="tfo-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">ECH (Secure Hello)</label><div class="toggle" id="ech-create" onclick="this.classList.toggle('on'); toggleEchFields('create')"></div></div>
+        <div class="fg"><label class="fl" data-en="TCP Fast Open" data-fa="TCP Fast Open">TCP Fast Open</label><div class="toggle" id="tfo-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="ECH (Secure Hello)" data-fa="ECH (Secure Hello)">ECH (Secure Hello)</label><div class="toggle" id="ech-create" onclick="this.classList.toggle('on'); toggleEchFields('create')"></div></div>
         <div id="ech-create-fields" style="display:none;">
-          <input class="fi" id="ech-sni-create" placeholder="ECH SNI (e.g. cloudflare.com)" style="margin-top:5px;">
-          <input class="fi" id="ech-doh-create" placeholder="ECH DoH URL (optional)" style="margin-top:5px;">
+          <input class="fi" id="ech-sni-create" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
+          <input class="fi" id="ech-doh-create" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
         </div>
-        <div class="fg"><label class="fl">Allow Insecure</label><div class="toggle" id="insecure-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Random Path</label><div class="toggle" id="random-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">SMUX</label><div class="toggle" id="smux-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">UDP</label><div class="toggle on" id="udp-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">IPv6 targets</label><div class="toggle on" id="ipv6-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">IP Limit</label><input class="fi" type="number" id="aip-limit" min="0" value="0" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl">Protocol</label>
-          <select class="fs" id="aprotocol" onchange="toggleProxyFields('create')">
-            <option value="vless-ws">VLESS + WS</option>
-            <option value="vmess-ws">VMess + WS (AEAD)</option>
-            <option value="trojan-ws">Trojan + WS</option>
-            <option value="ss-ws">Shadowsocks + WS (AEAD 2022)</option>
-            <option value="xhttp-packet-up">XHTTP Packet-Up</option>
-            <option value="xhttp-stream-up">XHTTP Stream-Up</option>
-            <option value="xhttp-stream-one">XHTTP Stream-One</option>
-            <option value="xhttp-auto">XHTTP Auto</option>
-            <option value="socks5">Telegram SOCKS5</option>
-            <option value="mtproto">Telegram MTProto proxy</option>
-            <option value="webproxy">Telegram WEB proxy</option>
-            <option value="http-proxy">HTTP proxy (CONNECT)</option>
-          </select>
-        </div>
-        <div id="proxy-fields-create" style="display:none;">
-          <div class="fg" id="fg-amtproto-variant"><label class="fl">MTProto Variant</label>
-            <select class="fs" id="amtproto-variant" onchange="toggleProxyFields('create')">
-              <option value="dd">dd (recommended, obfuscated2)</option>
-              <option value="plain">Plain secret</option>
-              <option value="faketls">Fake-TLS (dd + domain)</option>
-            </select></div>
-          <div class="fg" id="fg-amtproto-domain"><label class="fl">Fake-TLS Domain</label><input class="fi" id="amtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
-          <div class="fg" id="fg-awebproxy-port"><label class="fl">WEB Proxy Port (per-port secret)</label>
-            <select class="fs" id="awebproxy-port">
-              <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
-            </select></div>
-          <div class="fg"><label class="fl">Proxy Info</label><div class="hint" id="aproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
-        </div>
-        <div class="fg"><label class="fl">Shadowsocks Method</label>
+        <div class="fg"><label class="fl" data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</label><div class="toggle" id="insecure-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Random Path" data-fa="مسیر تصادفی">Random Path</label><div class="toggle" id="random-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="SMUX" data-fa="SMUX">SMUX</label><div class="toggle" id="smux-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="UDP" data-fa="UDP">UDP</label><div class="toggle on" id="udp-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</label><div class="toggle on" id="ipv6-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</label><input class="fi" type="number" id="aip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
           <select class="fs" id="ass-method">
-            <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
-            <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
-            <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
-            <option value="aes-256-gcm">aes-256-gcm (classic)</option>
-            <option value="aes-128-gcm">aes-128-gcm (classic)</option>
-            <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (classic)</option>
+            <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+            <option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
+            <option value="2022-blake3-chacha20-poly1305" data-en="2022-blake3-chacha20-poly1305" data-fa="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
+            <option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option>
+            <option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option>
+            <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Outbound Mode</label>
+        <div class="fg"><label class="fl" data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</label>
           <select class="fs" id="aoutbound-mode">
-            <option value="auto">Auto (proxy line if set, else direct)</option>
-            <option value="direct">Direct</option>
-            <option value="proxy">Proxy line (required)</option>
-            <option value="block">Block</option>
+            <option value="auto" data-en="Auto (proxy line if set, else direct)" data-fa="خودکار (در صورت تنظیم خط پروکسی، وگرنه مستقیم)">Auto (proxy line if set, else direct)</option>
+            <option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option>
+            <option value="proxy" data-en="Proxy line (required)" data-fa="خط پروکسی (الزامی)">Proxy line (required)</option>
+            <option value="block" data-en="Block" data-fa="مسدود">Block</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Region (exit country)</label>
-          <select class="fs" id="aregion"><option value="">None (auto / routing rules)</option></select>
-        </div>
-        <div class="fg"><label class="fl">Gaming Profile</label>
+        <div class="fg"><label class="fl" data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</label>
           <select class="fs" id="agaming-profile">
-            <option value="balanced">Balanced</option>
-            <option value="gaming">Gaming (low latency)</option>
-            <option value="low-overhead">Low Overhead</option>
-            <option value="stealth">Stealth</option>
+            <option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option>
+            <option value="gaming" data-en="Gaming (low latency)" data-fa="گیمینگ (تأخیر کم)">Gaming (low latency)</option>
+            <option value="low-overhead" data-en="Low Overhead" data-fa="سربار کم">Low Overhead</option>
+            <option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Owner User</label>
-          <select class="fs" id="aowner-user"><option value="">None</option></select>
-        </div>
-        <div class="fg"><label class="fl">ALPN</label>
+        <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="aowner-name" placeholder="Owner name (optional)" maxlength="60"></div>
+        <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="aowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
           <select class="fs" id="aalpn-sel" onchange="toggleAlpnCustom('create')">
-    <option value="" selected>None (default)</option>
-    <option value="http/1.1">http/1.1</option>
-    <option value="h2,http/1.1">h2,http/1.1</option>
-    <option value="h2">h2</option>
-    <option value="h3">h3</option>
-    <option value="custom">Custom</option>
+    <option value="" selected data-en="None (default)" data-fa="هیچ‌کدام (پیش‌فرض)">None (default)</option>
+    <option value="http/1.1" data-en="http/1.1" data-fa="http/1.1">http/1.1</option>
+    <option value="h2,http/1.1" data-en="h2,http/1.1" data-fa="h2,http/1.1">h2,http/1.1</option>
+    <option value="h2" data-en="h2" data-fa="h2">h2</option>
+    <option value="h3" data-en="h3" data-fa="h3">h3</option>
+    <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
-          <input class="fi" id="aalpn-custom" placeholder="e.g. h2,http/1.1" style="display:none; margin-top:5px;">
+          <input class="fi" id="aalpn-custom" placeholder="e.g. h2,http/1.1" data-ph-en="e.g. h2,http/1.1" data-ph-fa="مثلاً h2,http/1.1" style="display:none; margin-top:5px;">
           <input type="hidden" id="aalpn" value="">
         </div>
-        <div class="fg"><label class="fl">Port (shown in link — server listens on $PORT only)</label><input class="fi" type="number" id="aport" min="1" max="65535" value="443"></div>
-        <div class="fg"><label class="fl">Xray DNS Mode</label>
+        <div class="fg"><label class="fl">Port (shown in link — server listens on port <span id="port-note-create">…</span> only)</label><input class="fi" type="number" id="aport" min="1" max="65535" value="443"></div>
+        <div class="fg"><label class="fl" data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</label>
         <select class="fs" id="xray-dns-mode-create">
-        <option value="doh">DoH (DNS over HTTPS)</option>
-        <option value="fakedns">FakeDNS</option>
-        <option value="direct">Direct (system)</option>
+        <option value="doh" data-en="DoH (DNS over HTTPS)" data-fa="DoH (DNS روی HTTPS)">DoH (DNS over HTTPS)</option>
+        <option value="fakedns" data-en="FakeDNS" data-fa="FakeDNS">FakeDNS</option>
+        <option value="direct" data-en="Direct (system)" data-fa="مستقیم (سیستم)">Direct (system)</option>
         </select></div>
-        <div class="fg"><label class="fl">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url-create" placeholder="https://cloudflare-dns.com/dns-query"></div>
-        <div class="fg"><label class="fl">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains-create" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg"><label class="fl">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Bypass China (Direct)</label><div class="toggle" id="bypass-china-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url-create" placeholder="https://cloudflare-dns.com/dns-query"></div>
+        <div class="fg"><label class="fl" data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains-create" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg"><label class="fl" data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</label><div class="toggle" id="bypass-china-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-create" onclick="this.classList.toggle('on')"></div></div>
       </div>
-    </div>
-    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="hint" id="consumed-create" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;">Consumed: 0 B</div>
+    <div class="fg"><label class="fl" data-en="Max Sessions" data-fa="حداکثر نشست‌ها">Max Sessions</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('create')"></div>
+    <div class="hint" id="expires-preview-create" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
     <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#39ff14"></div>
     <div class="fg">
       <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
       <select class="fs" id="proxy-line-select-create">
-        <option value="">None (Direct)</option>
+        <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
+      <input class="fi" id="proxy-line-text-create" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" style="margin-top:6px;">
+      <div style="font-size:0.85rem;color:var(--text3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
       <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('create')" style="margin-top:6px;" data-en="🌍 Refresh Flags" data-fa="🌍 بروزرسانی پرچم‌ها">🌍 Refresh Flags</button>
     </div>
     <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
@@ -12007,185 +14706,185 @@ example.com
     <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
     <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
     <input type="hidden" id="eu">
-    <div class="fg"><label class="fl">UUID</label><input class="fi" id="euuid" readonly></div>
+    <div class="fg"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><input class="fi" id="euuid" readonly></div>
+    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+      <select class="fs" id="eprotocol" onchange="toggleProxyFields('edit')">
+        <option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option>
+        <option value="vmess-ws" data-en="VMess + WS (AEAD)" data-fa="VMess + WS (AEAD)">VMess + WS (AEAD)</option>
+        <option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option>
+        <option value="ss-ws" data-en="Shadowsocks + WS (AEAD 2022)" data-fa="Shadowsocks + WS (AEAD 2022)">Shadowsocks + WS (AEAD 2022)</option>
+        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option>
+        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option>
+        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option>
+        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option>
+        <option value="socks5" data-en="Telegram SOCKS5" data-fa="تلگرام SOCKS5">Telegram SOCKS5</option>
+        <option value="mtproto" data-en="Telegram MTProto proxy" data-fa="پروکسی MTProto تلگرام">Telegram MTProto proxy</option>
+        <option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option>
+        <option value="http-proxy" data-en="HTTP proxy (CONNECT)" data-fa="پروکسی HTTP (CONNECT)">HTTP proxy (CONNECT)</option>
+      </select>
+    </div>
+    <div id="proxy-fields-edit" style="display:none;">
+      <div class="fg" id="fg-emtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
+        <select class="fs" id="emtproto-variant" onchange="toggleProxyFields('edit')">
+          <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
+          <option value="plain" data-en="Plain secret" data-fa="سکرت ساده">Plain secret</option>
+          <option value="faketls" data-en="Fake-TLS (dd + domain)" data-fa="Fake-TLS (dd + دامنه)">Fake-TLS (dd + domain)</option>
+        </select></div>
+      <div class="fg" id="fg-emtproto-domain"><label class="fl" data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</label><input class="fi" id="emtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
+      <div class="fg" id="fg-ewebproxy-port"><label class="fl" data-en="WEB Proxy Port (per-port secret)" data-fa="پورت WEB Proxy (سکرت هر پورت)">WEB Proxy Port (per-port secret)</label>
+        <select class="fs" id="ewebproxy-port">
+          <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
+        </select></div>
+      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="eproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
+    </div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" maxlength="60"></div>
     <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
       <select class="fs" id="flag-select-edit" onchange="applyFlagEdit()">
-        <option value="">None</option>
-        <option value="cn">🇨🇳 China</option>
-        <option value="nl">🇳🇱 Netherlands</option>
-        <option value="ru">🇷🇺 Russia</option>
-        <option value="us">🇺🇸 United States</option>
-        <option value="ca">🇨🇦 Canada</option>
-        <option value="ir">🇮🇷 Iran</option>
-        <option value="de">🇩🇪 Germany</option>
-        <option value="gb">🇬🇧 United Kingdom</option>
-        <option value="it">🇮🇹 Italy</option>
-        <option value="fr">🇫🇷 France</option>
-        <option value="tr">🇹🇷 Turkey</option>
-        <option value="ae">🇦🇪 UAE</option>
-        <option value="custom">Custom (2-letter)</option>
+        <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
+        <option value="cn" data-en="🇨🇳 China" data-fa="🇨🇳 چین">🇨🇳 China</option>
+        <option value="nl" data-en="🇳🇱 Netherlands" data-fa="🇳🇱 هلند">🇳🇱 Netherlands</option>
+        <option value="ru" data-en="🇷🇺 Russia" data-fa="🇷🇺 روسیه">🇷🇺 Russia</option>
+        <option value="us" data-en="🇺🇸 United States" data-fa="🇺🇸 ایالات متحده">🇺🇸 United States</option>
+        <option value="ca" data-en="🇨🇦 Canada" data-fa="🇨🇦 کانادا">🇨🇦 Canada</option>
+        <option value="ir" data-en="🇮🇷 Iran" data-fa="🇮🇷 ایران">🇮🇷 Iran</option>
+        <option value="de" data-en="🇩🇪 Germany" data-fa="🇩🇪 آلمان">🇩🇪 Germany</option>
+        <option value="gb" data-en="🇬🇧 United Kingdom" data-fa="🇬🇧 بریتانیا">🇬🇧 United Kingdom</option>
+        <option value="it" data-en="🇮🇹 Italy" data-fa="🇮🇹 ایتالیا">🇮🇹 Italy</option>
+        <option value="fr" data-en="🇫🇷 France" data-fa="🇫🇷 فرانسه">🇫🇷 France</option>
+        <option value="tr" data-en="🇹🇷 Turkey" data-fa="🇹🇷 ترکیه">🇹🇷 Turkey</option>
+        <option value="ae" data-en="🇦🇪 UAE" data-fa="🇦🇪 امارات">🇦🇪 UAE</option>
+        <option value="custom" data-en="Custom (2-letter)" data-fa="سفارشی (۲ حرفی)">Custom (2-letter)</option>
       </select>
-      <input class="fi" id="flag-custom-edit" placeholder="e.g. jp" style="display:none; margin-top:5px;" maxlength="2">
+      <input class="fi" id="flag-custom-edit" placeholder="e.g. jp" data-ph-en="e.g. jp" data-ph-fa="مثلاً jp" style="display:none; margin-top:5px;" maxlength="2">
       <input type="hidden" id="flag-code-edit" value="">
-      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagEdit()" style="margin-top:4px;">🔍 Auto Detect</button>
+      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagEdit()" style="margin-top:4px;" data-en="🔍 Auto Detect" data-fa="🔍 تشخیص خودکار">🔍 Auto Detect</button>
     </div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
     <div class="hint" style="color:var(--text3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-edit" class="adv-section">
         <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
-          <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select>
-          <small style="color:var(--text3);font-size:0.75rem;">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
+          <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="youtube" data-en="YouTube" data-fa="YouTube">YouTube</option><option value="instagram" data-en="Instagram" data-fa="Instagram">Instagram</option><option value="twitter" data-en="Twitter" data-fa="Twitter">Twitter</option><option value="tiktok" data-en="TikTok" data-fa="TikTok">TikTok</option><option value="whatsapp" data-en="WhatsApp" data-fa="WhatsApp">WhatsApp</option><option value="telegram" data-en="Telegram" data-fa="Telegram">Telegram</option><option value="netflix" data-en="Netflix" data-fa="Netflix">Netflix</option><option value="spotify" data-en="Spotify" data-fa="Spotify">Spotify</option><option value="google" data-en="Google" data-fa="Google">Google</option></select>
+          <small style="color:var(--text3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
         </div>
-        <div class="fg"><label class="fl">Path</label><input class="fi" id="ep"></div>
-        <div class="fg"><label class="fl">SNI</label><input class="fi" id="esni"></div>
-        <div class="fg"><label class="fl">Host</label><input class="fi" id="ehost"></div>
-        <div class="fg"><label class="fl">Fingerprint</label>
+        <div class="fg"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ep"></div>
+        <div class="fg"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="esni"></div>
+        <div class="fg"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="ehost"></div>
+        <div class="fg"><label class="fl" data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</label>
           <select class="fs" id="efingerprint-sel" onchange="toggleFingerprintCustom('edit')">
-    <option value="none">None / Disable</option>
-    <option value="chrome">Chrome</option>
-    <option value="firefox">Firefox</option>
-    <option value="safari">Safari</option>
-    <option value="ios">iOS</option>
-    <option value="android">Android</option>
-    <option value="edge">Edge</option>
+    <option value="none" data-en="None / Disable" data-fa="هیچ‌کدام / غیرفعال">None / Disable</option>
+    <option value="chrome" data-en="Chrome" data-fa="Chrome">Chrome</option>
+    <option value="firefox" data-en="Firefox" data-fa="Firefox">Firefox</option>
+    <option value="safari" data-en="Safari" data-fa="Safari">Safari</option>
+    <option value="ios" data-en="iOS" data-fa="iOS">iOS</option>
+    <option value="android" data-en="Android" data-fa="Android">Android</option>
+    <option value="edge" data-en="Edge" data-fa="Edge">Edge</option>
     <option value="360">360</option>
-    <option value="qq">QQ</option>
-    <option value="random">Random</option>
-    <option value="randomized">Randomized</option>
-    <option value="custom">Custom</option>
+    <option value="qq" data-en="QQ" data-fa="QQ">QQ</option>
+    <option value="random" data-en="Random" data-fa="تصادفی">Random</option>
+    <option value="randomized" data-en="Randomized" data-fa="تصادفی‌سازی‌شده">Randomized</option>
+    <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
-          <input class="fi" id="efingerprint-custom" placeholder="Enter custom fingerprint" style="display:none; margin-top:5px;">
+          <input class="fi" id="efingerprint-custom" placeholder="Enter custom fingerprint" data-ph-en="Enter custom fingerprint" data-ph-fa="اثرانگشت سفارشی را وارد کنید" style="display:none; margin-top:5px;">
           <input type="hidden" id="efingerprint" value="">
         </div>
-        <div class="fg"><label class="fl">Fragment</label>
+        <div class="fg"><label class="fl" data-en="Fragment" data-fa="فرگمنت">Fragment</label>
           <select class="fs" id="efrag-mode" onchange="toggleFragmentFields('edit')">
-            <option value="off">Off</option>
-            <option value="tlshello">TLS Hello</option>
-            <option value="range">Range</option>
+            <option value="off" data-en="Off" data-fa="خاموش">Off</option>
+            <option value="tlshello" data-en="TLS Hello" data-fa="TLS Hello">TLS Hello</option>
+            <option value="range" data-en="Range" data-fa="بازه">Range</option>
           </select>
           <div id="frag-edit-range" style="display:none;">
-            <input class="fi" id="efrag-length" placeholder="Length (e.g. 100-200)" style="margin-top:5px;">
-            <input class="fi" id="efrag-interval" placeholder="Interval (e.g. 10-20)" style="margin-top:5px;">
+            <input class="fi" id="efrag-length" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
+            <input class="fi" id="efrag-interval" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
           </div>
           <input type="hidden" id="efrag" value="">
         </div>
-        <div class="fg"><label class="fl">IP Profile</label><select class="fs" id="eip-profile"></select></div>
+        <div class="fg"><label class="fl" data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</label><select class="fs" id="eip-profile"></select></div>
         <div class="fg"><label class="fl" data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</label>
           <select class="fs" id="enaming-mode">
-            <option value="default">Default (SulgX-Name-Server1)</option>
-            <option value="short">Short (SXP 1, SXP 2, ...)</option>
+            <option value="default" data-en="Default (SulgX-Name-Server1)" data-fa="پیش‌فرض (SulgX-Name-Server1)">Default (SulgX-Name-Server1)</option>
+            <option value="short" data-en="Short (SXP 1, SXP 2, ...)" data-fa="کوتاه (SXP 1, SXP 2, ...)">Short (SXP 1, SXP 2, ...)</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">TCP Fast Open</label><div class="toggle" id="tfo-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">ECH (Secure Hello)</label><div class="toggle" id="ech-edit" onclick="this.classList.toggle('on'); toggleEchFields('edit')"></div></div>
+        <div class="fg"><label class="fl" data-en="TCP Fast Open" data-fa="TCP Fast Open">TCP Fast Open</label><div class="toggle" id="tfo-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="ECH (Secure Hello)" data-fa="ECH (Secure Hello)">ECH (Secure Hello)</label><div class="toggle" id="ech-edit" onclick="this.classList.toggle('on'); toggleEchFields('edit')"></div></div>
         <div id="ech-edit-fields" style="display:none;">
-          <input class="fi" id="ech-sni-edit" placeholder="ECH SNI (e.g. cloudflare.com)" style="margin-top:5px;">
-          <input class="fi" id="ech-doh-edit" placeholder="ECH DoH URL (optional)" style="margin-top:5px;">
+          <input class="fi" id="ech-sni-edit" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
+          <input class="fi" id="ech-doh-edit" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
         </div>
-        <div class="fg"><label class="fl">Allow Insecure</label><div class="toggle" id="insecure-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Random Path</label><div class="toggle" id="random-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">SMUX</label><div class="toggle" id="smux-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">UDP</label><div class="toggle on" id="udp-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">IPv6 targets</label><div class="toggle on" id="ipv6-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">IP Limit</label><input class="fi" type="number" id="eip-limit" min="0" value="0" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl">Protocol</label>
-          <select class="fs" id="eprotocol" onchange="toggleProxyFields('edit')">
-            <option value="vless-ws">VLESS + WS</option>
-            <option value="vmess-ws">VMess + WS (AEAD)</option>
-            <option value="trojan-ws">Trojan + WS</option>
-            <option value="ss-ws">Shadowsocks + WS (AEAD 2022)</option>
-            <option value="xhttp-packet-up">XHTTP Packet-Up</option>
-            <option value="xhttp-stream-up">XHTTP Stream-Up</option>
-            <option value="xhttp-stream-one">XHTTP Stream-One</option>
-            <option value="xhttp-auto">XHTTP Auto</option>
-            <option value="socks5">Telegram SOCKS5</option>
-            <option value="mtproto">Telegram MTProto proxy</option>
-            <option value="webproxy">Telegram WEB proxy</option>
-            <option value="http-proxy">HTTP proxy (CONNECT)</option>
-          </select>
-        </div>
-        <div id="proxy-fields-edit" style="display:none;">
-          <div class="fg" id="fg-emtproto-variant"><label class="fl">MTProto Variant</label>
-            <select class="fs" id="emtproto-variant" onchange="toggleProxyFields('edit')">
-              <option value="dd">dd (recommended, obfuscated2)</option>
-              <option value="plain">Plain secret</option>
-              <option value="faketls">Fake-TLS (dd + domain)</option>
-            </select></div>
-          <div class="fg" id="fg-emtproto-domain"><label class="fl">Fake-TLS Domain</label><input class="fi" id="emtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
-          <div class="fg" id="fg-ewebproxy-port"><label class="fl">WEB Proxy Port (per-port secret)</label>
-            <select class="fs" id="ewebproxy-port">
-              <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
-            </select></div>
-          <div class="fg"><label class="fl">Proxy Info</label><div class="hint" id="eproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
-        </div>
-        <div class="fg"><label class="fl">Shadowsocks Method</label>
+        <div class="fg"><label class="fl" data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</label><div class="toggle" id="insecure-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Random Path" data-fa="مسیر تصادفی">Random Path</label><div class="toggle" id="random-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="SMUX" data-fa="SMUX">SMUX</label><div class="toggle" id="smux-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="UDP" data-fa="UDP">UDP</label><div class="toggle on" id="udp-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</label><div class="toggle on" id="ipv6-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</label><input class="fi" type="number" id="eip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
           <select class="fs" id="ess-method">
-            <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
-            <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
-            <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
-            <option value="aes-256-gcm">aes-256-gcm (classic)</option>
-            <option value="aes-128-gcm">aes-128-gcm (classic)</option>
-            <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (classic)</option>
+            <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+            <option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
+            <option value="2022-blake3-chacha20-poly1305" data-en="2022-blake3-chacha20-poly1305" data-fa="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
+            <option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option>
+            <option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option>
+            <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Outbound Mode</label>
+        <div class="fg"><label class="fl" data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</label>
           <select class="fs" id="eoutbound-mode">
-            <option value="auto">Auto (proxy line if set, else direct)</option>
-            <option value="direct">Direct</option>
-            <option value="proxy">Proxy line (required)</option>
-            <option value="block">Block</option>
+            <option value="auto" data-en="Auto (proxy line if set, else direct)" data-fa="خودکار (در صورت تنظیم خط پروکسی، وگرنه مستقیم)">Auto (proxy line if set, else direct)</option>
+            <option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option>
+            <option value="proxy" data-en="Proxy line (required)" data-fa="خط پروکسی (الزامی)">Proxy line (required)</option>
+            <option value="block" data-en="Block" data-fa="مسدود">Block</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Region (exit country)</label>
-          <select class="fs" id="eregion"><option value="">None (auto / routing rules)</option></select>
-        </div>
-        <div class="fg"><label class="fl">Gaming Profile</label>
+        <div class="fg"><label class="fl" data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</label>
           <select class="fs" id="egaming-profile">
-            <option value="balanced">Balanced</option>
-            <option value="gaming">Gaming (low latency)</option>
-            <option value="low-overhead">Low Overhead</option>
-            <option value="stealth">Stealth</option>
+            <option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option>
+            <option value="gaming" data-en="Gaming (low latency)" data-fa="گیمینگ (تأخیر کم)">Gaming (low latency)</option>
+            <option value="low-overhead" data-en="Low Overhead" data-fa="سربار کم">Low Overhead</option>
+            <option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Owner User</label>
-          <select class="fs" id="eowner-user"><option value="">None</option></select>
-        </div>
-        <div class="fg"><label class="fl">ALPN</label>
+        <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="eowner-name" placeholder="Owner name (optional)" maxlength="60"></div>
+        <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="eowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
           <select class="fs" id="ealpn-sel" onchange="toggleAlpnCustom('edit')">
-    <option value="">None (default)</option>
-    <option value="http/1.1">http/1.1</option>
-    <option value="h2,http/1.1">h2,http/1.1</option>
-    <option value="h2">h2</option>
-    <option value="h3">h3</option>
-    <option value="custom">Custom</option>
+    <option value="" data-en="None (default)" data-fa="هیچ‌کدام (پیش‌فرض)">None (default)</option>
+    <option value="http/1.1" data-en="http/1.1" data-fa="http/1.1">http/1.1</option>
+    <option value="h2,http/1.1" data-en="h2,http/1.1" data-fa="h2,http/1.1">h2,http/1.1</option>
+    <option value="h2" data-en="h2" data-fa="h2">h2</option>
+    <option value="h3" data-en="h3" data-fa="h3">h3</option>
+    <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
-          <input class="fi" id="ealpn-custom" placeholder="e.g. h2,http/1.1" style="display:none; margin-top:5px;">
+          <input class="fi" id="ealpn-custom" placeholder="e.g. h2,http/1.1" data-ph-en="e.g. h2,http/1.1" data-ph-fa="مثلاً h2,http/1.1" style="display:none; margin-top:5px;">
           <input type="hidden" id="ealpn" value="">
         </div>
-        <div class="fg"><label class="fl">Port (shown in link — server listens on $PORT only)</label><input class="fi" type="number" id="eport" min="1" max="65535" value="443"></div>
-        <div class="fg"><label class="fl">Xray DNS Mode</label>
+        <div class="fg"><label class="fl">Port (shown in link — server listens on port <span id="port-note-edit">…</span> only)</label><input class="fi" type="number" id="eport" min="1" max="65535" value="443"></div>
+        <div class="fg"><label class="fl" data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</label>
         <select class="fs" id="xray-dns-mode">
-        <option value="doh">DoH (DNS over HTTPS)</option>
-        <option value="fakedns">FakeDNS</option>
-        <option value="direct">Direct (system)</option>
+        <option value="doh" data-en="DoH (DNS over HTTPS)" data-fa="DoH (DNS روی HTTPS)">DoH (DNS over HTTPS)</option>
+        <option value="fakedns" data-en="FakeDNS" data-fa="FakeDNS">FakeDNS</option>
+        <option value="direct" data-en="Direct (system)" data-fa="مستقیم (سیستم)">Direct (system)</option>
         </select></div>
-        <div class="fg"><label class="fl">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url" placeholder="https://cloudflare-dns.com/dns-query"></div>
-        <div class="fg"><label class="fl">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg"><label class="fl">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Bypass China (Direct)</label><div class="toggle" id="bypass-china-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url" placeholder="https://cloudflare-dns.com/dns-query"></div>
+        <div class="fg"><label class="fl" data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg"><label class="fl" data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</label><div class="toggle" id="bypass-china-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-edit" onclick="this.classList.toggle('on')"></div></div>
       </div>
-    </div>
-    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited"></div>
-    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl" data-en="Used / Limit / Remaining" data-fa="مصرف / سقف / باقی‌مانده">Used / Limit / Remaining</label><div class="hint" id="eusage" style="color:var(--text2);font-size:0.9rem;"></div></div>
+    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('edit')"></div>
+    <div class="hint" id="expires-preview-edit" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
+    <div class="fg"><label class="fl" data-en="Consumed Volume" data-fa="حجم مصرف‌شده">Consumed Volume</label><div class="hint" id="eused-summary" style="color:var(--text2);font-size:0.9rem;">–</div></div>
     <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#39ff14"></div>
     <div class="fg">
       <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
       <select class="fs" id="proxy-line-select-edit">
-        <option value="">None (Direct)</option>
+        <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
+      <input class="fi" id="proxy-line-text-edit" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" style="margin-top:6px;">
+      <div style="font-size:0.85rem;color:var(--text3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
       <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('edit')" style="margin-top:6px;" data-en="🌍 Refresh Flags" data-fa="🌍 بروزرسانی پرچم‌ها">🌍 Refresh Flags</button>
     </div>
     <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
@@ -12195,9 +14894,21 @@ example.com
 <div class="mo" id="mo-qr" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box" style="max-width:360px;">
     <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
-    <div class="mo-title">QR Code</div>
+    <div class="mo-title" data-en="QR Code" data-fa="کد QR">QR Code</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR Code"></div>
     <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:10px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
+  </div>
+</div>
+
+<div class="mo" id="mo-confirm" onclick="if(event.target===this) _confirmDone(false)">
+  <div class="mo-box" style="max-width:420px;">
+    <button class="mo-close" onclick="_confirmDone(false)">✕</button>
+    <div class="mo-title" data-en="Confirm" data-fa="تأیید">Confirm</div>
+    <div id="confirm-msg" style="color:var(--text2);font-size:0.95rem;line-height:1.6;margin:8px 0 4px;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+      <button class="btn btn-outline" onclick="_confirmDone(false)" data-en="Cancel" data-fa="انصراف">Cancel</button>
+      <button class="btn btn-danger" id="confirm-ok" onclick="_confirmDone(true)">Delete</button>
+    </div>
   </div>
 </div>
 
@@ -12217,7 +14928,7 @@ example.com
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="quick-label"></div>
     <div class="fg"><label class="fl" data-en="Traffic (GB)" data-fa="حجم (گیگ)">Traffic (GB)</label><input class="fi" type="number" id="quick-limit" value="0"></div>
     <div class="fg"><label class="fl" data-en="Days" data-fa="روز">Days</label><input class="fi" type="number" id="quick-days" value="0"></div>
-    <button class="btn btn-primary" onclick="quickCreate()" style="width:100%;justify-content:center;">Create & Get Link</button>
+    <button class="btn btn-primary" onclick="quickCreate()" style="width:100%;justify-content:center;" data-en="Create & Get Link" data-fa="ایجاد و دریافت لینک">Create & Get Link</button>
   </div>
 </div>
 
@@ -12231,11 +14942,11 @@ example.com
       <textarea class="fi" id="ip-profile-addrs" rows="6" placeholder="1.1.1.1#MyServer+us+1
 8.8.8.8#Google+us
 example.com"></textarea>
-      <small style="color:var(--text3); font-size:0.75rem;">Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)</small>
+      <small style="color:var(--text3); font-size:0.75rem;" data-en="Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)" data-fa="قالب: IP#Name+Flag+SortNumber (نام، پرچم و شماره ترتیب اختیاری)">Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)</small>
     </div>
-    <button class="btn btn-outline btn-sm" onclick="detectFlagsForProfile()" style="margin-top:6px;">🔍 Auto-Detect Flags</button>
+    <button class="btn btn-outline btn-sm" onclick="detectFlagsForProfile()" style="margin-top:6px;" data-en="🔍 Auto-Detect Flags" data-fa="🔍 تشخیص خودکار پرچم‌ها">🔍 Auto-Detect Flags</button>
     <input type="hidden" id="ip-profile-id">
-    <button class="btn btn-primary" onclick="saveIpProfile()" style="width:100%;justify-content:center;margin-top:10px;">Save</button>
+    <button class="btn btn-primary" onclick="saveIpProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
   </div>
 </div>
 
@@ -12244,7 +14955,7 @@ example.com"></textarea>
     <button class="mo-close" onclick="document.getElementById('mo-scanner-profile').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</div>
     <div class="fg"><label class="fl" data-en="Profile Name" data-fa="نام پروفایل">Profile Name</label><input class="fi" id="scanner-profile-name"></div>
-    <button class="btn btn-primary" onclick="saveScannerProfile()" style="width:100%;justify-content:center;margin-top:10px;">Save</button>
+    <button class="btn btn-primary" onclick="saveScannerProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
   </div>
 </div>
 <div class="mo" id="mo-proxy" onclick="if(event.target===this) this.classList.remove('show')">
@@ -12253,11 +14964,11 @@ example.com"></textarea>
     <div class="mo-title" data-en="Add/Edit Proxy" data-fa="افزودن/ویرایش پروکسی">Add/Edit Proxy</div>
     <input type="hidden" id="proxy-id">
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="proxy-name"></div>
-    <div class="fg"><label class="fl">Type</label><select class="fs" id="proxy-type"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div>
-    <div class="fg"><label class="fl">Host</label><input class="fi" id="proxy-host"></div>
-    <div class="fg"><label class="fl">Port</label><input class="fi" type="number" id="proxy-port"></div>
-    <div class="fg"><label class="fl">Username</label><input class="fi" id="proxy-username"></div>
-    <div class="fg"><label class="fl">Password</label><input class="fi" type="password" id="proxy-password"></div>
+    <div class="fg"><label class="fl" data-en="Type" data-fa="نوع">Type</label><select class="fs" id="proxy-type"><option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option><option value="http" data-en="HTTP" data-fa="HTTP">HTTP</option></select></div>
+    <div class="fg"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="proxy-host"></div>
+    <div class="fg"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" type="number" id="proxy-port"></div>
+    <div class="fg"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="proxy-username"></div>
+    <div class="fg"><label class="fl" data-en="Password" data-fa="رمز عبور">Password</label><input class="fi" type="password" id="proxy-password"></div>
     <div class="fg"><label class="fl" data-en="Active" data-fa="فعال">Active</label><div class="toggle on" id="proxy-active" onclick="this.classList.toggle('on')"></div></div>
     <div class="fg">
       <label class="fl" data-en="Bulk Import (one per line)" data-fa="افزودن گروهی (هر خط یک)">Bulk Import</label>
@@ -12268,8 +14979,8 @@ host:port@user:pass"></textarea>
       <div class="fg" style="margin-top:6px;">
         <label class="fl" data-en="Default Type (for lines without prefix)" data-fa="نوع پیش‌فرض (برای خطوط بدون پیشوند)">Default Type</label>
         <select class="fs" id="proxy-default-type">
-          <option value="socks5" selected>SOCKS5</option>
-          <option value="http">HTTP</option>
+          <option value="socks5" selected data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option>
+          <option value="http" data-en="HTTP" data-fa="HTTP">HTTP</option>
         </select>
       </div>
       <button class="btn btn-outline btn-sm" onclick="importProxiesBulk()" data-en="Add All" data-fa="افزودن همه">Add All</button>
@@ -12319,10 +15030,10 @@ function goToPanel() {
 }
 
 function copyToClipboard(text) {
-    if (!text) { toast('Nothing to copy', true); return; }
+    if (!text) { toast(t('nothingToCopy'), true); return; }
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(function() {
-            toast('Copied!');
+            toast(t('copied'));
         }, function() {
             fallbackCopy(text);
         });
@@ -12339,9 +15050,9 @@ function fallbackCopy(text) {
     textArea.focus(); textArea.select();
     try {
         var successful = document.execCommand('copy');
-        toast(successful ? 'Copied!' : 'Failed to copy');
+        toast(successful ? t('copied') : t('copyFailed'));
     } catch (err) {
-        toast('Failed to copy', true);
+        toast(t('copyFailed'), true);
     }
     document.body.removeChild(textArea);
 }
@@ -12354,31 +15065,275 @@ const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
 const i18n = {
   en:{
     hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now', updatedAt:'Updated {time}',
-    success:'Success', failed:'Failed',
+    success:'Success',
     mb:'MB', gb:'GB', kb:'KB', b:'B',
     active:'Active', inactive:'Inactive', expired:'Expired', unlimited:'∞',
     create:'Create', save:'Save', cancel:'Cancel', edit:'Edit', copy:'Copy', sub:'Sub', qr:'QR', del:'Del',
     on:'On', off:'Off',
     logout: '🚪 Logout',
     reachable:'✅ Reachable', failed:'❌ Failed',
-    testing:'Testing...'
+    testing:'Testing...',
+    Error: 'Error',
+    'None (Direct)': 'None (Direct)',
+    'Proxy flags refreshed': 'Proxy flags refreshed',
+    addressUpdated: 'Address updated',
+    allDeleted: 'All deleted',
+    autoDetectFailed: 'Auto-detect failed',
+    batchAddFailed: 'Batch add failed',
+    bulkImportFailed: 'Bulk import failed',
+    checkBtn: 'Check',
+    cloneTip: 'Clone',
+    clonedOk: 'Cloned successfully',
+    confirmClearActivity: 'Clear all recent activity?',
+    confirmDelete: 'Delete?',
+    confirmDeleteAddrs: 'Delete selected addresses?',
+    confirmDeleteAllAddrs: 'Delete all addresses?',
+    confirmDeleteProfile: 'Delete this profile?',
+    confirmDeleteRule: 'Delete this routing rule?',
+    confirmDeleteSelected: 'Delete selected?',
+    confirmDeleteUser: 'Delete this user? Their links stay but lose the owner.',
+    confirmDisconnectSession: 'Disconnect this session?',
+    confirmReset: 'Reset?',
+    copied: 'Copied!',
+    copiedShort: 'Copied',
+    copyClashTip: 'Copy Clash Link',
+    copyFailed: 'Failed to copy',
+    copyFailedShort: 'Copy failed',
+    copyLinkBtn: 'Copy Link',
+    copySingboxTip: 'Copy Sing-Box Link',
+    copySubLinkTip: 'Copy Subscription Link',
+    created: 'Created',
+    createdPrefix: 'Created! ',
+    customProvider: 'Custom',
+    delBtn: 'Delete',
+    deleted: 'Deleted',
+    deletedSelected: 'Deleted selected',
+    detectionFailed: 'Detection failed: ',
+    disconnectAllTip: 'Disconnect All',
+    disconnected: 'Disconnected',
+    dohCopied: 'DOH URL copied',
+    enterName: 'Enter a name',
+    enterNameUrl: 'Enter name and URL',
+    errorPrefix: 'Error: ',
+    errorSavingSettings: 'Error saving settings',
+    exportFailed: 'Export failed',
+    failedPrefix: 'Failed: ',
+    failedToSend: 'Failed to send',
+    fillFields: 'Fill fields',
+    fillRequired: 'Fill required fields',
+    fillTokenChat: 'Fill token and chat ID',
+    flagDetected: 'Flag detected: ',
+    flagsUpdated: 'Flags detected and updated',
+    importFailed: 'Import failed',
+    importTxtFailed: 'Import .txt failed',
+    invalidAddress: 'Invalid address',
+    invalidJsonTemplates: 'Invalid JSON in templates',
+    largeRange: 'Large range: only first {n} IPs extracted.',
+    links: 'Links',
+    linksBtn: 'Links',
+    listenerDisabled: '(listener disabled)',
+    nameRequired: 'Name required',
+    noAddresses: 'No addresses',
+    noAddrsInFile: 'No addresses found in file',
+    noAddrsSelected: 'No addresses selected',
+    noAddrsToProcess: 'No addresses to process',
+    noChanges: 'No changes detected',
+    noData: 'No data',
+    noFlagFound: 'No flag found',
+    noIpAvailable: 'No IP available',
+    noItemsSelected: 'No items selected',
+    noLinksAssigned: 'No links assigned',
+    noProxyLines: 'No proxy lines',
+    noProxyLinesDefined: 'No proxy lines defined',
+    noProxySelected: 'No proxy selected',
+    noReachableIps: 'No reachable IPs found',
+    noUsersYet: 'No users yet',
+    noValidProxies: 'No valid proxies',
+    nothingToCopy: 'Nothing to copy',
+    passwordUpdated: 'Password updated',
+    profileCreated: 'Profile created',
+    promptMaxSess: 'Max concurrent sessions for this user (0 = unlimited)',
+    providerTruncated: 'Provider has more addresses; only the first {n} were loaded.',
+    proxiesTested: 'All proxies tested',
+    proxyListenerDisabled: 'Proxy listener disabled: ',
+    proxyWord: 'Proxy',
+    pwTooShort: 'Password must be at least 8 characters',
+    pwWeak: 'Password must contain uppercase, lowercase, and digit',
+    qrTooLong: 'Link too long for QR',
+    quotaLeft: 'Quota left:',
+    regenUuidTip: 'Regenerate UUID',
+    resetDone: 'Reset',
+    resolveFailed: 'Resolve failed: ',
+    saved: 'Saved',
+    savedApplied: 'Saved & Applied',
+    scanAllFailed: 'Scan finished: no address answered. Outbound TCP from this server appears blocked; the scanner needs a VPS or a host with allowed outbound TCP (port 443).',
+    scanAllReady: '{n} IPs from all providers are ready. Press Scan.',
+    failedProxiesDeleted: 'Failed proxies deleted',
+    scanNeedIPs: 'Enter at least one IP or CIDR to scan',
+    scanErrorEgress: 'Scanner error: outbound TCP from this server appears blocked. The scanner needs a VPS or a host with allowed outbound TCP.',
+    scanFinished: 'Scan finished successfully.',
+    scanTooMany: 'Max {max} IPs allowed. You entered {count}.',
+    sessionsOnLink: 'Sessions on link:',
+    startBtn: 'Start',
+    stopBtn: 'Stop',
+    subBtn: 'Sub',
+    subscriptionBtn: 'Subscription',
+    testError: 'Test error',
+    testFailed: 'Test failed',
+    testInboundTip: 'Test inbound',
+    testMsgSent: 'Test message sent!',
+    testStopped: 'Test stopped',
+    totalWord: 'Total',
+    updated: 'Updated',
+    userCreated: 'User created',
+    userWord: 'user',
+    testAll: 'Test All',
+    yesWord: 'yes',
+    noWord: 'no',
+    disableWord: 'Disable',
+    enableWord: 'Enable',
+    noRulesYet: 'No routing rules yet.',
+    uuidRegenerated: 'UUID regenerated',
+    xrayConfigTip: 'Xray Config',
   },
   fa:{
     hoursAgo:'{n} ساعت پیش', minsAgo:'{n} دقیقه پیش', justNow:'لحظاتی پیش', updatedAt:'بروزرسانی {time}',
-    success:'موفق', failed:'ناموفق',
+    success:'موفق',
     mb:'مگابایت', gb:'گیگابایت', kb:'کیلوبایت', b:'بایت',
     active:'فعال', inactive:'غیرفعال', expired:'منقضی', unlimited:'∞',
     create:'ایجاد', save:'ذخیره', cancel:'انصراف', edit:'ویرایش', copy:'کپی', sub:'اشتراک', qr:'QR', del:'حذف',
     on:'روشن', off:'خاموش',
     logout: '🚪 خروج',
     reachable:'✅ در دسترس', failed:'❌ خطا',
-    testing:'در حال تست'
+    testing:'در حال تست',
+    Error: 'خطا',
+    'None (Direct)': 'هیچ‌کدام (مستقیم)',
+    'Proxy flags refreshed': 'پرچم‌های پروکسی تازه‌سازی شد',
+    addressUpdated: 'آدرس به‌روز شد',
+    allDeleted: 'همه حذف شدند',
+    autoDetectFailed: 'تشخیص خودکار ناموفق بود',
+    batchAddFailed: 'افزودن گروهی ناموفق بود',
+    bulkImportFailed: 'ورود گروهی ناموفق بود',
+    checkBtn: 'بررسی',
+    cloneTip: 'کلون',
+    clonedOk: 'با موفقیت کلون شد',
+    confirmClearActivity: 'همه فعالیت‌های اخیر پاک شوند؟',
+    confirmDelete: 'حذف شود؟',
+    confirmDeleteAddrs: 'آدرس‌های انتخاب‌شده حذف شوند؟',
+    confirmDeleteAllAddrs: 'همه آدرس‌ها حذف شوند؟',
+    confirmDeleteProfile: 'این پروفایل حذف شود؟',
+    confirmDeleteRule: 'این قانون مسیریابی حذف شود؟',
+    confirmDeleteSelected: 'موارد انتخاب‌شده حذف شوند؟',
+    confirmDeleteUser: 'این کاربر حذف شود؟ لینک‌هایش می‌مانند اما مالک خود را از دست می‌دهند.',
+    confirmDisconnectSession: 'این نشست قطع شود؟',
+    confirmReset: 'بازنشانی شود؟',
+    copied: 'کپی شد!',
+    copiedShort: 'کپی شد',
+    copyClashTip: 'کپی لینک کلش',
+    copyFailed: 'کپی ناموفق بود',
+    copyFailedShort: 'کپی ناموفق بود',
+    copyLinkBtn: 'کپی لینک',
+    copySingboxTip: 'کپی لینک سینگ‌باکس',
+    copySubLinkTip: 'کپی لینک اشتراک',
+    created: 'ایجاد شد',
+    createdPrefix: 'ایجاد شد! ',
+    customProvider: 'سفارشی',
+    delBtn: 'حذف',
+    deleted: 'حذف شد',
+    deletedSelected: 'موارد انتخاب‌شده حذف شدند',
+    detectionFailed: 'تشخیص ناموفق بود: ',
+    disconnectAllTip: 'قطع همه',
+    disconnected: 'قطع شد',
+    dohCopied: 'آدرس DOH کپی شد',
+    enterName: 'یک نام وارد کنید',
+    enterNameUrl: 'نام و آدرس را وارد کنید',
+    errorPrefix: 'خطا: ',
+    errorSavingSettings: 'خطا در ذخیره تنظیمات',
+    exportFailed: 'خروجی ناموفق بود',
+    failedPrefix: 'ناموفق: ',
+    failedToSend: 'ارسال ناموفق بود',
+    fillFields: 'فیلدها را پر کنید',
+    fillRequired: 'فیلدهای الزامی را پر کنید',
+    fillTokenChat: 'توکن و شناسه چت را وارد کنید',
+    flagDetected: 'پرچم شناسایی شد: ',
+    flagsUpdated: 'پرچم‌ها شناسایی و به‌روز شدند',
+    importFailed: 'ورود ناموفق بود',
+    importTxtFailed: 'ورود فایل txt ناموفق بود',
+    invalidAddress: 'آدرس نامعتبر است',
+    invalidJsonTemplates: 'JSON قالب‌ها نامعتبر است',
+    largeRange: 'رنج بزرگ: فقط {n} آی‌پی اول استخراج شد.',
+    links: 'لینک‌ها',
+    linksBtn: 'لینک‌ها',
+    listenerDisabled: '(شنونده غیرفعال)',
+    nameRequired: 'نام الزامی است',
+    noAddresses: 'آدرسی نیست',
+    noAddrsInFile: 'در فایل آدرسی یافت نشد',
+    noAddrsSelected: 'آدرسی انتخاب نشده است',
+    noAddrsToProcess: 'آدرسی برای پردازش نیست',
+    noChanges: 'تغییری شناسایی نشد',
+    noData: 'داده‌ای نیست',
+    noFlagFound: 'پرچمی یافت نشد',
+    noIpAvailable: 'آی‌پی در دسترسی نیست',
+    noItemsSelected: 'موردی انتخاب نشده است',
+    noLinksAssigned: 'لینکی اختصاص داده نشده است',
+    noProxyLines: 'خط پروکسی وجود ندارد',
+    noProxyLinesDefined: 'خط پروکسی تعریف نشده است',
+    noProxySelected: 'پروکسی انتخاب نشده است',
+    noReachableIps: 'آی‌پی در دسترسی یافت نشد',
+    noUsersYet: 'هنوز کاربری نیست',
+    noValidProxies: 'پروکسی معتبری نیست',
+    nothingToCopy: 'چیزی برای کپی نیست',
+    passwordUpdated: 'رمز عبور به‌روز شد',
+    profileCreated: 'پروفایل ایجاد شد',
+    promptMaxSess: 'حداکثر نشست‌های هم‌زمان این کاربر (۰ = نامحدود)',
+    providerTruncated: 'این ارائه‌دهنده آدرس‌های بیشتری دارد؛ فقط {n} تای اول بارگذاری شد.',
+    proxiesTested: 'همه پروکسی‌ها تست شدند',
+    proxyListenerDisabled: 'شنونده پروکسی غیرفعال است: ',
+    proxyWord: 'پروکسی',
+    pwTooShort: 'رمز عبور باید حداقل ۸ کاراکتر باشد',
+    pwWeak: 'رمز عبور باید شامل حروف بزرگ، حروف کوچک و عدد باشد',
+    qrTooLong: 'لینک برای QR بیش از حد طولانی است',
+    quotaLeft: 'باقیمانده سهمیه:',
+    regenUuidTip: 'تازه‌سازی شناسه',
+    resetDone: 'بازنشانی شد',
+    resolveFailed: 'حل ناموفق بود: ',
+    saved: 'ذخیره شد',
+    savedApplied: 'ذخیره و اعمال شد',
+    scanAllFailed: 'اسکن تمام شد: هیچ آدرسی پاسخ نداد. به‌نظر می‌رسد TCP خروجی این سرور مسدود است؛ اسکنر به یک VPS یا هاستی با TCP خروجی مجاز (پورت ۴۴۳) نیاز دارد.',
+    scanAllReady: '{n} آی‌پی از همه ارائه‌دهنده‌ها آماده است. دکمه اسکن را بزنید.',
+    failedProxiesDeleted: 'پروکسی‌های خراب حذف شدند',
+    scanNeedIPs: 'برای اسکن دست‌کم یک IP یا CIDR وارد کنید',
+    scanErrorEgress: 'خطای اسکنر: به‌نظر می‌رسد TCP خروجی این سرور مسدود است. اسکنر به یک VPS یا هاستی با TCP خروجی مجاز نیاز دارد.',
+    scanFinished: 'اسکن با موفقیت تمام شد.',
+    scanTooMany: 'حداکثر {max} آی‌پی مجاز است. شما {count} آی‌پی وارد کردید.',
+    sessionsOnLink: 'نشست‌های روی لینک:',
+    startBtn: 'شروع',
+    stopBtn: 'توقف',
+    subBtn: 'اشتراک',
+    subscriptionBtn: 'اشتراک',
+    testError: 'خطای تست',
+    testFailed: 'تست ناموفق بود',
+    testInboundTip: 'تست اینباند',
+    testMsgSent: 'پیام تست ارسال شد!',
+    testStopped: 'تست متوقف شد',
+    totalWord: 'مجموع',
+    updated: 'به‌روز شد',
+    userCreated: 'کاربر ایجاد شد',
+    userWord: 'کاربر',
+    testAll: 'تست همه',
+    yesWord: 'بله',
+    noWord: 'خیر',
+    disableWord: 'غیرفعال',
+    enableWord: 'فعال‌سازی',
+    noRulesYet: 'هنوز قانون مسیریابی نیست.',
+    uuidRegenerated: 'UUID تازه‌سازی شد',
+    xrayConfigTip: 'کانفیگ Xray',
   }
 };
 const stealth_i18n = {
   en: {
     hoursAgo: '{n} h ago', minsAgo: '{n} min ago', justNow: 'Just now',
-    updatedAt: 'Updated {time}', success: 'Success', failed: 'Failed',
+    updatedAt: 'Updated {time}', success: 'Success',
     mb: 'MB', gb: 'GB', kb: 'KB', b: 'B',
     active: 'Active', inactive: 'Inactive', expired: 'Expired', unlimited: '∞',
     create: 'New Service', save: 'Save', cancel: 'Cancel', edit: 'Modify',
@@ -12391,11 +15346,133 @@ const stealth_i18n = {
     'Quick Add': 'Quick Service', 'Manage VLESS Configs': 'Manage Channels',
     'This Server is Free': 'Free Service', 'Regenerate UUID': 'Refresh ID',
     'Disconnect All': 'Terminate Links',
-    testing:'Testing...'
+    testing:'Testing...',
+    Error: 'Error',
+    'None (Direct)': 'None (Direct)',
+    'Proxy flags refreshed': 'Proxy flags refreshed',
+    addressUpdated: 'Address updated',
+    allDeleted: 'All deleted',
+    autoDetectFailed: 'Auto-detect failed',
+    batchAddFailed: 'Batch add failed',
+    bulkImportFailed: 'Bulk import failed',
+    checkBtn: 'Check',
+    cloneTip: 'Clone',
+    clonedOk: 'Cloned successfully',
+    confirmClearActivity: 'Clear all recent activity?',
+    confirmDelete: 'Delete?',
+    confirmDeleteAddrs: 'Delete selected addresses?',
+    confirmDeleteAllAddrs: 'Delete all addresses?',
+    confirmDeleteProfile: 'Delete this profile?',
+    confirmDeleteRule: 'Delete this routing rule?',
+    confirmDeleteSelected: 'Delete selected?',
+    confirmDeleteUser: 'Delete this user? Their links stay but lose the owner.',
+    confirmDisconnectSession: 'Disconnect this session?',
+    confirmReset: 'Reset?',
+    copied: 'Copied!',
+    copiedShort: 'Copied',
+    copyClashTip: 'Copy Clash Link',
+    copyFailed: 'Failed to copy',
+    copyFailedShort: 'Copy failed',
+    copyLinkBtn: 'Copy Link',
+    copySingboxTip: 'Copy Sing-Box Link',
+    copySubLinkTip: 'Copy Subscription Link',
+    created: 'Created',
+    createdPrefix: 'Created! ',
+    customProvider: 'Custom',
+    delBtn: 'Delete',
+    deleted: 'Deleted',
+    deletedSelected: 'Deleted selected',
+    detectionFailed: 'Detection failed: ',
+    disconnectAllTip: 'Disconnect All',
+    disconnected: 'Disconnected',
+    dohCopied: 'DOH URL copied',
+    enterName: 'Enter a name',
+    enterNameUrl: 'Enter name and URL',
+    errorPrefix: 'Error: ',
+    errorSavingSettings: 'Error saving settings',
+    exportFailed: 'Export failed',
+    failedPrefix: 'Failed: ',
+    failedToSend: 'Failed to send',
+    fillFields: 'Fill fields',
+    fillRequired: 'Fill required fields',
+    fillTokenChat: 'Fill token and chat ID',
+    flagDetected: 'Flag detected: ',
+    flagsUpdated: 'Flags detected and updated',
+    importFailed: 'Import failed',
+    importTxtFailed: 'Import .txt failed',
+    invalidAddress: 'Invalid address',
+    invalidJsonTemplates: 'Invalid JSON in templates',
+    largeRange: 'Large range: only first {n} IPs extracted.',
+    links: 'Links',
+    linksBtn: 'Links',
+    listenerDisabled: '(listener disabled)',
+    nameRequired: 'Name required',
+    noAddresses: 'No addresses',
+    noAddrsInFile: 'No addresses found in file',
+    noAddrsSelected: 'No addresses selected',
+    noAddrsToProcess: 'No addresses to process',
+    noChanges: 'No changes detected',
+    noData: 'No data',
+    noFlagFound: 'No flag found',
+    noIpAvailable: 'No IP available',
+    noItemsSelected: 'No items selected',
+    noLinksAssigned: 'No links assigned',
+    noProxyLines: 'No proxy lines',
+    noProxyLinesDefined: 'No proxy lines defined',
+    noProxySelected: 'No proxy selected',
+    noReachableIps: 'No reachable IPs found',
+    noUsersYet: 'No users yet',
+    noValidProxies: 'No valid proxies',
+    nothingToCopy: 'Nothing to copy',
+    passwordUpdated: 'Password updated',
+    profileCreated: 'Profile created',
+    promptMaxSess: 'Max concurrent sessions for this user (0 = unlimited)',
+    providerTruncated: 'Provider has more addresses; only the first {n} were loaded.',
+    proxiesTested: 'All proxies tested',
+    proxyListenerDisabled: 'Proxy listener disabled: ',
+    proxyWord: 'Proxy',
+    pwTooShort: 'Password must be at least 8 characters',
+    pwWeak: 'Password must contain uppercase, lowercase, and digit',
+    qrTooLong: 'Link too long for QR',
+    quotaLeft: 'Quota left:',
+    regenUuidTip: 'Regenerate UUID',
+    resetDone: 'Reset',
+    resolveFailed: 'Resolve failed: ',
+    saved: 'Saved',
+    savedApplied: 'Saved & Applied',
+    scanAllFailed: 'Scan finished: no address answered. Outbound TCP from this server appears blocked; the scanner needs a VPS or a host with allowed outbound TCP (port 443).',
+    scanAllReady: '{n} IPs from all providers are ready. Press Scan.',
+    failedProxiesDeleted: 'Failed proxies deleted',
+    scanNeedIPs: 'Enter at least one IP or CIDR to scan',
+    scanErrorEgress: 'Scanner error: outbound TCP from this server appears blocked. The scanner needs a VPS or a host with allowed outbound TCP.',
+    scanFinished: 'Scan finished successfully.',
+    scanTooMany: 'Max {max} IPs allowed. You entered {count}.',
+    sessionsOnLink: 'Sessions on link:',
+    startBtn: 'Start',
+    stopBtn: 'Stop',
+    subBtn: 'Sub',
+    subscriptionBtn: 'Subscription',
+    testError: 'Test error',
+    testFailed: 'Test failed',
+    testInboundTip: 'Test inbound',
+    testMsgSent: 'Test message sent!',
+    testStopped: 'Test stopped',
+    totalWord: 'Total',
+    updated: 'Updated',
+    userCreated: 'User created',
+    userWord: 'user',
+    testAll: 'Test All',
+    yesWord: 'yes',
+    noWord: 'no',
+    disableWord: 'Disable',
+    enableWord: 'Enable',
+    noRulesYet: 'No routing rules yet.',
+    uuidRegenerated: 'UUID regenerated',
+    xrayConfigTip: 'Xray Config',
   },
   fa: {
     hoursAgo: '{n} ساعت پیش', minsAgo: '{n} دقیقه پیش', justNow: 'لحظاتی پیش',
-    updatedAt: 'بروزرسانی {time}', success: 'موفق', failed: 'ناموفق',
+    updatedAt: 'بروزرسانی {time}', success: 'موفق',
     mb: 'مگابایت', gb: 'گیگابایت', kb: 'کیلوبایت', b: 'بایت',
     active: 'فعال', inactive: 'غیرفعال', expired: 'منقضی', unlimited: '∞',
     create: 'سرویس جدید', save: 'ذخیره', cancel: 'انصراف', edit: 'ویرایش',
@@ -12408,7 +15485,129 @@ const stealth_i18n = {
     'Quick Add': 'سرویس سریع', 'Manage VLESS Configs': 'مدیریت کانال‌ها',
     'This Server is Free': 'سرویس رایگان', 'Regenerate UUID': 'تازه‌سازی شناسه',
     'Disconnect All': 'قطع تمام اتصالات',
-    testing:'در حال تست'
+    testing:'در حال تست',
+    Error: 'خطا',
+    'None (Direct)': 'هیچ‌کدام (مستقیم)',
+    'Proxy flags refreshed': 'پرچم‌های پروکسی تازه‌سازی شد',
+    addressUpdated: 'آدرس به‌روز شد',
+    allDeleted: 'همه حذف شدند',
+    autoDetectFailed: 'تشخیص خودکار ناموفق بود',
+    batchAddFailed: 'افزودن گروهی ناموفق بود',
+    bulkImportFailed: 'ورود گروهی ناموفق بود',
+    checkBtn: 'بررسی',
+    cloneTip: 'کلون',
+    clonedOk: 'با موفقیت کلون شد',
+    confirmClearActivity: 'همه فعالیت‌های اخیر پاک شوند؟',
+    confirmDelete: 'حذف شود؟',
+    confirmDeleteAddrs: 'آدرس‌های انتخاب‌شده حذف شوند؟',
+    confirmDeleteAllAddrs: 'همه آدرس‌ها حذف شوند؟',
+    confirmDeleteProfile: 'این پروفایل حذف شود؟',
+    confirmDeleteRule: 'این قانون مسیریابی حذف شود؟',
+    confirmDeleteSelected: 'موارد انتخاب‌شده حذف شوند؟',
+    confirmDeleteUser: 'این کاربر حذف شود؟ لینک‌هایش می‌مانند اما مالک خود را از دست می‌دهند.',
+    confirmDisconnectSession: 'این نشست قطع شود؟',
+    confirmReset: 'بازنشانی شود؟',
+    copied: 'کپی شد!',
+    copiedShort: 'کپی شد',
+    copyClashTip: 'کپی لینک کلش',
+    copyFailed: 'کپی ناموفق بود',
+    copyFailedShort: 'کپی ناموفق بود',
+    copyLinkBtn: 'کپی لینک',
+    copySingboxTip: 'کپی لینک سینگ‌باکس',
+    copySubLinkTip: 'کپی لینک اشتراک',
+    created: 'ایجاد شد',
+    createdPrefix: 'ایجاد شد! ',
+    customProvider: 'سفارشی',
+    delBtn: 'حذف',
+    deleted: 'حذف شد',
+    deletedSelected: 'موارد انتخاب‌شده حذف شدند',
+    detectionFailed: 'تشخیص ناموفق بود: ',
+    disconnectAllTip: 'قطع همه',
+    disconnected: 'قطع شد',
+    dohCopied: 'آدرس DOH کپی شد',
+    enterName: 'یک نام وارد کنید',
+    enterNameUrl: 'نام و آدرس را وارد کنید',
+    errorPrefix: 'خطا: ',
+    errorSavingSettings: 'خطا در ذخیره تنظیمات',
+    exportFailed: 'خروجی ناموفق بود',
+    failedPrefix: 'ناموفق: ',
+    failedToSend: 'ارسال ناموفق بود',
+    fillFields: 'فیلدها را پر کنید',
+    fillRequired: 'فیلدهای الزامی را پر کنید',
+    fillTokenChat: 'توکن و شناسه چت را وارد کنید',
+    flagDetected: 'پرچم شناسایی شد: ',
+    flagsUpdated: 'پرچم‌ها شناسایی و به‌روز شدند',
+    importFailed: 'ورود ناموفق بود',
+    importTxtFailed: 'ورود فایل txt ناموفق بود',
+    invalidAddress: 'آدرس نامعتبر است',
+    invalidJsonTemplates: 'JSON قالب‌ها نامعتبر است',
+    largeRange: 'رنج بزرگ: فقط {n} آی‌پی اول استخراج شد.',
+    links: 'لینک‌ها',
+    linksBtn: 'لینک‌ها',
+    listenerDisabled: '(شنونده غیرفعال)',
+    nameRequired: 'نام الزامی است',
+    noAddresses: 'آدرسی نیست',
+    noAddrsInFile: 'در فایل آدرسی یافت نشد',
+    noAddrsSelected: 'آدرسی انتخاب نشده است',
+    noAddrsToProcess: 'آدرسی برای پردازش نیست',
+    noChanges: 'تغییری شناسایی نشد',
+    noData: 'داده‌ای نیست',
+    noFlagFound: 'پرچمی یافت نشد',
+    noIpAvailable: 'آی‌پی در دسترسی نیست',
+    noItemsSelected: 'موردی انتخاب نشده است',
+    noLinksAssigned: 'لینکی اختصاص داده نشده است',
+    noProxyLines: 'خط پروکسی وجود ندارد',
+    noProxyLinesDefined: 'خط پروکسی تعریف نشده است',
+    noProxySelected: 'پروکسی انتخاب نشده است',
+    noReachableIps: 'آی‌پی در دسترسی یافت نشد',
+    noUsersYet: 'هنوز کاربری نیست',
+    noValidProxies: 'پروکسی معتبری نیست',
+    nothingToCopy: 'چیزی برای کپی نیست',
+    passwordUpdated: 'رمز عبور به‌روز شد',
+    profileCreated: 'پروفایل ایجاد شد',
+    promptMaxSess: 'حداکثر نشست‌های هم‌زمان این کاربر (۰ = نامحدود)',
+    providerTruncated: 'این ارائه‌دهنده آدرس‌های بیشتری دارد؛ فقط {n} تای اول بارگذاری شد.',
+    proxiesTested: 'همه پروکسی‌ها تست شدند',
+    proxyListenerDisabled: 'شنونده پروکسی غیرفعال است: ',
+    proxyWord: 'پروکسی',
+    pwTooShort: 'رمز عبور باید حداقل ۸ کاراکتر باشد',
+    pwWeak: 'رمز عبور باید شامل حروف بزرگ، حروف کوچک و عدد باشد',
+    qrTooLong: 'لینک برای QR بیش از حد طولانی است',
+    quotaLeft: 'باقیمانده سهمیه:',
+    regenUuidTip: 'تازه‌سازی شناسه',
+    resetDone: 'بازنشانی شد',
+    resolveFailed: 'حل ناموفق بود: ',
+    saved: 'ذخیره شد',
+    savedApplied: 'ذخیره و اعمال شد',
+    scanAllFailed: 'اسکن تمام شد: هیچ آدرسی پاسخ نداد. به‌نظر می‌رسد TCP خروجی این سرور مسدود است؛ اسکنر به یک VPS یا هاستی با TCP خروجی مجاز (پورت ۴۴۳) نیاز دارد.',
+    scanAllReady: '{n} آی‌پی از همه ارائه‌دهنده‌ها آماده است. دکمه اسکن را بزنید.',
+    failedProxiesDeleted: 'پروکسی‌های خراب حذف شدند',
+    scanNeedIPs: 'برای اسکن دست‌کم یک IP یا CIDR وارد کنید',
+    scanErrorEgress: 'خطای اسکنر: به‌نظر می‌رسد TCP خروجی این سرور مسدود است. اسکنر به یک VPS یا هاستی با TCP خروجی مجاز نیاز دارد.',
+    scanFinished: 'اسکن با موفقیت تمام شد.',
+    scanTooMany: 'حداکثر {max} آی‌پی مجاز است. شما {count} آی‌پی وارد کردید.',
+    sessionsOnLink: 'نشست‌های روی لینک:',
+    startBtn: 'شروع',
+    stopBtn: 'توقف',
+    subBtn: 'اشتراک',
+    subscriptionBtn: 'اشتراک',
+    testError: 'خطای تست',
+    testFailed: 'تست ناموفق بود',
+    testInboundTip: 'تست اینباند',
+    testMsgSent: 'پیام تست ارسال شد!',
+    testStopped: 'تست متوقف شد',
+    totalWord: 'مجموع',
+    updated: 'به‌روز شد',
+    userCreated: 'کاربر ایجاد شد',
+    userWord: 'کاربر',
+    testAll: 'تست همه',
+    yesWord: 'بله',
+    noWord: 'خیر',
+    disableWord: 'غیرفعال',
+    enableWord: 'فعال‌سازی',
+    noRulesYet: 'هنوز قانون مسیریابی نیست.',
+    uuidRegenerated: 'UUID تازه‌سازی شد',
+    xrayConfigTip: 'کانفیگ Xray',
   }
 };
 let stealthMode = false;
@@ -12611,7 +15810,7 @@ async function autoDetectFlagCreate() {
     }
   }
   if (!ipField) ipField = location.hostname;
-  if (!ipField) return toast('No IP available', true);
+  if (!ipField) return toast(t('noIpAvailable'), true);
   try {
     const r = await fetch('/api/auto-flag/' + encodeURIComponent(ipField));
     const data = await r.json();
@@ -12626,11 +15825,11 @@ async function autoDetectFlagCreate() {
         $m('flag-custom-create').style.display = 'block';
         $m('flag-custom-create').value = data.flag;
       }
-      toast('Flag detected: ' + data.flag.toUpperCase());
+      toast(t('flagDetected') + data.flag.toUpperCase());
     } else {
-      toast('No flag found');
+      toast(t('noFlagFound'));
     }
-  } catch(e) { toast('Auto-detect failed', true); }
+  } catch(e) { toast(t('autoDetectFailed'), true); }
 }
 
 async function autoDetectFlagEdit() {
@@ -12644,7 +15843,7 @@ async function autoDetectFlagEdit() {
     }
   }
   if (!ipField) ipField = location.hostname;
-  if (!ipField) return toast('No IP available', true);
+  if (!ipField) return toast(t('noIpAvailable'), true);
   try {
     const r = await fetch('/api/auto-flag/' + encodeURIComponent(ipField));
     const data = await r.json();
@@ -12659,11 +15858,11 @@ async function autoDetectFlagEdit() {
         $m('flag-custom-edit').style.display = 'block';
         $m('flag-custom-edit').value = data.flag;
       }
-      toast('Flag detected: ' + data.flag.toUpperCase());
+      toast(t('flagDetected') + data.flag.toUpperCase());
     } else {
-      toast('No flag found');
+      toast(t('noFlagFound'));
     }
-  } catch(e) { toast('Auto-detect failed', true); }
+  } catch(e) { toast(t('autoDetectFailed'), true); }
 }
 
 function setPanelLanguage(l) {
@@ -12722,6 +15921,7 @@ function setKeepAliveMode(mode) {
 function setTheme(t){
   theme=t;
   document.body.classList.toggle('light-mode',t==='light');
+  document.documentElement.classList.toggle('light-mode',t==='light');
   document.body.classList.toggle('blue-mode',t==='blue-dark');
   localStorage.setItem('theme',t);
   const themeBtn = document.getElementById('theme-toggle-btn');
@@ -12821,6 +16021,7 @@ function setLang(l){
   document.body.dir=l==='fa'?'rtl':'ltr';
   document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
+  document.querySelectorAll('[data-en-title]').forEach(el=>{const v=el.getAttribute('data-'+l+'-title');if(v)el.title=v;});
   localStorage.setItem('ll',l);
   document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   updateSettingsStatusLabels();
@@ -12836,6 +16037,88 @@ function setLang(l){
   const activeLangBtn = document.getElementById(`btn-lang-${l}`);
   if (activeLangBtn) activeLangBtn.classList.add('active');
 }
+function safeCall(fn){ try { const r = fn(); if (r && typeof r.catch === 'function') r.catch(e => console.error('init step failed', e)); } catch(e) { console.error('init step failed', e); } }
+let sessionRefreshTimer = null;
+function startSessionRefreshTimer(){
+  if (sessionRefreshTimer) return;
+  sessionRefreshTimer = setInterval(maybeRefreshSession, 60000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) maybeRefreshSession(); });
+}
+async function maybeRefreshSession(){
+  if (!isAuthenticated || document.hidden) return;
+  try {
+    const r = await fetch('/api/me', {credentials:'same-origin'});
+    if (!r.ok) return;
+    const d = await r.json();
+    if (typeof d.expires_in === 'number' && d.expires_in < 900) {
+      const rr = await fetch('/api/refresh', {method:'POST', credentials:'same-origin'});
+      if (rr.ok) console.log('Session refreshed');
+    }
+  } catch(e) {}
+}
+function showLinksSkeleton(){
+  const tb = $m('ltb');
+  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text3);">Loading inbounds…</td></tr>';
+  const em = $m('lempty');
+  if (em) em.style.display = 'none';
+}
+function showLogsSkeleton(){
+  const tb = $m('logs-tbody');
+  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3);">Loading logs…</td></tr>';
+}
+function setChartEmpty(canvasId, show, msg){
+  const cv = $m(canvasId);
+  if (!cv) return;
+  const box = cv.parentElement;
+  if (!box) return;
+  let note = box.querySelector('.chart-empty-note');
+  if (show) {
+    if (!note) { note = document.createElement('div'); note.className = 'chart-empty-note'; note.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:0.9rem;text-align:center;padding:12px;pointer-events:none;'; box.style.position = 'relative'; box.appendChild(note); }
+    note.textContent = msg || 'No data yet';
+    note.style.display = 'flex';
+  } else if (note) { note.style.display = 'none'; }
+}
+function initChartsSafe(){
+  try {
+  if (typeof Chart === 'undefined') {
+    setChartEmpty('tc', true, 'Chart library failed to load');
+    setChartEmpty('doughnut-chart', true, 'Chart library failed to load');
+    setChartEmpty('speed-chart', true, 'Chart library failed to load');
+    setTimeout(() => { if (typeof Chart !== 'undefined') { initChart(); initDoughnutChart(); initSpeedChart(); setChartEmpty('tc', false); setChartEmpty('doughnut-chart', false); setChartEmpty('speed-chart', false); updChart(); updDoughnutChart(); } }, 1500);
+    return;
+  }
+  try { initChart(); } catch(e) { console.error('initChart failed', e); setChartEmpty('tc', true, 'Chart failed to start'); }
+  try { initDoughnutChart(); } catch(e) { console.error('initDoughnutChart failed', e); setChartEmpty('doughnut-chart', true, 'Chart failed to start'); }
+  try { initSpeedChart(); } catch(e) { console.error('initSpeedChart failed', e); setChartEmpty('speed-chart', true, 'Chart failed to start'); }
+  } catch(e) { console.error('initChartsSafe failed', e); }
+}
+function updateExpiryPreview(which){
+  const isCreate = which === 'create';
+  const daysEl = $m(isCreate ? 'nd' : 'ed');
+  const prevEl = $m(isCreate ? 'expires-preview-create' : 'expires-preview-edit');
+  if (!daysEl || !prevEl) return;
+  const days = parseInt(daysEl.value) || 0;
+  if (!days) { if (isCreate) prevEl.textContent = ''; return; }
+  const d = new Date(Date.now() + days * 86400000);
+  prevEl.textContent = 'Expires on ' + d.toLocaleDateString('en-CA') + ' (' + days + ' days)';
+}
+function fillPortNotes(){
+  const p = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+  const c = $m('port-note-create'); if (c) c.textContent = p;
+  const e = $m('port-note-edit'); if (e) e.textContent = p;
+}
+async function refreshActiveUsers(btn){
+  if (btn) btn.disabled = true;
+  try { await loadActiveUsers(); toast('Active users refreshed at ' + getLocalTimeString()); } catch(e) { toast('Refresh failed', true); } finally { if (btn) btn.disabled = false; }
+}
+async function refreshTgProxyCard(btn){
+  if (btn) btn.disabled = true;
+  try { await loadTgProxyCard(); toast('Telegram proxy refreshed at ' + getLocalTimeString()); } catch(e) { toast('Refresh failed', true); } finally { if (btn) btn.disabled = false; }
+}
+async function refreshInbOutCard(btn){
+  if (btn) btn.disabled = true;
+  try { await loadInbOutCard(); toast('Inbounds refreshed at ' + getLocalTimeString()); } catch(e) { toast('Refresh failed', true); } finally { if (btn) btn.disabled = false; }
+}
 async function checkAuth() {
     if (sessionStorage.getItem('justLoggedOut') === '1') {
         sessionStorage.removeItem('justLoggedOut');
@@ -12845,9 +16128,9 @@ async function checkAuth() {
     }
 
     isInitialChecking = true;
-    await loadPanelInfo();
+    try { await loadPanelInfo(); } catch(e) { console.warn('loadPanelInfo failed', e); }
     try {
-        const r = await fetch('/api/me');
+        const r = await fetch('/api/me', {credentials:'same-origin'});
         if (r.status === 200 && (await r.json()).authenticated) {
             isAuthenticated = true;
             isInitialChecking = false;
@@ -12882,31 +16165,38 @@ async function authenticatedFetch(url, options = {}) {
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
 async function showDashboard(){
   isAuthenticated=true;
+  try {
+    const dashPrefix = window.panelPrefix ? '/' + window.panelPrefix : '';
+    const dashPath = dashPrefix + '/panel';
+    if (window.location.pathname !== dashPath) window.history.replaceState({}, '', dashPath);
+  } catch(e) {}
   $m('login-page').style.display='none';
   $m('dashboard-page').style.display='';
-  await loadGeneralSettings();
+  showLinksSkeleton();
+  showLogsSkeleton();
+  try { await loadGeneralSettings(); } catch(e) { console.error('loadGeneralSettings failed', e); }
   if (!localStorage.getItem('ll')) {
     const defLang = $m('set-default-lang')?.value || 'en';
     if (defLang) setLang(defLang);
   }
-  initChart();
-  initDoughnutChart();
-  initSpeedChart();
-  await loadStats();
-  loadLinks();
-  loadAddrs();
-  loadLogs();
-  loadLoginLogs();
-  buildProviderPills();
-  loadTelegramSettings();
-  loadIpProfiles();
-  buildDohUI();
-  loadMultiPanel();
-  loadProxyLines();
+  safeCall(initChartsSafe);
+  safeCall(loadStats);
+  safeCall(loadLinks);
+  safeCall(loadAddrs);
+  safeCall(loadLogs);
+  safeCall(loadLoginLogs);
+  safeCall(buildProviderPills);
+  safeCall(loadTelegramSettings);
+  safeCall(loadIpProfiles);
+  safeCall(buildDohUI);
+  safeCall(loadMultiPanel);
+  safeCall(loadProxyLines);
+  safeCall(fillPortNotes);
   setLang(lang);
   startPanelClock();
   syncGlassThemeButtons();
   startSSE();
+  startSessionRefreshTimer();
   if (stealthMode) {
     const scannerPage = $m('page-ipscanner');
     if (scannerPage) scannerPage.style.display = 'none';
@@ -12917,11 +16207,6 @@ async function showDashboard(){
   }
   buildProfileTabs();
 
-  const prefix = window.panelPrefix ? '/' + window.panelPrefix : '';
-  const newPath = prefix + '/panel';
-  if (window.location.pathname !== newPath) {
-    window.history.replaceState({}, '', newPath);
-  }
 }
 
 function startPanelClock() {
@@ -12932,20 +16217,31 @@ function startPanelClock() {
   }, 1000);
 }
 
+let loginPending=false;
 async function doLogin(){
+    if(loginPending) return;
+    loginPending=true;
+    const btn=$m('login-btn');
+    if(btn) btn.disabled=true;
     const pw=$m('login-pw').value;
     $m('login-err').style.display='none';
     try{
-        const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+        const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({password:pw})});
         if(r.ok){
             $m('login-pw').value='';
-            showDashboard();
+            try{ await showDashboard(); }catch(e){ console.error('Dashboard init error', e); toast('Logged in, but the dashboard failed to initialise. Reload the page.', true); }
+        } else if(r.status===429){
+            $m('login-err').textContent='Too many attempts, try again later';
+            $m('login-err').style.display='block';
         } else {
             $m('login-err').style.display='block';
         }
-    } catch {
-        console.error('Login error');
+    } catch(e){
+        console.error('Login error', e);
         $m('login-err').style.display='block';
+    } finally {
+        loginPending=false;
+        if(btn) btn.disabled=false;
     }
 }
 
@@ -12963,104 +16259,75 @@ async function loadInbOutCard(){
     const di=await a.json(), dout=await b.json(), dpro=await c.json();
     const proto=(dpro.protocols||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.id||'')+'</b><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.description||'')+'</div></div>').join('')||'<div>No protocols</div>';
     const inb=(di.inbounds||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.tag||'')+'</b> <span class="tag">'+esc(x.type||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.path||'')+' · port: '+esc(String(x.port||''))+'</div><div style="color:var(--text3);font-size:0.85rem;">'+esc((x.protocols||[]).join(', '))+'</div>'+(x.note?'<div style="color:var(--text3);font-size:0.85rem;">'+esc(x.note)+'</div>':'')+'</div>').join('')||'<div>No inbounds</div>';
-    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.flag||'')+' '+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>No proxy lines</div>';
-    $m('inb-out-body').innerHTML='<div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Inbounds (WS/XHTTP on $PORT)</div>'+inb+'<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">SOCKS5 port: '+esc(String(di.socks_port||0))+' · MTProto port: '+esc(String(di.mtproxy_port||0))+'</div></div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Outbounds (proxy lines)</div>'+out+'</div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Protocols</div>'+proto+'</div>';
+    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.flag||'')+' '+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>' + t('noProxyLines') + '</div>';
+    $m('inb-out-body').innerHTML='<div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Inbounds (WS/XHTTP on port ' + esc(String(di.panel_port || window.location.port || '')) + ')</div>'+inb+'<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">SOCKS5 port: '+esc(String(di.socks_port||0))+' · MTProto port: '+esc(String(di.mtproxy_port||0))+'</div></div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Outbounds (proxy lines)</div>'+out+'</div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">Protocols</div>'+proto+'</div>';
   }catch(e){ const b=$m('inb-out-body'); if(b) b.innerHTML='<div>Failed to load</div>'; }
 }
+function tgProxyLinkRow(label, url){
+  if(!url) return '';
+  return '<div class="tg-link-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b>'+label+'</b><button class="btn btn-outline btn-sm" onclick="cpLink(\''+esc(url)+'\')">Copy</button><button class="btn btn-outline btn-sm" onclick="toggleRowLink(this)">Show link</button></div><div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="'+esc(url)+'" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">Copy link text</button></div>';
+}
+function toggleRowLink(btn){
+  let box = null;
+  const cell = btn.closest('td');
+  if(cell) box = cell.querySelector('.row-link-text');
+  if(!box) box = btn.parentElement.nextElementSibling;
+  if(box && box.classList.contains('row-link-text')){
+    const show = box.style.display === 'none';
+    box.style.display = show ? 'block' : 'none';
+    if(btn.textContent === 'Show link' || btn.textContent === 'Hide link') btn.textContent = show ? 'Hide link' : 'Show link';
+  }
+}
 async function loadTgProxyCard(){
+  const btn = $m('tg-proxy-refresh-btn');
+  const body = $m('tg-proxy-body');
+  if(btn){ btn.disabled = true; btn.textContent = 'Refreshing…'; }
   try{
-    const r=await authenticatedFetch('/api/telegram-proxy');
-    const d=await r.json();
-    const linkRow=(label,url)=>url?'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b>'+label+'</b><span style="word-break:break-all;font-size:0.85rem;">'+esc(url)+'</span><button class="btn btn-outline btn-sm" onclick="cpLink(\''+esc(url)+'\')">Copy</button></div>':'';
-    const notes=(d.notes||[]).map(n=>'<li style="margin-bottom:4px;">'+esc(n)+'</li>').join('');
-    $m('tg-proxy-body').innerHTML='<div style="color:var(--text3);font-size:0.9rem;margin-bottom:8px;">SOCKS5: '+(d.socks&&d.socks.enabled?'running on port '+esc(String(d.socks_port||'')):'disabled')+' · MTProto: '+(d.mtproxy&&d.mtproxy.enabled?'running on port '+esc(String(d.mtproxy_port||'')):'disabled')+' · Domain: '+esc(d.domain||'')+'</div>'+linkRow('MTProto',d.mtproxy_link)+linkRow('MTProto Fake-TLS',d.mtproxy_faketls_link)+linkRow('MTProto padded',d.mtproxy_dd_link)+'<ul style="margin:10px 0 0 18px;color:var(--text3);font-size:0.85rem;">'+notes+'</ul>';
-  }catch(e){ const b=$m('tg-proxy-body'); if(b) b.innerHTML='<div>Failed to load</div>'; }
-}
-async function loadRegionsForSelect(selectId, selected){
-  try{
-    const r = await authenticatedFetch('/api/regions');
+    const r = await authenticatedFetch('/api/telegram-proxy');
+    if(!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-    const sel = $m(selectId);
-    if(!sel) return;
-    sel.innerHTML = '<option value="">None (auto / routing rules)</option>';
-    (d.regions || []).forEach(x => { sel.innerHTML += `<option value="${esc(x.id)}"${x.id === selected ? ' selected' : ''}>${esc(x.name)} (${esc(x.id)})</option>`; });
-    if(selected) sel.value = selected;
-  }catch(e){}
+    const updated = new Date().toLocaleTimeString();
+    const pill = (on) => on ? '<span class="tag tag-on">enabled</span>' : '<span class="tag tag-off">disabled</span>';
+    const protoRow = (name, st, port, note) => '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+name+'</b>'+pill(st && st.enabled)+'<span style="color:var(--text3);font-size:0.85rem;">'+(port ? 'port ' + esc(String(port)) : 'no port')+'</span><span style="color:var(--text3);font-size:0.85rem;">'+note+'</span></div>';
+    const rawNote = d.single_port_host ? 'Not available on this host: a single HTTPS port cannot publish raw TCP listeners.' : 'Raw TCP listener, needs a VPS or Railway TCP Proxy.';
+    const domainWarn = d.domain === 'localhost' ? ' <span style="color:var(--red);">Localhost is not a usable Telegram domain. Set DOMAIN or open the panel through its public URL.</span>' : '';
+    let html = '<div style="color:var(--text3);font-size:0.9rem;margin-bottom:8px;">Domain: <b style="color:var(--text);">'+esc(d.domain || '')+'</b> <span style="font-size:0.8rem;">(' + esc(d.domain_source || '') + ')</span>' + domainWarn + '</div>';
+    html += protoRow('SOCKS5', d.socks, d.socks_port, rawNote);
+    html += protoRow('MTProto', d.mtproxy, d.mtproxy_port, rawNote + ' Each inbound has its own derived secret.');
+    html += protoRow('WEB', d.webproxy, (d.webproxy && d.webproxy.port) || 0, (d.webproxy && d.webproxy.enabled) ? 'Rides the panel HTTPS port, works on this host.' : 'Not configured (needs SECRET_KEY).');
+    html += protoRow('HTTP', d.http, d.http_port, rawNote);
+    if(d.webproxy_link){ html += tgProxyLinkRow('WEB proxy link (port 443)', d.webproxy_link); }
+    else if(d.webproxy && d.webproxy.enabled){ html += '<div style="color:var(--text3);font-size:0.85rem;padding:6px 0;">WEB proxy is enabled but no port-443 link exists yet. Create a WEB proxy inbound on port 443 to get a working tg://webproxy link.</div>'; }
+    html += '<div style="color:var(--text3);font-size:0.85rem;padding:6px 0;">Bot: ' + (d.bot_configured ? 'configured' : 'not configured — add Bot Token and Chat ID above, then press Test.') + '</div>';
+    if((d.next_steps || []).length){ html += '<div style="margin-top:8px;"><b>What to do next</b><ol style="margin:6px 0 0 18px;color:var(--text2);font-size:0.9rem;">' + d.next_steps.map(s => '<li style="margin-bottom:4px;">' + esc(s) + '</li>').join('') + '</ol></div>'; }
+    if((d.deployment_notes || []).length){ html += '<details style="margin-top:10px;"><summary style="cursor:pointer;color:var(--text2);">Deployment notes</summary><ul style="margin:8px 0 0 18px;color:var(--text3);font-size:0.85rem;">' + d.deployment_notes.map(n => '<li style="margin-bottom:4px;">' + esc(n) + '</li>').join('') + '</ul></details>'; }
+    html += '<div style="color:var(--text3);font-size:0.8rem;margin-top:10px;">Updated ' + esc(updated) + '</div>';
+    if(body) body.innerHTML = html;
+    toast('Telegram proxy status updated');
+  }catch(e){ if(body) body.innerHTML = '<div>Failed to load Telegram proxy status. Press Refresh to retry.</div>'; toast('Failed to load Telegram proxy status', true); }
+  finally{ if(btn){ btn.disabled = false; btn.textContent = 'Refresh'; } }
 }
-async function loadRegionsCard(){
-  try{
-    const r = await authenticatedFetch('/api/regions');
-    const d = await r.json();
-    const tb = $m('regions-body');
-    const preset = $m('new-region-preset');
-    if(preset && preset.options.length <= 1){ (d.presets || []).forEach(p => { const o = document.createElement('option'); o.value = p.code; o.textContent = p.name + ' (' + p.code + ')'; preset.appendChild(o); }); preset.onchange = () => { const p = (d.presets || []).find(x => x.code === preset.value); if(p){ $m('new-region-code').value = p.code; $m('new-region-name').value = p.name; } }; }
-    if(tb){
-      tb.innerHTML = '<table class="tbl"><thead><tr><th>Code</th><th>Name</th><th>SOCKS5</th><th>Status</th><th>Health</th><th>Source</th><th>Actions</th></tr></thead><tbody>' + ((d.regions || []).map(x => `<tr><td style="font-weight:600;">${esc(x.id)}</td><td>${esc(x.name)}</td><td>${esc(x.socks_host)}:${esc(String(x.socks_port))}</td><td>${esc(x.status)}</td><td>${esc(x.health)}${x.last_check ? ' (' + esc(x.last_check.slice(0,16).replace('T',' ')) + ')' : ''}</td><td>${esc(x.source)}</td><td style="white-space:nowrap;"><button class="btn btn-outline btn-sm" onclick="checkRegion('${esc(x.id)}')">Check</button> ${x.status === 'active' ? `<button class="btn btn-outline btn-sm" onclick="setRegionStatus('${esc(x.id)}','stop')">Stop</button>` : `<button class="btn btn-outline btn-sm" onclick="setRegionStatus('${esc(x.id)}','start')">Start</button>`} <button class="btn btn-danger btn-sm" onclick="deleteRegion('${esc(x.id)}')">Delete</button></td></tr>`).join('') || '<tr><td colspan="7">No regions yet — add one below.</td></tr>') + '</tbody></table>' + ((d.notes || []).map(n => '<div style="font-size:0.85rem;color:var(--text3);margin-top:6px;">' + esc(n) + '</div>').join(''));
-    }
-    const rr = await authenticatedFetch('/api/routing-rules');
-    const dr = await rr.json();
-    const rb = $m('rules-body');
-    if(rb){
-      rb.innerHTML = '<table class="tbl"><thead><tr><th>Rule</th><th>Match</th><th>Region</th><th>Priority</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>' + ((dr.rules || []).map(x => `<tr><td>${esc(x.name)}</td><td>${esc(x.match_type)}: ${esc(x.match_value || '*')}</td><td>${esc(x.region_id)}</td><td>${esc(String(x.priority))}</td><td>${x.enabled ? 'yes' : 'no'}</td><td style="white-space:nowrap;"><button class="btn btn-outline btn-sm" onclick="toggleRoutingRule('${esc(x.id)}', ${x.enabled ? 0 : 1})">${x.enabled ? 'Disable' : 'Enable'}</button> <button class="btn btn-danger btn-sm" onclick="deleteRoutingRule('${esc(x.id)}')">Delete</button></td></tr>`).join('') || '<tr><td colspan="6">No routing rules yet.</td></tr>') + '</tbody></table>';
-    }
-    const rsel = $m('new-rule-region');
-    if(rsel){ rsel.innerHTML = '<option value="">Region…</option>'; (d.regions || []).forEach(x => { rsel.innerHTML += `<option value="${esc(x.id)}">${esc(x.name)} (${esc(x.id)})</option>`; }); }
-  }catch(e){ const b=$m('regions-body'); if(b) b.innerHTML='<div>Failed to load</div>'; }
-}
-async function createRegion(){
-  const code = $m('new-region-code').value.trim().toLowerCase();
-  const name = $m('new-region-name').value.trim();
-  const host = $m('new-region-host').value.trim() || '127.0.0.1';
-  const port = $m('new-region-port').value.trim();
-  if(!code) return toast('Region code required', true);
-  try{
-    const r = await authenticatedFetch('/api/regions', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code, name, socks_host: host, socks_port: port ? parseInt(port) : 0})});
-    if(!r.ok) throw new Error((await r.json()).detail || r.status);
-    toast('Region added'); loadRegionsCard();
-  }catch(e){ toast('Error: ' + e.message, true); }
-}
-async function checkRegion(id){ try{ const r = await authenticatedFetch('/api/regions/' + id + '/check', {method:'POST'}); const d = await r.json(); toast(d.ok ? 'Region SOCKS5 reachable' : 'Region SOCKS5 unreachable', !d.ok); loadRegionsCard(); }catch(e){ toast('Error', true); } }
-async function setRegionStatus(id, action){ try{ await authenticatedFetch('/api/regions/' + id + '/' + action, {method:'POST'}); toast(action === 'start' ? 'Region started' : 'Region stopped'); loadRegionsCard(); }catch(e){ toast('Error', true); } }
-async function deleteRegion(id){ if(!confirm('Delete region ' + id + '? Links using it lose their region.')) return; try{ await authenticatedFetch('/api/regions/' + id, {method:'DELETE'}); toast('Deleted'); loadRegionsCard(); }catch(e){ toast('Error', true); } }
-async function probeRegions(){
-  try{
-    const r = await authenticatedFetch('/api/regions/probe', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
-    const d = await r.json();
-    $m('probe-result').textContent = d.live.length ? ('Live SOCKS5 on ' + d.host + ': ' + d.live.join(', ')) : ('No live SOCKS5 in ' + d.range + ' on ' + d.host);
-  }catch(e){ toast('Error', true); }
-}
-async function createRoutingRule(){
-  const match_type = $m('new-rule-type').value;
-  const match_value = $m('new-rule-value').value.trim();
-  const region_id = $m('new-rule-region').value;
-  const priority = parseInt($m('new-rule-priority').value) || 0;
-  if(!region_id) return toast('Choose a region', true);
-  try{
-    const r = await authenticatedFetch('/api/routing-rules', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({match_type, match_value, region_id, priority})});
-    if(!r.ok) throw new Error((await r.json()).detail || r.status);
-    toast('Rule added'); loadRegionsCard();
-  }catch(e){ toast('Error: ' + e.message, true); }
-}
-async function toggleRoutingRule(id, enabled){ try{ await authenticatedFetch('/api/routing-rules/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: !!enabled})}); loadRegionsCard(); }catch(e){ toast('Error', true); } }
-async function deleteRoutingRule(id){ if(!confirm('Delete this routing rule?')) return; try{ await authenticatedFetch('/api/routing-rules/' + id, {method:'DELETE'}); loadRegionsCard(); }catch(e){ toast('Error', true); } }
 function switchPage(id){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   $m('page-'+id).classList.add('active');
   document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
   document.querySelectorAll('.mobile-nav .nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
   if (id === 'inbounds') {
+    loadLinks();
     loadProxyLines();
     loadInbOutCard();
-    loadRegionsCard();
-  }
-  if (id === 'users') {
-    loadUsersPage();
   }
   if (id === 'active-users') {
     loadActiveUsers();
   }
   if (id === 'telegram') {
     loadTgProxyCard();
+  }
+  if (id === 'ipscanner') {
+    try { buildProviderPills(); } catch (e) { console.error('Provider pills failed', e); }
+  }
+  if (id === 'addresses') {
+    loadAddrs();
   }
 }
 function toast(msg, err = false) {
@@ -13087,7 +16354,7 @@ function fmtLim(b) {
 function fmtExp(ea) {
     if (!ea || ea === 0) return '∞';
     const d = new Date(ea) - new Date();
-    if (d <= 0) return 'Expired';
+    if (d <= 0) return t('expired');
     const days = Math.floor(d / 86400000);
     if (days > 0) return days + 'd';
     const hours = Math.floor(d / 3600000);
@@ -13136,44 +16403,62 @@ function renderLinks(links) {
               mc2 = l.max_connections || 0,
               check = selectedUids.has(l.uuid) ? 'checked' : '',
               flagEmoji = l.flag ? codeToFlag(l.flag) : '',
-              labelDisplay = (flagEmoji ? flagEmoji + ' ' : '') + esc(l.label) + (l.proxy && !l.proxy.enabled ? ' <span style="color:var(--red);font-size:0.8rem;">(listener disabled)</span>' : ''),
-              udpEnabled = l.udp_enabled !== undefined ? l.udp_enabled : true;
+              labelDisplay = (flagEmoji ? flagEmoji + ' ' : '') + esc(l.label) + (l.proxy && !l.proxy.enabled ? ' <span style="color:var(--red);font-size:0.8rem;">' + t('listenerDisabled') + '</span>' : ''),
+              udpEnabled = l.udp_enabled !== undefined ? l.udp_enabled : true,
+              isProxy = ['socks5', 'mtproto', 'webproxy', 'http-proxy'].includes(l.protocol),
+              nativeLink = l.vless_link || (l.proxy && l.proxy.protocol_link) || '',
+              linkTextBox = nativeLink ? `<div class="row-link-text" style="display:none;width:100%;"><input readonly value="${esc(nativeLink)}" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font-size:0.8rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">Copy link text</button></div>` : '';
 
         tableBuffer += `<tr>
           <td><input type="checkbox" value="${esc(l.uuid)}" ${check} onchange="toggleSelectUid('${esc(l.uuid)}')"></td>
           <td data-label="Name" style="font-weight:600">${labelDisplay}</td>
+          <td data-label="Owner">${esc(l.owner_name || '')}</td>
           <td data-label="Type"><span class="tag tag-vless">${esc(protoShort(l.protocol))}</span></td>
-          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td>
+          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used num">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="num">${fmtLim(lim)}</span></div><div style="font-size:0.8rem;color:var(--text2)">Remaining ${lim ? fmtB(Math.max(0, lim - u)) : '∞'}</div></td>
           <td data-label="Conns">${cc}/${mc2 || '∞'}</td>
           <td data-label="Expiry" style="color:${ec}">${ex}</td>
           <td data-label="Status"><span class="tag ${l.active ? 'tag-on' : 'tag-off'}">${l.active ? t('on') : t('off')}</span></td>
           <td data-label="Actions" style="min-width:140px;">
-            <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
-              <button class="toggle ${l.active ? 'on' : ''}" data-uid="${esc(l.uuid)}" onclick="togLink(this)"></button>
-              <div style="display:flex; flex-wrap:wrap; gap:4px; justify-content:center;">
+            <div style="display:flex; flex-wrap:nowrap; gap:4px; justify-content:flex-start; align-items:center;">
+              <button class="toggle ${l.active ? 'on' : ''}" data-uid="${esc(l.uuid)}" onclick="togLink(this)" title="On / Off"></button>
+              <div class="act-icons" style="display:flex; flex-wrap:nowrap; gap:4px; justify-content:flex-start;">
                 ${l.label === 'This Server is Free' ? `
                   <span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(l.vless_link)}')">📋</button><span class="tooltip-text">${t('copy')}</span></span>
                   <span class="tooltip-container"><button class="act-btn act-sub" onclick="cpSub('${esc(l.uuid)}')">🔗</button><span class="tooltip-text">${t('sub')}</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">🐱</button><span class="tooltip-text">Copy Clash Link</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">🧩</button><span class="tooltip-text">Copy Sing‑Box Link</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">🐱</button><span class="tooltip-text">${t('copyClashTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">🧩</button><span class="tooltip-text">${t('copySingboxTip')}</span></span>
                   <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(l.vless_link)}')">📷</button><span class="tooltip-text">${t('qr')}</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyXrayConfig('${esc(l.uuid)}')">⚙️</button><span class="tooltip-text">Xray Config</span></span>
+                  <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">👁</button><span class="tooltip-text">Show link text</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" style="width:auto;padding:0 10px;font-size:0.75rem;font-weight:700;" onclick="copyXrayConfig('${esc(l.uuid)}')">Xray</button><span class="tooltip-text">${t('xrayConfigTip')}</span></span>
+                ` : (isProxy ? `
+                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">✏️</button><span class="tooltip-text">${t('edit')}</span></span>
+                  ${nativeLink ? `<span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(nativeLink)}')">📋</button><span class="tooltip-text">Copy proxy link</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(nativeLink)}')">📷</button><span class="tooltip-text">${t('qr')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-sub" onclick="copySubLink('${esc(l.uuid)}')">📎 ${t('subBtn')}</button><span class="tooltip-text">Copy Subscription Link (proxy link only)</span></span>
+                  <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">👁</button><span class="tooltip-text">Show link text</span></span>` : `<span style="color:var(--red);font-size:0.8rem;">listener disabled — no working link</span>`}
+                  <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">🗑️</button><span class="tooltip-text">${t('del')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="regenerateUUID('${esc(l.uuid)}')">🔄</button><span class="tooltip-text">${t('regenUuidTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">🧪</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-del" onclick="disconnectLink('${esc(l.uuid)}')">🔌</button><span class="tooltip-text">${t('disconnectAllTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="cloneLink('${esc(l.uuid)}')">🐑</button><span class="tooltip-text">${t('cloneTip')}</span></span>
                 ` : `
                   <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">✏️</button><span class="tooltip-text">${t('edit')}</span></span>
                   <span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(l.vless_link)}')">📋</button><span class="tooltip-text">${t('copy')}</span></span>
                   <span class="tooltip-container"><button class="act-btn act-sub" onclick="cpSub('${esc(l.uuid)}')">🔗</button><span class="tooltip-text">${t('sub')}</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">🐱</button><span class="tooltip-text">Copy Clash Link</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">🧩</button><span class="tooltip-text">Copy Sing‑Box Link</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">🐱</button><span class="tooltip-text">${t('copyClashTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">🧩</button><span class="tooltip-text">${t('copySingboxTip')}</span></span>
                   <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(l.vless_link)}')">📷</button><span class="tooltip-text">${t('qr')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">👁</button><span class="tooltip-text">Show link text</span></span>
                   <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">🗑️</button><span class="tooltip-text">${t('del')}</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="regenerateUUID('${esc(l.uuid)}')">🔄</button><span class="tooltip-text">Regenerate UUID</span></span>
-                  <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">🧪</button><span class="tooltip-text">Test inbound</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-del" onclick="disconnectLink('${esc(l.uuid)}')">🔌</button><span class="tooltip-text">Disconnect All</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-sub" onclick="copySubLink('${esc(l.uuid)}')">📎 Sub</button><span class="tooltip-text">Copy Subscription Link</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="cloneLink('${esc(l.uuid)}')">🐑</button><span class="tooltip-text">Clone</span></span>
-                  <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyXrayConfig('${esc(l.uuid)}')">⚙️</button><span class="tooltip-text">Xray Config</span></span>
-                `}
+                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="regenerateUUID('${esc(l.uuid)}')">🔄</button><span class="tooltip-text">${t('regenUuidTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">🧪</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-del" onclick="disconnectLink('${esc(l.uuid)}')">🔌</button><span class="tooltip-text">${t('disconnectAllTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-sub" onclick="copySubLink('${esc(l.uuid)}')">📎 ${t('subBtn')}</button><span class="tooltip-text">${t('copySubLinkTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-edit" onclick="cloneLink('${esc(l.uuid)}')">🐑</button><span class="tooltip-text">${t('cloneTip')}</span></span>
+                  <span class="tooltip-container"><button class="act-btn act-clash" style="width:auto;padding:0 10px;font-size:0.75rem;font-weight:700;" onclick="copyXrayConfig('${esc(l.uuid)}')">Xray</button><span class="tooltip-text">${t('xrayConfigTip')}</span></span>
+                `)}
               </div>
+              ${linkTextBox}
             </div>
           </td>
         </tr>`;
@@ -13189,44 +16474,32 @@ function copyXrayConfig(uid) {
 function copySingboxLink(uid) { const prefix = window.panelPrefix ? '/' + window.panelPrefix : ''; copyToClipboard('https://' + location.host + prefix + '/sub/' + uid + '/singbox'); }
 function toggleSelectUid(uid){selectedUids.has(uid)?selectedUids.delete(uid):selectedUids.add(uid);}
 function toggleSelectAll(){const all=$m('select-all');const boxes=document.querySelectorAll('#ltb input[type=checkbox]');if(all.checked){boxes.forEach(c=>{c.checked=true;selectedUids.add(c.value);});}else{boxes.forEach(c=>{c.checked=false;selectedUids.clear();});}}
-function batchAction(action) {
-    if (selectedUids.size === 0) return toast('No items selected', true);
-    if (action === 'delete' && !confirm('Delete selected?')) return;
+async function batchAction(action) {
+    if (selectedUids.size === 0) return toast(t('noItemsSelected'), true);
+    if (action === 'delete' && !(await confirmDialog(t('confirmDeleteSelected'), t('del')))) return;
     authenticatedFetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})})
     .then(async (r)=>{
       if(!r.ok){const d = await r.json();toast(d.detail || 'Error', true);}
       else {selectedUids.clear(); loadLinks(); loadStats();}
     });
 }
-async function regenerateUUID(uid){const r=await authenticatedFetch('/api/links/'+uid+'/new-uuid',{method:'POST'});if(r.ok){loadLinks();toast('UUID regenerated');}else{toast('Failed: '+((await r.json()).detail||r.status),true);}}
-async function testInbound(uid){try{const r=await authenticatedFetch('/api/links/'+uid+'/test',{method:'POST'});const d=await r.json();toast((d.ok?'OK':'FAIL')+' ('+d.protocol+', '+d.latency_ms+'ms): '+d.detail, !d.ok);}catch(e){toast('Test error',true);}}
-async function disconnectLink(uid){await authenticatedFetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast('Disconnected');loadLinks();}
+async function regenerateUUID(uid){const r=await authenticatedFetch('/api/links/'+uid+'/new-uuid',{method:'POST'});if(r.ok){loadLinks();toast(t('uuidRegenerated'));}else{toast(t('failedPrefix')+((await r.json()).detail||r.status),true);}}
+async function testInbound(uid){try{const r=await authenticatedFetch('/api/links/'+uid+'/test',{method:'POST'});const d=await r.json();toast((d.ok?'OK':'FAIL')+' ('+d.protocol+', '+d.latency_ms+'ms): '+d.detail, !d.ok);}catch(e){toast(t('testError'),true);}}
+async function disconnectLink(uid){await authenticatedFetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast(t('disconnected'));loadLinks();}
 let sortCol='created_at',sortDir='desc';
 function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='desc';}allLinks.sort((a,b)=>{let va=a[sortCol]??'',vb=b[sortCol]??'';if(sortCol==='used_bytes'){va=Number(va);vb=Number(vb);}else if(sortCol==='expires_at'){va=va||'';vb=vb||'';}if(va<vb)return sortDir==='asc'?-1:1;if(va>vb)return sortDir==='asc'?1:-1;return 0;});filterLinks();}
-async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await authenticatedFetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
+async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await authenticatedFetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast(t('failed'),true);}}
 function showQuickAdd(){$m('mo-quick-add').classList.add('show');}
-async function quickCreate(){const label=$m('quick-label').value.trim()||'User-'+Math.random().toString(36).slice(2,8);const limit=parseFloat($m('quick-limit').value)||0;const days=parseInt($m('quick-days').value)||0;try{const r=await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:limit,limit_unit:'GB',days_valid:days})});if(!r.ok)throw new Error((await r.json()).detail);const data=await r.json();$m('mo-quick-add').classList.remove('show');const userUrl='https://'+location.host+'/user/'+data.uuid;toast('Created! '+userUrl);loadLinks();loadStats();}catch(e){toast('Error: '+e.message,true);}}
-async function cloneLink(uid){try{const r=await authenticatedFetch('/api/links/'+uid+'/clone',{method:'POST'});if(!r.ok)throw new Error((await r.json()).detail);toast('Cloned successfully');loadLinks();loadStats();}catch(e){toast('Error: '+e.message,true);}}
+async function quickCreate(){const label=$m('quick-label').value.trim()||'User-'+Math.random().toString(36).slice(2,8);const limit=parseFloat($m('quick-limit').value)||0;const days=parseInt($m('quick-days').value)||0;try{const r=await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:limit,limit_unit:'GB',days_valid:days})});if(!r.ok)throw new Error((await r.json()).detail);const data=await r.json();$m('mo-quick-add').classList.remove('show');const userUrl='https://'+location.host+'/user/'+data.uuid;toast(t('createdPrefix')+userUrl);loadLinks();loadStats();}catch(e){toast(t('errorPrefix')+e.message,true);}}
+async function cloneLink(uid){try{const r=await authenticatedFetch('/api/links/'+uid+'/clone',{method:'POST'});if(!r.ok)throw new Error((await r.json()).detail);toast(t('clonedOk'));loadLinks();loadStats();}catch(e){toast(t('errorPrefix')+e.message,true);}}
 function showAddMo(){
   $m('mo-add').classList.add('show');
+  updateExpiryPreview('create');
+  fillPortNotes();
   toggleProxyFields('create');
   loadIpProfilesForSelect();
   loadProxyOptionsCreate();
-  loadOwnerUsers('aowner-user', '');
-  loadRegionsForSelect('aregion', '');
-}
-async function loadOwnerUsers(selectId, selected){
-  try{
-    const r = await authenticatedFetch('/api/users');
-    const data = await r.json();
-    const sel = $m(selectId);
-    if(!sel) return;
-    sel.innerHTML = '<option value="">None</option>';
-    (data.users || []).forEach(u => {
-      sel.innerHTML += `<option value="${u.id}"${u.id === selected ? ' selected' : ''}>${esc(u.name)}</option>`;
-    });
-    if(selected) sel.value = selected;
-  }catch(e){}
+  $m('proxy-line-text-create').value = '';
 }
 function protoShort(p){
   p = p || 'vless-ws';
@@ -13249,60 +16522,26 @@ function renderActiveUsers(sessions){
   if(!sessions || !sessions.length){ box.innerHTML = '<div style="color:var(--text2);">No active users</div>'; return; }
   box.innerHTML = sessions.map(s => `<div class="card" style="margin:0;padding:12px;">
     <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>${esc(s.label || s.uid || '')}</b><span class="tag tag-vless">${esc(s.protocol || '')}</span></div>
-    <div style="font-size:0.85rem;color:var(--text2);margin-top:6px;">${esc(s.user || '')} · ${esc(s.inbound_tag || '')}${s.region ? ' · ' + esc(s.region) : ''} · ${esc(s.outbound_mode || '')}</div>
+    <div style="font-size:0.85rem;color:var(--text2);margin-top:6px;">${esc(s.user || '')} · ${esc(s.inbound_tag || '')}${s.outbound_proxy ? ' · ' + esc(s.outbound_proxy) : ''} · ${esc(s.outbound_mode || '')}</div>
     <div style="font-size:0.85rem;margin-top:6px;">↑ ${fmtBps(s.up_bps)} &nbsp; ↓ ${fmtBps(s.down_bps)}</div>
-    <div style="font-size:0.85rem;">Total ↑ ${fmtB(s.bytes_up)} &nbsp; ↓ ${fmtB(s.bytes_down)}</div>
+    <div style="font-size:0.85rem;">${t('totalWord')} ↑ <span class="num">${fmtB(s.bytes_up)}</span> &nbsp; ↓ <span class="num">${fmtB(s.bytes_down)}</span></div>
     <div style="font-size:0.85rem;color:var(--text2);">IP ${esc(s.client_ip || '')} · Since ${esc(s.started_at || '')}</div>
-    <div style="font-size:0.85rem;">Quota left: ${s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : fmtB(s.quota_remaining)} · Sessions on link: ${s.link_sessions}/${s.max_connections || '∞'}</div>
+    <div style="font-size:0.85rem;">${t('quotaLeft')} ${s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>'} · ${t('sessionsOnLink')} ${s.link_sessions}/${s.max_connections || '∞'}</div>
     <button class="btn btn-danger btn-sm" style="margin-top:8px;" onclick="disconnectActiveUser('${esc(s.conn_id)}')">Disconnect</button>
   </div>`).join('');
 }
 async function loadActiveUsers(){
   try{
+    const box = $m('active-users-cards');
+    if (box && !box.innerHTML.trim()) box.innerHTML = '<div style="color:var(--text3);">Loading…</div>';
     const r = await authenticatedFetch('/api/active-users');
     const d = await r.json();
     renderActiveUsers(d.sessions || []);
-  }catch(e){ toast('Error', true); }
+  }catch(e){ toast(t('Error'), true); }
 }
 async function disconnectActiveUser(connId){
-  if(!confirm('Disconnect this session?')) return;
-  try{ const r = await authenticatedFetch('/api/active-users/' + encodeURIComponent(connId) + '/disconnect', {method:'POST'}); if(!r.ok) throw new Error('failed'); toast('Disconnected'); loadActiveUsers(); }catch(e){ toast('Error', true); }
-}
-async function editUserMaxSess(id, cur){
-  const v = prompt('Max concurrent sessions for this user (0 = unlimited)', String(cur || 0));
-  if(v === null) return;
-  const n = parseInt(v) || 0;
-  try{ await authenticatedFetch('/api/users/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({max_sessions: n})}); toast('Saved'); loadUsersPage(); }catch(e){ toast('Error', true); }
-}
-async function loadUsersPage(){
-  try{
-    const r = await authenticatedFetch('/api/users');
-    const d = await r.json();
-    const tb = $m('users-tbody');
-    if(!tb) return;
-    tb.innerHTML = (d.users || []).map(u => `<tr><td style=\"font-weight:600\">${esc(u.name)}</td><td>${u.links}</td><td>${fmtB(u.used_bytes)}</td><td>${u.limit_bytes ? fmtB(u.limit_bytes) : '∞'}</td><td><button class="btn btn-outline btn-sm" onclick="editUserMaxSess('${u.id}', ${u.max_sessions || 0})">${u.max_sessions || 0}</button></td><td>${u.active_sessions || 0}</td><td><button class=\"btn btn-outline btn-sm\" onclick=\"showUserLinks('${u.id}', '${esc(u.name)}')\">Links</button> <button class=\"btn btn-danger btn-sm\" onclick=\"deleteUser('${u.id}')\">Delete</button></td></tr>`).join('') || '<tr><td colspan=\"7\">No users yet</td></tr>';
-  }catch(e){}
-}
-async function createUser(){
-  const name = $m('new-user-name').value.trim();
-  if(!name) return toast('Name required', true);
-  try{
-    await authenticatedFetch('/api/users', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, telegram_chat_id: $m('new-user-chat').value.trim(), notes: $m('new-user-notes').value.trim(), max_sessions: parseInt($m('new-user-maxsess').value) || 0})});
-    $m('new-user-name').value=''; $m('new-user-chat').value=''; $m('new-user-notes').value=''; $m('new-user-maxsess').value='0';
-    toast('User created'); loadUsersPage();
-  }catch(e){ toast('Error', true); }
-}
-async function deleteUser(id){
-  if(!confirm('Delete this user? Their links stay but lose the owner.')) return;
-  try{ await authenticatedFetch('/api/users/' + id, {method:'DELETE'}); toast('Deleted'); loadUsersPage(); }catch(e){ toast('Error', true); }
-}
-async function showUserLinks(id, name){
-  try{
-    const r = await authenticatedFetch('/api/users/' + id + '/links');
-    const d = await r.json();
-    const box = $m('user-links-box');
-    box.innerHTML = `<div class=\"card-hd\"><span class=\"card-title\">${esc(name)} — ${esc(fmtB(d.used_bytes))} / ${d.limit_bytes ? esc(fmtB(d.limit_bytes)) : '∞'}</span></div>` + ((d.links || []).map(l => `<div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);\"><span class=\"tag tag-vless\">${esc(protoShort(l.protocol))}</span><b>${esc(l.label)}</b><button class=\"btn btn-outline btn-sm\" onclick=\"cpLink('${esc(l.protocol_link)}')\">Copy Link</button><button class=\"btn btn-outline btn-sm\" onclick=\"cpSub('${esc(l.uid)}')\">Subscription</button>${l.socks && l.socks.enabled ? '<span style="color:var(--text3);font-size:0.85rem;">SOCKS5 ' + esc(l.socks.host) + ':' + l.socks.port + ' · user ' + esc(l.socks.username) + '</span>' : ''}${l.proxy && l.proxy.enabled && l.proxy.protocol_link ? '<span style="color:var(--text3);font-size:0.85rem;">Proxy ' + esc(l.proxy.protocol_link) + '</span>' : ''}${l.proxy && !l.proxy.enabled ? '<span style="color:var(--red);font-size:0.85rem;">Proxy listener disabled: ' + esc(l.proxy.reason || '') + '</span>' : ''}${l.region_name ? '<span style="color:var(--text3);font-size:0.85rem;">Region: ' + esc(l.region_name) + '</span>' : ''}</div>`).join('') || '<div>No links assigned</div>');
-  }catch(e){ toast('Error', true); }
+  if(!(await confirmDialog(t('confirmDisconnectSession')))) return;
+  try{ const r = await authenticatedFetch('/api/active-users/' + encodeURIComponent(connId) + '/disconnect', {method:'POST'}); if(!r.ok) throw new Error('failed'); toast(t('disconnected')); loadActiveUsers(); }catch(e){ toast(t('Error'), true); }
 }
 
 function proxyInfoText(proto, info){
@@ -13310,9 +16549,25 @@ function proxyInfoText(proto, info){
   const on = (k) => st[k] && st[k].enabled;
   if(proto === 'socks5') return 'SOCKS5 listener port ' + (info ? info.socks_port : '') + (on('socks') ? ' (running)' : ' (DISABLED on this host - Render exposes one HTTP port only)') + '. Auth is the link UUID for user and password. Telegram DC destinations only, TCP CONNECT, no UDP.';
   if(proto === 'mtproto') return 'MTProto listener port ' + (info ? info.mtproxy_port : '') + (on('mtproxy') ? ' (running)' : ' (DISABLED on this host - Render exposes one HTTP port only)') + '. Each inbound has its own derived secret, so quota and the 1-user limit apply per inbound.';
-  if(proto === 'webproxy') return 'WEB proxy rides the panel HTTPS port, so it works on Render and Railway. The port selects the per-port secret used in the tg://webproxy link.';
+  if(proto === 'webproxy') return 'WEB proxy rides the panel HTTPS port, so it works on Cloady, Render and Railway. Each WEB proxy link needs its own port: the port selects the secret in the tg://webproxy link, so two links never share a secret.';
   if(proto === 'http-proxy') return 'HTTP proxy listener port ' + (info ? info.http_proxy_port : '') + (on('http') ? ' (running)' : ' (DISABLED on this host - Render exposes one HTTP port only)') + '. CONNECT only, Basic auth is the link UUID, Telegram DC destinations only, not an open web proxy.';
   return '';
+}
+function parseProxyLine(line){
+  let rest = (line || '').trim();
+  if(!rest) return null;
+  if(rest.indexOf('://') !== -1){
+    const parts = rest.split('://');
+    if(parts[0].toLowerCase() !== 'socks5' && parts[0].toLowerCase() !== 'socks') return null;
+    rest = parts.slice(1).join('://');
+  }
+  if(rest.indexOf('@') !== -1) rest = rest.split('@').pop();
+  const idx = rest.lastIndexOf(':');
+  if(idx <= 0) return null;
+  const host = rest.slice(0, idx).trim();
+  const port = parseInt(rest.slice(idx + 1), 10);
+  if(!host || !port || port < 1 || port > 65535) return null;
+  return {host: host, port: port};
 }
 async function toggleProxyFields(prefix){
   const isCreate = prefix === 'create';
@@ -13359,7 +16614,10 @@ async function createLink(){
   const outboundMode=$m('aoutbound-mode').value||'auto';
   const gamingProfile=$m('agaming-profile').value||'balanced';
   const ssMethod=$m('ass-method').value||'2022-blake3-aes-256-gcm';
-  const ownerUserId=$m('aowner-user').value||'';
+  const ownerName=$m('aowner-name').value.trim();
+  const ownerMaxSess=parseInt($m('aowner-maxsess').value)||0;
+  const proxyLine=$m('proxy-line-text-create').value.trim();
+  if(proxyLine && !parseProxyLine(proxyLine)){ toast('Invalid outbound proxy line (use host:port or user:pass@host:port)', true); return; }
   const fpSel=$m('afingerprint-sel').value;const fingerprint=fpSel==='custom'?($m('afingerprint-custom').value.trim().toLowerCase()||''):fpSel==='none'?'':fpSel;
   const alpnSel=$m('aalpn-sel').value;const alpn=alpnSel==='custom'?$m('aalpn-custom').value.trim():(alpnSel||'');
   const port=protocol==='webproxy' ? webproxyPort : parseInt($m('aport').value)||443;
@@ -13390,7 +16648,7 @@ async function createLink(){
     allow_insecure:allowInsecure,random_path:randomPath,
     smux_enabled:smuxEnabled,ip_limit:ipLimit,
     protocol:protocol,fingerprint:fingerprint,alpn:alpn,port:port,mtproto_variant:mtprotoVariant,mtproto_domain:mtprotoDomain,
-    outbound_mode:outboundMode,gaming_profile:gamingProfile,ss_method:ssMethod,owner_user_id:ownerUserId,region_id:$m('aregion').value||'',
+    outbound_mode:outboundMode,gaming_profile:gamingProfile,ss_method:ssMethod,owner_name:ownerName,owner_max_sessions:ownerMaxSess,outbound_proxy:$m('proxy-line-text-create').value.trim(),
     proxy_line_id: parseInt($m('proxy-line-select-create').value) || null,
     xray_dns_mode: xrayDnsMode,
     xray_doh_url: xrayDohUrl,
@@ -13401,7 +16659,7 @@ async function createLink(){
     udp_enabled: udpEnabled,
     enable_ipv6: $m('ipv6-create').classList.contains('on') ? 1 : 0
   };
-  try{await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}
+  try{await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast(t('created'));$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast(t('Error'),true);}
 }
 
 async function showEditMo(uid) {
@@ -13412,8 +16670,13 @@ async function showEditMo(uid) {
   $m('euuid').value = l.uuid;
   $m('en2').value = l.label;
   $m('el').value = l.limit_bytes > 0 ? (l.limit_bytes / 1073741824) : '';
+  $m('eusage').textContent = fmtB(l.used_bytes || 0) + ' / ' + fmtLim(l.limit_bytes || 0) + ' / ' + (l.limit_bytes ? fmtB(Math.max(0, l.limit_bytes - (l.used_bytes || 0))) : '∞');
   $m('ec').value = l.max_connections || '';
+  const consumedEdit = $m('consumed-edit');
+  if (consumedEdit) consumedEdit.textContent = 'Consumed: ' + fmtB(l.used_bytes || 0) + ' of ' + (l.limit_bytes > 0 ? fmtB(l.limit_bytes) : '∞') + (l.limit_bytes > 0 ? ' (' + Math.min(100, Math.round((l.used_bytes || 0) / l.limit_bytes * 100)) + '%)' : '') + ' — Reset Traffic zeroes it';
   $m('ed').value = l.expires_at ? Math.max(0, Math.ceil((new Date(l.expires_at) - Date.now()) / 86400000)) : '';
+  const expPrevEdit = $m('expires-preview-edit');
+  if (expPrevEdit) expPrevEdit.textContent = l.expires_at ? 'Current expiry: ' + new Date(l.expires_at).toLocaleDateString('en-CA') + ' ' + new Date(l.expires_at).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'}) : '';
   $m('ep').value = l.custom_path || '';
   $m('esni').value = l.custom_sni || '';
   $m('ehost').value = l.custom_host || '';
@@ -13465,7 +16728,9 @@ async function showEditMo(uid) {
   $m('ess-method').value = l.ss_method || '2022-blake3-aes-256-gcm';
   $m('eoutbound-mode').value = l.outbound_mode || 'auto';
   $m('egaming-profile').value = l.gaming_profile || 'balanced';
-  loadOwnerUsers('eowner-user', l.owner_user_id || '');
+  $m('eowner-name').value = l.owner_name || '';
+  $m('eowner-maxsess').value = l.owner_max_sessions || 0;
+  $m('eused-summary').textContent = fmtB(l.used_bytes || 0) + ' of ' + (l.limit_bytes ? fmtB(l.limit_bytes) : 'Unlimited') + (l.limit_bytes ? ' (' + Math.min(100, Math.round((l.used_bytes || 0) / l.limit_bytes * 100)) + '%)' : '');
 
   const currentFp = l.fingerprint || 'chrome';
   const fpSel = $m('efingerprint-sel');
@@ -13520,7 +16785,7 @@ async function showEditMo(uid) {
   else $m('udp-edit').classList.remove('on');
   if (l.enable_ipv6 !== undefined ? l.enable_ipv6 : true) $m('ipv6-edit').classList.add('on');
   else $m('ipv6-edit').classList.remove('on');
-  loadRegionsForSelect('eregion', l.region_id || '');
+  $m('proxy-line-text-edit').value = l.outbound_proxy || '';
 
   const fragMode = l.fragment_mode || 'off';
   $m('efrag-mode').value = fragMode;
@@ -13546,6 +16811,7 @@ async function showEditMo(uid) {
   }
 
   $m('mo-edit').classList.add('show');
+  fillPortNotes();
 }
 
 async function saveEdit() {
@@ -13571,7 +16837,10 @@ async function saveEdit() {
   const outboundMode = $m('eoutbound-mode').value || 'auto';
   const gamingProfile = $m('egaming-profile').value || 'balanced';
   const ssMethod = $m('ess-method').value || '2022-blake3-aes-256-gcm';
-  const ownerUserId = $m('eowner-user').value || '';
+  const ownerName = $m('eowner-name').value.trim();
+  const ownerMaxSess = parseInt($m('eowner-maxsess').value) || 0;
+  const proxyLine = $m('proxy-line-text-edit').value.trim();
+  if (proxyLine && !parseProxyLine(proxyLine)) { toast('Invalid outbound proxy line (use host:port or user:pass@host:port)', true); return; }
   const fpSel = $m('efingerprint-sel').value; const fingerprint = fpSel === 'custom' ? ($m('efingerprint-custom').value.trim().toLowerCase() || '') : fpSel === 'none' ? '' : fpSel;
   const alpnSel = $m('ealpn-sel').value; const alpn = alpnSel === 'custom' ? $m('ealpn-custom').value.trim() : (alpnSel || '');
   const port = protocol === 'webproxy' ? webproxyPort : parseInt($m('eport').value) || 443;
@@ -13627,8 +16896,9 @@ async function saveEdit() {
     outbound_mode: outboundMode,
     gaming_profile: gamingProfile,
     ss_method: ssMethod,
-    owner_user_id: ownerUserId,
-    region_id: $m('eregion').value || '',
+    owner_name: ownerName,
+    owner_max_sessions: ownerMaxSess,
+    outbound_proxy: $m('proxy-line-text-edit').value.trim(),
     proxy_line_id: parseInt($m('proxy-line-select-edit').value) || null,
     xray_dns_mode: xrayDnsMode,
     xray_doh_url: xrayDohUrl,
@@ -13653,47 +16923,60 @@ async function saveEdit() {
       return;
     }
     if (data.message === 'no changes') {
-      toast('No changes detected', true);
+      toast(t('noChanges'), true);
       return;
     }
-    toast('Updated');
+    toast(t('updated'));
     $m('mo-edit').classList.remove('show');
     loadLinks();
   } catch (e) {
-    toast('Error: ' + (e.message || 'Network error'), true);
+    toast(t('errorPrefix') + (e.message || 'Network error'), true);
   }
 }
 
 async function resetTraf() {
   const uid = $m('eu').value;
-  if (!confirm('Reset?')) return;
+  if (!(await confirmDialog(t('confirmReset')))) return;
   try {
     await authenticatedFetch('/api/links/' + uid, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reset_usage: true })
     });
-    toast('Reset');
+    toast(t('resetDone'));
     loadLinks();
   } catch {
-    toast('Error', true);
+    toast(t('Error'), true);
   }
 }
 
+let _confirmResolve = null;
+function confirmDialog(msg, okLabel){
+  return new Promise((resolve)=>{
+    _confirmResolve = resolve;
+    $m('confirm-msg').textContent = msg;
+    $m('confirm-ok').textContent = okLabel || (lang === 'fa' ? 'تأیید' : 'Confirm');
+    $m('mo-confirm').classList.add('show');
+  });
+}
+function _confirmDone(v){
+  $m('mo-confirm').classList.remove('show');
+  if(_confirmResolve){ const r = _confirmResolve; _confirmResolve = null; r(v); }
+}
 async function delLink(uid) {
-  if (!confirm('Delete?')) return;
+  if (!(await confirmDialog(t('confirmDelete'), t('del')))) return;
   try {
     const r = await authenticatedFetch('/api/links/' + uid, { method: 'DELETE' });
     if (!r.ok) {
       const d = await r.json();
       toast(d.detail || 'Error', true);
     } else {
-      toast('Deleted');
+      toast(t('deleted'));
       loadLinks();
       loadStats();
     }
   } catch {
-    toast('Error', true);
+    toast(t('Error'), true);
   }
 }
 
@@ -13708,7 +16991,7 @@ async function cpSub(uid) {
 
 function showQR(txt) {
   if (txt.length > 2000) {
-    toast('Link too long for QR', true);
+    toast(t('qrTooLong'), true);
     return;
   }
   const img = $m('qr-img');
@@ -13765,10 +17048,10 @@ async function loadStats() {
       prevStatsTime = now;
     }
 
-    safeSetHTML('sv-traffic', (sData.total_traffic_mb || 0) + '<span class="stat-unit"> MB</span>');
+    safeSetHTML('sv-traffic', '<span class="stat-unit num">' + (sData.total_traffic_mb || 0) + ' MB</span>');
     safeSetText('sv-requests', sData.total_requests);
     safeSetText('sv-uptime', sData.uptime);
-    safeSetHTML('sv-disk', (sData.disk_free_gb || 0) + '<span class="stat-unit"> GB</span>');
+    safeSetHTML('sv-disk', '<span class="stat-unit num">' + (sData.disk_free_gb || 0) + ' GB</span>');
     safeSetText('last-up', t('updatedAt', { time: getLocalTimeString() }));
 
     if (sData.cpu_percent !== undefined && sData.cpu_percent !== null) {
@@ -13791,7 +17074,7 @@ async function loadStats() {
 
     const monthlyUsageGB = sData.monthly_usage_bytes ? sData.monthly_usage_bytes / 1e9 : 0;
     const monthlyLimitGB = sData.monthly_limit_bytes ? sData.monthly_limit_bytes / 1e9 : 0;
-    safeSetHTML('sv-monthly', monthlyUsageGB.toFixed(1) + ' GB' + (monthlyLimitGB > 0 ? ' / ' + monthlyLimitGB.toFixed(1) + ' GB' : ''));
+    safeSetHTML('sv-monthly', '<span class="num">' + monthlyUsageGB.toFixed(1) + ' GB' + (monthlyLimitGB > 0 ? ' / ' + monthlyLimitGB.toFixed(1) + ' GB' : '') + '</span>');
     const pc = sData.protocol_counts || {};
     const ps = $m('proto-summary');
     if (ps) {
@@ -13814,6 +17097,7 @@ function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
 function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
 async function loadLinks(){
   if (!isAuthenticated || isInitialChecking) return;
+  showLinksSkeleton();
   try {
     const r = await authenticatedFetch('/api/links');
     if (!r.ok) return;
@@ -13822,9 +17106,11 @@ async function loadLinks(){
     filterLinks();
   } catch(e) { console.error('loadLinks error:', e); }
 }
-async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<8){toast('Password must be at least 8 characters',true);return;}if(!/[A-Z]/.test(nw)||!/[a-z]/.test(nw)||!/[0-9]/.test(nw)){toast('Password must contain uppercase, lowercase, and digit',true);return;}try{const r=await authenticatedFetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
+async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast(t('fillFields'),true);return;}if(nw.length<8){toast(t('pwTooShort'),true);return;}if(!/[A-Z]/.test(nw)||!/[a-z]/.test(nw)||!/[0-9]/.test(nw)){toast(t('pwWeak'),true);return;}try{const r=await authenticatedFetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast(t('passwordUpdated'));}catch(e){toast(e.message,true);}}
 function initChart(){
+  if(typeof Chart==='undefined')return;
   const ctx=$m('tc'); if(!ctx||tChart)return;
+  if(typeof Chart==='undefined'){ setChartEmpty('tc', true, 'Chart library failed to load'); return; }
   tChart=new Chart(ctx,{
     type:'bar',
     data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.6)',borderColor:'#39ff14',borderWidth:1,barPercentage:0.7,categoryPercentage:0.9}]},
@@ -13841,6 +17127,8 @@ function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.set
 function getLocalTimeString(){const d=new Date();d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;}
 function updChart(){
   if(!tChart||!sData.hourly_traffic)return;
+  const hasTrafficData = Object.values(sData.hourly_traffic).some(v => (v||0) > 0);
+  setChartEmpty('tc', !hasTrafficData, 'No traffic data yet');
   const labels = []; const data = [];
   for(let h=0;h<24;h++){
     const key = `${h.toString().padStart(2,'0')}:00`;
@@ -13852,11 +17140,13 @@ function updChart(){
   tChart.update();
 }
 let doughnutChart=null;
-function initDoughnutChart(){const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw>=1e9?(ctx.raw/1e9).toFixed(1)+' GB':(ctx.raw/1e6).toFixed(1)+' MB'}`}}}}});}
-function updDoughnutChart(){if(!doughnutChart)return;const labels=[],data=[],colors=[];allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});doughnutChart.data.labels=labels;doughnutChart.data.datasets[0].data=data;doughnutChart.data.datasets[0].backgroundColor=colors;doughnutChart.update();}
+function initDoughnutChart(){const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;if(typeof Chart==='undefined'){setChartEmpty('doughnut-chart',true,'Chart library failed to load');return;}doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw>=1e9?(ctx.raw/1e9).toFixed(1)+' GB':(ctx.raw/1e6).toFixed(1)+' MB'}`}}}}});}
+function updDoughnutChart(){if(!doughnutChart)return;const anyUsed=allLinks.some(l => (l.used_bytes||0) > 0);setChartEmpty('doughnut-chart', !anyUsed, 'No usage data yet');const labels=[],data=[],colors=[];allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});doughnutChart.data.labels=labels;doughnutChart.data.datasets[0].data=data;doughnutChart.data.datasets[0].backgroundColor=colors;doughnutChart.update();}
 let speedChart=null,speedHistory=[];
 function initSpeedChart(){
+  if(typeof Chart==='undefined')return;
   const ctx=$m('speed-chart');if(!ctx||speedChart)return;
+  if(typeof Chart==='undefined'){setChartEmpty('speed-chart',true,'Chart library failed to load');return;}
   speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
 }
 function updSpeedChart(up,down){
@@ -13870,6 +17160,7 @@ function updSpeedChart(up,down){
   speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);
   speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);
   speedChart.update();
+  setChartEmpty('speed-chart', speedHistory.length < 2, 'Waiting for live speed samples');
 }
 let currentProfileId = 'all';
 let currentProfileAddresses = [];
@@ -13879,7 +17170,7 @@ async function buildProfileTabs() {
     const profiles = await r.json();
     const tabsDiv = $m('profile-tabs');
     if (!tabsDiv) return;
-    tabsDiv.innerHTML = '<button class="pill-btn active" data-profile="all" onclick="switchProfileView(\'all\')">All</button>';
+    tabsDiv.innerHTML = '<button class="pill-btn active" data-profile="all" onclick="switchProfileView(\'all\')" data-en="All" data-fa="همه">All</button>';
     profiles.forEach(p => {
         const btn = document.createElement('button');
         btn.className = 'pill-btn';
@@ -13983,17 +17274,17 @@ function toggleAllAddresses(){
 }
 function copySelectedAddrs(){
   const selected = Array.from(selectedAddrIndices).map(i => allAddrs[i]);
-  if (selected.length === 0) return toast('No addresses selected', true);
+  if (selected.length === 0) return toast(t('noAddrsSelected'), true);
   copyToClipboard(selected.join('\n'));
 }
-async function bulkDeleteAddrs(){if(selectedAddrIndices.size===0)return toast('No addresses selected',true);if(!confirm('Delete selected addresses?'))return;const indices = Array.from(selectedAddrIndices);try{const r=await authenticatedFetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});if(r.ok){selectedAddrIndices.clear();await loadAddrs();toast('Deleted selected');}}catch(e){toast('Error',true);}}
+async function bulkDeleteAddrs(){if(selectedAddrIndices.size===0)return toast(t('noAddrsSelected'),true);if(!(await confirmDialog(t('confirmDeleteAddrs'), t('del'))))return;const indices = Array.from(selectedAddrIndices);try{const r=await authenticatedFetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});if(r.ok){selectedAddrIndices.clear();await loadAddrs();toast(t('deletedSelected'));}}catch(e){toast(t('Error'),true);}}
 function showEditAddr(i){editingAddrIndex=i;$m('edit-addr-input').value=allAddrs[i];$m('mo-addr-edit').classList.add('show');}
-async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();if(!newAddr)return toast('Invalid address',true);try{const r=await authenticatedFetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});if(r.ok){toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();}else{const d=await r.json();toast(d.detail||'Error updating',true);}}catch(e){toast('Error',true);}}
-async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await authenticatedFetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
-async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await authenticatedFetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function delAddr(i){if(!confirm('Delete?'))return;try{await authenticatedFetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){try{const r=await authenticatedFetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sulgx-links.json';a.click();}catch{toast('Export failed',true);}}
-async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await authenticatedFetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
+async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();if(!newAddr)return toast(t('invalidAddress'),true);try{const r=await authenticatedFetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});if(r.ok){toast(t('addressUpdated'));$m('mo-addr-edit').classList.remove('show');await loadAddrs();}else{const d=await r.json();toast(d.detail||'Error updating',true);}}catch(e){toast(t('Error'),true);}}
+async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await authenticatedFetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast(t('batchAddFailed'),true);}}
+async function deleteAllAddrs(){if(!(await confirmDialog(t('confirmDeleteAllAddrs'), t('del'))))return;try{await authenticatedFetch('/api/addresses',{method:'DELETE'});toast(t('allDeleted'));await loadAddrs();}catch{toast(t('Error'),true);}}
+async function delAddr(i){if(!(await confirmDialog(t('confirmDelete'), t('del'))))return;try{await authenticatedFetch('/api/addresses/'+i,{method:'DELETE'});toast(t('deleted'));await loadAddrs();}catch{toast(t('Error'),true);}}
+async function exportLinks(){try{const r=await authenticatedFetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sulgx-links.json';a.click();}catch{toast(t('exportFailed'),true);}}
+async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await authenticatedFetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast(t('importFailed'),true);}input.value='';}
 async function importIpFile(input){
   const file = input.files[0];
   if(!file) return;
@@ -14001,7 +17292,7 @@ async function importIpFile(input){
     const text = await file.text();
     const lines = text.split(/[\r\n]+/g).map(l => l.trim()).filter(l => l);
     
-    if(lines.length === 0) return toast('No addresses found in file', true);
+    if(lines.length === 0) return toast(t('noAddrsInFile'), true);
     
     const r = await authenticatedFetch('/api/addresses/batch',{
       method:'POST',
@@ -14013,13 +17304,13 @@ async function importIpFile(input){
     toast(`Imported ${d.added} addresses` + (d.errors ? ` (${d.errors} errors)` : ''));
     await loadAddrs();
   } catch(e) { 
-    toast('Import .txt failed', true); 
+    toast(t('importTxtFailed'), true); 
     console.error(e);
   }
   input.value='';
 }
 async function resolveAllFlags() {
-    if (!allAddrs || allAddrs.length === 0) return toast('No addresses', true);
+    if (!allAddrs || allAddrs.length === 0) return toast(t('noAddresses'), true);
     const btn = document.querySelector('[data-en="Resolve All Flags"]') || document.querySelector('[data-fa="دریافت همه پرچم‌ها"]');
     if (btn) { btn.disabled = true; btn.textContent = 'Resolving...'; }
     try {
@@ -14028,7 +17319,7 @@ async function resolveAllFlags() {
         toast(`Resolved flags for ${data.resolved} addresses`);
         await loadAddrs();
     } catch (e) {
-        toast('Resolve failed: ' + e.message, true);
+        toast(t('resolveFailed') + e.message, true);
     }
     if (btn) { btn.disabled = false; btn.textContent = 'Resolve All Flags'; }
 }
@@ -14041,8 +17332,8 @@ async function loadIpProfiles(){
     renderIpProfiles(profiles);
     list.scrollTop = scrollTop;
 }
-async function loadIpProfilesForSelect(){const r=await authenticatedFetch('/api/ip-profiles');const profiles=await r.json();const sel=$m('aip-profile');if(!sel)return;sel.innerHTML='<option value="">None</option>';profiles.forEach(p=>{sel.innerHTML+=`<option value="${p.id}">${p.name} (${p.address_count})</option>`;});}
-async function loadIpProfilesForSelectEdit(currentId){const r=await authenticatedFetch('/api/ip-profiles');const profiles=await r.json();const sel=$m('eip-profile');if(!sel)return;sel.innerHTML='<option value="">None</option>';profiles.forEach(p=>{sel.innerHTML+=`<option value="${p.id}" ${p.id===currentId?'selected':''}>${p.name} (${p.address_count})</option>`;});}
+async function loadIpProfilesForSelect(){try{const r=await authenticatedFetch('/api/ip-profiles');const profiles=await r.json();const sel=$m('aip-profile');if(!sel)return;sel.innerHTML='<option value="" data-en="None" data-fa="هیچ‌کدام">None</option>';profiles.forEach(p=>{sel.innerHTML+=`<option value="${p.id}">${p.name} (${p.address_count})</option>`;});}catch(e){}}
+async function loadIpProfilesForSelectEdit(currentId){try{const r=await authenticatedFetch('/api/ip-profiles');const profiles=await r.json();const sel=$m('eip-profile');if(!sel)return;sel.innerHTML='<option value="" data-en="None" data-fa="هیچ‌کدام">None</option>';profiles.forEach(p=>{sel.innerHTML+=`<option value="${p.id}" ${p.id===currentId?'selected':''}>${p.name} (${p.address_count})</option>`;});}catch(e){}}
 function renderIpProfiles(profiles){
   const list=$m('ip-profiles-list'); if(!list)return;
   list.innerHTML = profiles.map(p=>`
@@ -14057,7 +17348,7 @@ function renderIpProfiles(profiles){
 }
 async function createIpProfile(){
   const name = $m('new-profile-name').value.trim();
-  if (!name) return toast('Enter a name', true);
+  if (!name) return toast(t('enterName'), true);
   $m('ip-profile-id').value = '';
   $m('ip-profile-name').value = name;
   $m('ip-profile-addrs').value = '';
@@ -14065,7 +17356,7 @@ async function createIpProfile(){
   $m('new-profile-name').value = '';
 }
 async function deleteIpProfile(pid){
-  if(!confirm('Delete this profile?'))return;
+  if(!(await confirmDialog(t('confirmDeleteProfile'), t('del'))))return;
   await authenticatedFetch('/api/ip-profiles/'+pid,{method:'DELETE'});
   await loadIpProfiles();
   await buildProfileTabs();
@@ -14103,7 +17394,7 @@ async function saveIpProfile(){
   const name = $m('ip-profile-name').value.trim();
   const raw = $m('ip-profile-addrs').value.trim();
 
-  if (!name) return toast('Enter a name', true);
+  if (!name) return toast(t('enterName'), true);
 
   if (!pid) {
     const r = await authenticatedFetch('/api/ip-profiles', {
@@ -14141,7 +17432,7 @@ async function saveIpProfile(){
 }
 async function detectFlagsForProfile() {
     const raw = $m('ip-profile-addrs').value.trim();
-    if (!raw) return toast('No addresses to process', true);
+    if (!raw) return toast(t('noAddrsToProcess'), true);
     const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
     const ips = lines.map(line => {
         const ip = line.split('#')[0].trim();
@@ -14174,8 +17465,8 @@ async function detectFlagsForProfile() {
             return newLine;
         });
         $m('ip-profile-addrs').value = updatedLines.join('\n');
-        toast('Flags detected and updated');
-    } catch(e) { toast('Detection failed: ' + e.message, true); }
+        toast(t('flagsUpdated'));
+    } catch(e) { toast(t('detectionFailed') + e.message, true); }
 }
 const dohPresets = [
   "https://dns.cloudflare.com/dns-query",
@@ -14294,7 +17585,7 @@ function copyDohEndpoint() {
   const el = $m('doh-endpoint-url');
   if (el && el.value) {
     copyToClipboard(el.value);
-    toast('DOH URL copied');
+    toast(t('dohCopied'));
   }
 }
 
@@ -14330,7 +17621,7 @@ function editMultiPanel(index) {
 function addMultiPanel(){
   const name=$m('new-panel-name').value.trim();
   const url=$m('new-panel-url').value.trim();
-  if(!name||!url)return toast('Enter name and URL');
+  if(!name||!url)return toast(t('enterNameUrl'));
   const stored=localStorage.getItem('multipanel')||'[]';
   const panels=JSON.parse(stored);
   if (editingPanelIndex >= 0) {
@@ -14353,7 +17644,12 @@ function removeMultiPanel(index){
 }
 
 let currentProvider=null;
-function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);if(prov==='Railway') btn.classList.add('railway-hl');container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
+function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.dataset.provider=prov;btn.onclick=()=>selectProvider(prov,btn);if(prov==='Railway') btn.classList.add('railway-hl');container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent=t('customProvider');customBtn.dataset.provider='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
+function cidrCount(cidr){const parts=cidr.split('/');if(parts.length!==2)return 1;const mask=parseInt(parts[1]);if(isNaN(mask)||mask<8||mask>32)return 1;return Math.min(Math.pow(2,32-mask),256);}
+function countProviderIPs(prov){const ranges=providerIPs[prov]?providerIPs[prov].ipv4:[];let total=0;ranges.forEach(r=>{total+=cidrCount(r);});return total;}
+function collectProviderIPs(prov,limit){const out=[];const ranges=providerIPs[prov]?providerIPs[prov].ipv4:[];for(let i=0;i<ranges.length&&out.length<limit;i++){const part=expandCIDR(ranges[i],true);for(let j=0;j<part.length&&out.length<limit;j++){out.push(part[j]);}}return out;}
+function filterProviders(q){const needle=(q||'').toLowerCase();document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>{const key=(b.dataset.provider||b.textContent).toLowerCase();b.style.display=key.indexOf(needle)>-1?'':'none';});}
+function scanAllProviders(){const all=[];Object.keys(providerIPs).forEach(prov=>{if(all.length>=256)return;const ranges=providerIPs[prov].ipv4;if(!ranges||!ranges.length)return;const part=expandCIDR(ranges[0],true);for(let i=0;i<part.length&&all.length<256&&i<8;i++){all.push(part[i]);}});$m('scan-ips').value=all.join('\n');toast(t('scanAllReady',{n:all.length}));}
 function selectProvider(prov,btn){
     document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
@@ -14368,20 +17664,21 @@ function selectProvider(prov,btn){
     const rangeBtns=$m('range-btns'); rangeBtns.innerHTML='';
     const ranges=providerIPs[prov]?.ipv4||[];
     ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});
-    const allIPs=[]; ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});
+    const allIPs=collectProviderIPs(prov,256);
     $m('scan-ips').value=allIPs.join('\n');
+    if(countProviderIPs(prov)>256){toast(t('providerTruncated',{n:256}));}
 }
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){
+function expandCIDR(cidr,quiet){
     const parts = cidr.split('/');
     if(parts.length !== 2) return [cidr];
     const ip = parts[0].trim(), mask = parseInt(parts[1]);
-    if(isNaN(mask) || mask < 16 || mask > 32) return [cidr];
+    if(isNaN(mask) || mask < 8 || mask > 32) return [cidr];
     const ipParts = ip.split('.').map(Number);
     if(ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
     const count = Math.pow(2, 32 - mask);
     const limit = Math.min(count, 256);
-    if(count > limit) toast(lang === 'fa' ? `رنج بزرگ: فقط ${limit} آی‌پی اول استخراج شد.` : `Large range: only first ${limit} IPs extracted.`);
+    if(count > limit && !quiet) toast(t('largeRange',{n:limit}));
     const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
     const base = start & (~((1 << (32 - mask)) - 1));
     const result = [];
@@ -14394,7 +17691,7 @@ function expandCIDR(cidr){
     return result;
 }
 
-let totalScanCount = 0, scannedCount = 0, wsScanner = null;
+let totalScanCount = 0, scannedCount = 0, scanOkCount = 0, wsScanner = null;
 
 function stopScan(){
     if(wsScanner){ wsScanner.close(); wsScanner = null; }
@@ -14412,12 +17709,14 @@ async function startIPScan(){
         else if(!dnsRanges.has(l.trim())) items.push(l.trim());
     });
     const unique = [...new Set(items)];
+    if(!unique.length){toast(t('scanNeedIPs'));return;}
     const MAX_IPS = 256;
     if (unique.length > MAX_IPS) {
-        toast(lang === 'fa' ? `حداکثر ${MAX_IPS} آی‌پی مجاز است. شما ${unique.length} آی‌پی وارد کردید.` : `Max ${MAX_IPS} IPs allowed. You entered ${unique.length}.`, true);
+        toast(t('scanTooMany',{max:MAX_IPS,count:unique.length}), true);
         return;
     }
-    totalScanCount = unique.length; scannedCount = 0;
+    totalScanCount = unique.length; scannedCount = 0; scanOkCount = 0;
+    const eg0=$m('scan-egress-note');if(eg0)eg0.style.display='none';
     $m('scan-tbody').innerHTML = '';
     $m('scan-progress').style.width = '0%'; $m('progress-text').textContent = '0%';
     $m('scan-start-btn').style.display = 'none'; $m('scan-stop-btn').style.display = 'inline-flex';
@@ -14431,22 +17730,27 @@ async function startIPScan(){
             wsScanner.close();
             $m('scan-start-btn').style.display = 'inline-flex';
             $m('scan-stop-btn').style.display = 'none';
+            if(d.error){toast(d.error,true);}
+            else if(d.all_failed||(totalScanCount>0&&scanOkCount===0)){const eg=$m('scan-egress-note');if(eg)eg.style.display='block';toast(t('scanAllFailed'),true);}
+            else{toast(t('scanFinished'));}
             fetchLocationData();
-            toast(lang === 'fa' ? 'اسکن با موفقیت تمام شد.' : 'Scan finished successfully.');
             return;
         }
         scannedCount++;
+        if(d.ok)scanOkCount++;
         const pct = Math.round((scannedCount / totalScanCount) * 100);
         $m('scan-progress').style.width = pct + '%'; $m('progress-text').textContent = pct + '%';
         const row = `<tr class="scan-row" data-ip="${esc(d.ip)}"><td>${esc(d.ip)}</td><td style="color:${d.ok ? 'var(--green)' : 'var(--red)'}">${d.ok ? t('reachable') : t('failed')}</td><td>${d.tcp_latency!=null ? d.tcp_latency+' ms' : '–'}</td><td>${d.https_latency!=null ? d.https_latency+' ms' : '–'}</td><td class="location-cell">–</td></tr>`;
         $m('scan-tbody').insertAdjacentHTML('beforeend', row);
     };
     wsScanner.onerror = () => {
-        toast(lang === 'fa' ? 'خطای اسکنر (احتمالاً تایم‌اوت)' : 'Scanner error (Timeout likely)', true);
+        if(scannedCount===0){const eg=$m('scan-egress-note');if(eg)eg.style.display='block';}
+        toast(t('scanErrorEgress'), true);
         $m('scan-start-btn').style.display = 'inline-flex';
         $m('scan-stop-btn').style.display = 'none';
     };
     wsScanner.onclose = () => {
+        if (scannedCount === 0 && totalScanCount > 0) { const egNote = $m('scan-egress-note'); if (egNote) egNote.style.display = 'block'; }
         $m('scan-start-btn').style.display = 'inline-flex';
         $m('scan-stop-btn').style.display = 'none';
     };
@@ -14532,7 +17836,7 @@ function sortBestIPs(){
         const tcp=parseFloat(cells[2].textContent);
         if(ok&&!isNaN(tcp))items.push({ip,latency:tcp});
     });
-    if(items.length===0){toast('No reachable IPs',true);return;}
+    if(items.length===0){toast(t('noReachableIps'),true);return;}
     items.sort((a,b)=>a.latency-b.latency);
     const tbody=$m('scan-tbody');
     const newRows = items.map(i => {
@@ -14552,7 +17856,7 @@ function copyReachableSorted(){
     const lat=parseFloat(cells[2].textContent);
     if(ok&&!isNaN(lat))reachable.push({ip,lat});
   });
-  if(reachable.length===0){toast('No reachable IPs found',true);return;}
+  if(reachable.length===0){toast(t('noReachableIps'),true);return;}
   reachable.sort((a,b)=>a.lat-b.lat);
   copyToClipboard(reachable.map(item=>item.ip).join('\n'));
 }
@@ -14566,7 +17870,7 @@ async function createProfileFromReachable() {
     const ok = cells[1].textContent.includes('✅');
     if(ok) reachable.push(ip);
   });
-  if (reachable.length === 0) return toast('No reachable IPs', true);
+  if (reachable.length === 0) return toast(t('noReachableIps'), true);
   window._scannerIps = reachable;
   $m('mo-scanner-profile').classList.add('show');
 }
@@ -14582,16 +17886,19 @@ async function saveScannerProfile() {
       body: JSON.stringify({name, ips})
     });
     if (r.ok) {
-      toast('Profile created');
+      toast(t('profileCreated'));
       $m('mo-scanner-profile').classList.remove('show');
       loadIpProfiles();
     }
-  } catch(e) { toast('Error', true); }
+  } catch(e) { toast(t('Error'), true); }
 }
 
+const LOG_TYPES={Scanner:{en:'Scanner',fa:'اسکنر'},Tunnel:{en:'Tunnel',fa:'تونل'},Proxy:{en:'Proxy',fa:'پروکسی'},Login:{en:'Login',fa:'ورود'},Error:{en:'Error',fa:'خطا'},Event:{en:'Event',fa:'رویداد'}};
+function logTypeLabel(ty){const e=LOG_TYPES[ty];if(e)return e[lang]||e.en;return ty||'Event';}
 async function loadLogs(){
   if (!isAuthenticated || isInitialChecking) return;
-  try{const r=await authenticatedFetch('/api/logs');const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
+  showLogsSkeleton();
+  try{const r=await authenticatedFetch('/api/logs');const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(logTypeLabel(l.type))}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function refreshLogs(){ loadLogs(); }
 async function loadLoginLogs(){
   if (!isAuthenticated || isInitialChecking) return;
@@ -14608,7 +17915,7 @@ async function loadLoginLogs(){
       const isp = l.isp || '-';
       const isLogout = l.path && l.path.includes('logout');
       const statusStyle = isLogout ? 'color: var(--yellow);' : (l.success ? 'color: var(--green);' : 'color: var(--red);');
-      const statusText = isLogout ? t('logout') : (l.success ? '✅ ' + t('success') : '❌ ' + t('failed'));
+      const statusText = isLogout ? t('logout') : (l.success ? '✅ ' + t('success') : t('failed'));
       return `<tr>
         <td>${timeAgo(l.timestamp)}</td>
         <td>
@@ -14622,8 +17929,8 @@ async function loadLoginLogs(){
   } catch(e) {}
 }
 async function clearRecentActivity(){
-  if(!confirm('Clear all recent activity?')) return;
-  try { await authenticatedFetch('/api/logs/clear', {method:'DELETE'}); loadLoginLogs(); } catch(e) { toast('Error', true); }
+  if(!(await confirmDialog(t('confirmClearActivity')))) return;
+  try { await authenticatedFetch('/api/logs/clear', {method:'DELETE'}); loadLoginLogs(); } catch(e) { toast(t('Error'), true); }
 }
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
 
@@ -14697,7 +18004,7 @@ async function saveTelegramSettings(){
     JSON.parse(templates_en);
     JSON.parse(templates_fa);
   } catch (e) {
-    toast('Invalid JSON in templates', true);
+    toast(t('invalidJsonTemplates'), true);
     return;
   }
 
@@ -14720,9 +18027,9 @@ async function saveTelegramSettings(){
         telegram_notify_enabled: tgNotify
       })
     });
-    toast('Saved');
+    toast(t('saved'));
   } catch {
-    toast('Error', true);
+    toast(t('Error'), true);
   }
 }
 
@@ -14730,7 +18037,7 @@ async function testTelegram(){
   const token = $m('tg-token').value.trim();
   const chat = $m('tg-chat-id').value.trim();
   if (!token || !chat) {
-    toast('Fill token and chat ID', true);
+    toast(t('fillTokenChat'), true);
     return;
   }
   const tglang = $m('tg-lang-hidden').value;
@@ -14741,10 +18048,10 @@ async function testTelegram(){
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chat, text: msg })
     });
-    if (res.ok) toast('Test message sent!');
-    else toast('Failed to send', true);
+    if (res.ok) toast(t('testMsgSent'));
+    else toast(t('failedToSend'), true);
   } catch {
-    toast('Error', true);
+    toast(t('Error'), true);
   }
 }
 
@@ -14825,11 +18132,11 @@ async function loadGeneralSettings(){
     $m('set-default-path').value = d.default_path || '';
     $m('set-default-xhttp-path').value = d.default_xhttp_path || '/xhttp';
     timezoneOffset = parseFloat(d.timezone_offset) || 0;
-    $m('set-default-limit').value = d.default_limit_bytes ? (parseInt(d.default_limit_bytes)/1073741824).toFixed(1) : '';
-    $m('set-default-expiry').value = d.default_expiry_days || '';
-    $m('set-default-maxconn').value = d.default_max_connections || '';
+    $m('set-default-limit').value = d.default_limit_bytes ? (parseInt(d.default_limit_bytes)/1073741824).toFixed(1) : '0';
+    $m('set-default-expiry').value = d.default_expiry_days || '0';
+    $m('set-default-maxconn').value = d.default_max_connections || '0';
     $m('set-scanner-timeout').value = d.scanner_timeout || '4';
-    $m('set-monthly-limit').value = d.monthly_limit_gb || '';
+    $m('set-monthly-limit').value = d.monthly_limit_gb || '0';
     $m('set-default-protocol').value = d.default_protocol || 'vless-ws';
     $m('set-default-ss-method').value = d.default_ss_method || '2022-blake3-aes-256-gcm';
     $m('set-default-outbound-mode').value = d.default_outbound_mode || 'auto';
@@ -14838,8 +18145,6 @@ async function loadGeneralSettings(){
     $m('set-ws-rate-window').value = d.ws_rate_window || '60';
     $m('set-sub-update-interval').value = d.sub_update_interval || '6';
     $m('set-max-xhttp-sessions').value = d.max_xhttp_sessions || '200';
-    $m('set-region-socks-host').value = d.region_socks_host || '127.0.0.1';
-    $m('set-region-socks-range').value = d.region_socks_range || '1024-1099';
     $m('set-max-scan-ips').value = d.max_scan_ips || '256';
     $m('set-keep-alive-interval').value = d.keep_alive_interval || '300';
     
@@ -14912,8 +18217,6 @@ async function saveGeneralSettings(){
   const wsRateWindow = $m('set-ws-rate-window').value.trim();
   const subUpdateInterval = $m('set-sub-update-interval').value.trim();
   const maxXhttpSessions = $m('set-max-xhttp-sessions').value.trim();
-  const regionSocksHost = $m('set-region-socks-host').value.trim();
-  const regionSocksRange = $m('set-region-socks-range').value.trim();
   const maxScanIps = $m('set-max-scan-ips').value.trim();
   const keepAliveInterval = $m('set-keep-alive-interval').value.trim();
   const keepAliveEnabled = $m('set-keepalive-enabled').value;
@@ -14943,7 +18246,6 @@ async function saveGeneralSettings(){
         monthly_limit_gb: monthlyLimit, max_scan_ips: maxScanIps, keep_alive_interval: keepAliveInterval,
         default_protocol: defProtocol, default_ss_method: defSsMethod, default_outbound_mode: defOutboundMode, default_gaming_profile: defGamingProfile,
         ws_rate_max: wsRateMax, ws_rate_window: wsRateWindow, sub_update_interval: subUpdateInterval, max_xhttp_sessions: maxXhttpSessions,
-        region_socks_host: regionSocksHost, region_socks_range: regionSocksRange,
         keep_alive_enabled: keepAliveEnabled, keep_alive_mode: keepAliveMode, auto_disable_enabled: autoDisable,
         telegram_report_enabled: tgReport, telegram_notify_enabled: tgNotify,
         stealth_mode: stealthModeVal, landing_redirect: landingRedirect, camouflage_url: camouflageUrl, sub_filename: subFilename,
@@ -14952,7 +18254,7 @@ async function saveGeneralSettings(){
       })
     });
     timezoneOffset = parseFloat(tz) || 0;
-    toast('Saved & Applied');
+    toast(t('savedApplied'));
     if (panelPrefixVal !== (window.panelPrefix || '')) {
         setTimeout(() => {
             const newPrefix = panelPrefixVal ? '/' + panelPrefixVal : '';
@@ -14961,17 +18263,17 @@ async function saveGeneralSettings(){
     } else {
         loadGeneralSettings();
     }
-  } catch { toast('Error saving settings', true); }
+  } catch { toast(t('errorSavingSettings'), true); }
 }
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
-function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
+function toggleAdv(id){const el=$m(id);if(!el)return;el.style.display=getComputedStyle(el).display==='none'?'block':'none';}
 function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
-async function clearLogs(){if(!confirm('Clear all logs?'))return;await authenticatedFetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
+async function clearLogs(){if(!(await confirmDialog('Clear all logs?')))return;await authenticatedFetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
 async function fetchLogSize(){const r=await authenticatedFetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}, Size: ${d.size_kb} KB`);}
 async function resetAllSettings() {
     const msg = lang === 'fa' ? 'آیا مطمئن هستید؟ تمام تنظیمات (به جز رمز عبور) بازنشانی می‌شوند.' : 'Are you sure? All settings (except password) will return to defaults.';
-    if (!confirm(msg)) return;
+    if (!(await confirmDialog(msg))) return;
     try {
         const r = await authenticatedFetch('/api/settings/reset', { method: 'POST' });
         if (!r.ok) throw new Error((await r.json()).detail);
@@ -15002,7 +18304,7 @@ function startSSE() {
 function stopSSE() {
     if (sseConnection) { sseConnection.close(); sseConnection = null; }
 }
-document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','users','active-users','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
+document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
 if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
 setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated && !isInitialChecking){loadStats();}},15000);
@@ -15023,8 +18325,8 @@ async function saveBlockedDomains() {
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({domains: lines})
         });
-        toast('Saved');
-    } catch { toast('Error', true); }
+        toast(t('saved'));
+    } catch { toast(t('Error'), true); }
 }
 
 let selectedProxyIds = new Set();
@@ -15040,7 +18342,7 @@ async function loadProxyLines() {
 function renderProxyLines(lines) {
     const tbody = $m('proxy-lines-tbody');
     if (!lines.length) {
-        tbody.innerHTML = '<tr><td colspan="7">No proxy lines defined</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7">' + t('noProxyLinesDefined') + '</td></tr>';
         return;
     }
     tbody.innerHTML = lines.map(p => {
@@ -15087,8 +18389,8 @@ function toggleSelectAllProxies() {
 }
 
 async function deleteSelectedProxies() {
-    if (selectedProxyIds.size === 0) return toast('No proxy selected', true);
-    if (!confirm('Delete selected proxies?')) return;
+    if (selectedProxyIds.size === 0) return toast(t('noProxySelected'), true);
+    if (!(await confirmDialog('Delete selected proxies?', t('del')))) return;
     const ids = Array.from(selectedProxyIds);
     try {
         const r = await authenticatedFetch('/api/proxy-lines/bulk-delete', {
@@ -15102,24 +18404,24 @@ async function deleteSelectedProxies() {
         }
         selectedProxyIds.clear();
         loadProxyLines();
-        toast('Deleted');
+        toast(t('deleted'));
     } catch (e) {
         toast(e.message || 'Error', true);
     }
 }
 
 async function deleteFailedProxies() {
-    if (!confirm('Delete all failed proxies (based on last test)?')) return;
+    if (!(await confirmDialog('Delete all failed proxies (based on last test)?', t('del')))) return;
     try {
         const r = await authenticatedFetch('/api/proxy-lines/delete-failed', { method: 'POST' });
         const d = await r.json();
         if (d.ok) {
-            toast('Failed proxies deleted');
+            toast(t('failedProxiesDeleted'));
             loadProxyLines();
         } else {
-            toast('Error', true);
+            toast(t('Error'), true);
         }
-    } catch(e) { toast('Error', true); }
+    } catch(e) { toast(t('Error'), true); }
 }
 
 function copySelectedProxies() {
@@ -15131,9 +18433,9 @@ function copySelectedProxies() {
             ips.push(hostPort);
         }
     });
-    if (ips.length === 0) return toast('No proxy selected', true);
+    if (ips.length === 0) return toast(t('noProxySelected'), true);
     copyToClipboard(ips.join('\n'));
-    toast('Copied');
+    toast(t('copiedShort'));
 }
 
 async function resolveProxyFlags() {
@@ -15144,7 +18446,7 @@ async function resolveProxyFlags() {
         const d = await r.json();
         toast(`Flags resolved for ${d.resolved} proxies`);
         loadProxyLines();
-    } catch(e) { toast('Error', true); }
+    } catch(e) { toast(t('Error'), true); }
     if (btn) { btn.disabled = false; btn.textContent = '🌍 Resolve Flags'; }
 }
 
@@ -15162,7 +18464,7 @@ async function testProxyDirect(pid) {
         }
         toast(d.ok ? `OK (${d.latency_ms}ms)` : (d.error || 'Failed'));
     } catch(e) {
-        toast('Test failed', true);
+        toast(t('testFailed'), true);
     }
 }
 
@@ -15207,7 +18509,7 @@ async function saveProxy() {
         is_active: $m('proxy-active').classList.contains('on') ? 1 : 0
     };
     if (!body.name || !body.host || !body.port) {
-        toast('Fill required fields', true);
+        toast(t('fillRequired'), true);
         return;
     }
     try {
@@ -15227,17 +18529,17 @@ async function saveProxy() {
         $m('mo-proxy').classList.remove('show');
         loadProxyLines();
     } catch(e) {
-        toast('Error', true);
+        toast(t('Error'), true);
     }
 }
 
 async function deleteProxy(pid) {
-    if (!confirm('Delete this proxy?')) return;
+    if (!(await confirmDialog('Delete this proxy?', t('del')))) return;
     try {
         await authenticatedFetch('/api/proxy-lines/' + pid, {method:'DELETE'});
         loadProxyLines();
     } catch(e) {
-        toast('Error', true);
+        toast(t('Error'), true);
     }
 }
 
@@ -15271,9 +18573,26 @@ async function loadProxyOptionsEdit() {
     } catch(e) {}
 }
 
+async function refreshProxyFlagsAndOptions(context) {
+    const btn = document.querySelector(`#mo-${context === 'create' ? 'add' : 'edit'} button[onclick*="refreshProxyFlagsAndOptions"]`);
+    if (btn) btn.disabled = true;
+    try {
+        await authenticatedFetch('/api/proxy-lines/resolve-flags', {method:'POST'});
+        if (context === 'create') {
+            await loadProxyOptionsCreate();
+        } else {
+            await loadProxyOptionsEdit();
+        }
+        toast(t('Proxy flags refreshed'));
+    } catch(e) {
+        toast(t('Error'), true);
+    }
+    if (btn) btn.disabled = false;
+}
+
 async function importProxiesBulk() {
     const raw = $m('proxy-bulk').value.trim();
-    if (!raw) return toast('No data', true);
+    if (!raw) return toast(t('noData'), true);
     const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
     const proxies = [];
     const defaultType = $m('proxy-default-type').value || 'socks5';
@@ -15302,7 +18621,7 @@ async function importProxiesBulk() {
         const name = user ? `${host}:${port} (${user})` : `${host}:${port}`;
         proxies.push({ name, type, host, port, username: user, password: pass, is_active: 1 });
     }
-    if (!proxies.length) return toast('No valid proxies', true);
+    if (!proxies.length) return toast(t('noValidProxies'), true);
 
     try {
         const r = await authenticatedFetch('/api/proxy-lines/bulk', {
@@ -15315,7 +18634,7 @@ async function importProxiesBulk() {
         $m('proxy-bulk').value = '';
         loadProxyLines();
     } catch(e) {
-        toast('Bulk import failed', true);
+        toast(t('bulkImportFailed'), true);
     }
 }
 
@@ -15388,14 +18707,14 @@ async function testAllProxies() {
                 return latA - latB;
             });
             rows.forEach(function(row) { tbody.appendChild(row); });
-            toast('All proxies tested');
+            toast(t('proxiesTested'));
         }
     } catch (e) {
         if (e.name !== 'AbortError') {
-            toast('Test failed', true);
+            toast(t('testFailed'), true);
         }
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Test All'; }
+        if (btn) { btn.disabled = false; btn.textContent = t('testAll'); }
         if (stopBtn) stopBtn.style.display = 'none';
         proxyTestAbortController = null;
     }
@@ -15405,25 +18724,8 @@ function stopProxyTest() {
     if (proxyTestAbortController) {
         proxyTestAbortController.abort();
         proxyTestAbortController = null;
-        toast('Test stopped');
+        toast(t('testStopped'));
     }
-}
-
-async function refreshProxyFlagsAndOptions(context) {
-    const btn = document.querySelector(`#mo-${context === 'create' ? 'add' : 'edit'} button[onclick*="refreshProxyFlagsAndOptions"]`);
-    if (btn) btn.disabled = true;
-    try {
-        await authenticatedFetch('/api/proxy-lines/resolve-flags', {method:'POST'});
-        if (context === 'create') {
-            await loadProxyOptionsCreate();
-        } else {
-            await loadProxyOptionsEdit();
-        }
-        toast(t('Proxy flags refreshed'));
-    } catch(e) {
-        toast(t('Error'), true);
-    }
-    if (btn) btn.disabled = false;
 }
 
 document.addEventListener('keydown', function(e) {
