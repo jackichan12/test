@@ -121,7 +121,7 @@ def http_proxy_link(host, port, username, password):
 
 
 def _mtproxy_candidates():
-    out = [("", _SECRET)]
+    out = []
     for uid, secret in list(_MTPROXY_LINK_SECRETS.items()):
         out.append((uid, secret))
     return out
@@ -307,6 +307,8 @@ async def _handle_mtproxy(reader, writer):
         ok = await _COUNT_TRAFFIC(mt_uid, delta)
         if ok:
             mt_totals[direction + "_flushed"] = mt_totals[direction]
+            if mt_entry is not None:
+                mt_entry["bytes_flushed"] = mt_totals["up_flushed"] + mt_totals["down_flushed"]
         return ok
     try:
         if _MTPROXY_QUOTA_OK is not None:
@@ -351,6 +353,9 @@ async def _handle_mtproxy(reader, writer):
                 return
             mt_secret = matched_secret
             mt_uid = matched_uid
+        if not mt_uid:
+            writer.close()
+            return
         replay_key = hashlib.sha256(init).digest()[:16]
         if replay_key in _REPLAY:
             writer.close()
@@ -476,7 +481,7 @@ async def _handle_mtproxy(reader, writer):
             return total
         peer = writer.get_extra_info("peername")
         mt_sid = "mtproxy-" + os.urandom(6).hex()
-        mt_entry = {"id": mt_sid, "username": mt_uid, "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "writer": writer}
+        mt_entry = {"id": mt_sid, "username": mt_uid, "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
         ACTIVE_PROXY[mt_sid] = mt_entry
         await asyncio.gather(_client_to_up(), _up_to_client())
         if mt_uid:
@@ -501,6 +506,8 @@ async def _handle_socks5(reader, writer):
     _STATS["socks_connections"] += 1
     link = None
     total_bytes = 0
+    up_flushed = 0
+    down_flushed = 0
     sid = None
     entry = None
     try:
@@ -612,20 +619,30 @@ async def _handle_socks5(reader, writer):
 
         peer = writer.get_extra_info("peername")
         sid = "socks5-" + os.urandom(6).hex()
-        entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "writer": writer}
+        entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
         ACTIVE_PROXY[sid] = entry
 
         async def _count(n, direction):
-            nonlocal total_bytes
+            nonlocal total_bytes, up_flushed, down_flushed
             total_bytes += n
             _STATS["socks_bytes"] += n
+            pending = 0
             if entry is not None:
                 if direction == "up":
                     entry["bytes_up"] += n
+                    pending = entry["bytes_up"] - up_flushed
                 else:
                     entry["bytes_down"] += n
-            if _COUNT_TRAFFIC is not None and total_bytes % 1048576 < 65536:
-                if not await _COUNT_TRAFFIC(uid, 0):
+                    pending = entry["bytes_down"] - down_flushed
+            if _COUNT_TRAFFIC is not None and pending >= 1048576:
+                if await _COUNT_TRAFFIC(uid, pending):
+                    if direction == "up":
+                        up_flushed += pending
+                    else:
+                        down_flushed += pending
+                    if entry is not None:
+                        entry["bytes_flushed"] = up_flushed + down_flushed
+                else:
                     try:
                         writer.close()
                     except OSError:
@@ -663,9 +680,9 @@ async def _handle_socks5(reader, writer):
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
-        if link is not None and _COUNT_TRAFFIC is not None and total_bytes > 0:
+        if link is not None and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
             try:
-                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes)
+                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes - (up_flushed + down_flushed))
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
@@ -680,6 +697,8 @@ async def _handle_http_proxy(reader, writer):
     _STATS["http_connections"] += 1
     link = None
     total_bytes = 0
+    up_flushed = 0
+    down_flushed = 0
     sid = None
     entry = None
     target_writer = None
@@ -783,19 +802,29 @@ async def _handle_http_proxy(reader, writer):
         await writer.drain()
         peer = writer.get_extra_info("peername")
         sid = "http-" + os.urandom(6).hex()
-        entry = {"id": sid, "username": username, "protocol": "http-proxy", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "writer": writer}
+        entry = {"id": sid, "username": username, "protocol": "http-proxy", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
         ACTIVE_PROXY[sid] = entry
         async def _count(n, direction):
-            nonlocal total_bytes
+            nonlocal total_bytes, up_flushed, down_flushed
             total_bytes += n
             _STATS["http_bytes"] += n
+            pending = 0
             if entry is not None:
                 if direction == "up":
                     entry["bytes_up"] += n
+                    pending = entry["bytes_up"] - up_flushed
                 else:
                     entry["bytes_down"] += n
-            if _COUNT_TRAFFIC is not None and total_bytes % 1048576 < 65536:
-                if not await _COUNT_TRAFFIC(uid, 0):
+                    pending = entry["bytes_down"] - down_flushed
+            if _COUNT_TRAFFIC is not None and pending >= 1048576:
+                if await _COUNT_TRAFFIC(uid, pending):
+                    if direction == "up":
+                        up_flushed += pending
+                    else:
+                        down_flushed += pending
+                    if entry is not None:
+                        entry["bytes_flushed"] = up_flushed + down_flushed
+                else:
                     try:
                         writer.close()
                     except OSError:
@@ -831,9 +860,9 @@ async def _handle_http_proxy(reader, writer):
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
-        if link is not None and _COUNT_TRAFFIC is not None and total_bytes > 0:
+        if link is not None and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
             try:
-                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes)
+                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes - (up_flushed + down_flushed))
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
@@ -1009,18 +1038,22 @@ def webproxy_disconnect_session(sid):
 
 
 async def _webproxy_flush_session(session, force=False):
-    if not session.uid or _WEB_HOOKS.get("count") is None:
-        return True
-    delta = (session.bytes_up - session.flushed_up) + (session.bytes_down - session.flushed_down)
-    if delta <= 0:
-        return True
-    if not force and delta < 1048576:
-        return True
-    ok = await _WEB_HOOKS["count"](session.uid, delta)
-    if ok:
-        session.flushed_up = session.bytes_up
-        session.flushed_down = session.bytes_down
-    return ok
+    async with session.flush_lock:
+        if not session.uid or _WEB_HOOKS.get("count") is None:
+            return True
+        delta = (session.bytes_up - session.flushed_up) + (session.bytes_down - session.flushed_down)
+        if delta <= 0:
+            return True
+        if not force and delta < 1048576:
+            return True
+        ok = await _WEB_HOOKS["count"](session.uid, delta)
+        if ok:
+            session.flushed_up = session.bytes_up
+            session.flushed_down = session.bytes_down
+            _entry = _WEB_ACTIVE.get(session.sid)
+            if _entry is not None:
+                _entry["bytes_flushed"] = session.flushed_up + session.flushed_down
+        return ok
 
 
 
@@ -1590,6 +1623,7 @@ class _WebProxySession:
         self.sid = "webproxy-" + os.urandom(6).hex()
         self.flushed_up = 0
         self.flushed_down = 0
+        self.flush_lock = asyncio.Lock()
         self.lane_used = False
         self.streams = {}
         self.closed = False
@@ -1606,7 +1640,7 @@ class _WebProxySession:
         self.keepalive_task = None
         _WEB_STATS["sessions"] += 1
         _WEB_STATS["sessions_active"] += 1
-        _WEB_ACTIVE[self.sid] = {"id": self.sid, "username": self.uid, "protocol": "webproxy", "client_ip": self.client_ip, "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "mode": self.mode, "session": self}
+        _WEB_ACTIVE[self.sid] = {"id": self.sid, "username": self.uid, "protocol": "webproxy", "client_ip": self.client_ip, "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "mode": self.mode, "session": self}
         _webproxy_log("session_open", "lane=" + str(lane_id) + " carrier=" + WEBPROXY_CARRIER)
 
     def send_frame(self, data):
@@ -1680,7 +1714,9 @@ class _WebProxySession:
                     if _entry is not None:
                         _entry["bytes_down"] = self.bytes_down
                     if self.uid:
-                        await _webproxy_flush_session(self)
+                        if not await _webproxy_flush_session(self):
+                            await self.shutdown()
+                            break
                 finally:
                     self.send_queue.task_done()
         except asyncio.CancelledError:
@@ -1737,6 +1773,7 @@ class _WebProxySession:
             pass
         finally:
             self.dispose()
+            await _webproxy_flush_session(self, force=True)
             if self.sender_task is not None:
                 try:
                     try:
@@ -1765,7 +1802,9 @@ class _WebProxySession:
         if _entry is not None:
             _entry["bytes_up"] = self.bytes_up
         if self.uid:
-            await _webproxy_flush_session(self)
+            if not await _webproxy_flush_session(self):
+                await self.shutdown()
+                raise _WebProxyProtocolError("quota exceeded")
         offset = 0
         frames = 0
         while offset < len(raw):
@@ -1886,6 +1925,10 @@ async def webproxy_websocket_handler(websocket, protocol=None):
         _WEB_STATS["ws_rejects"] += 1
         raise ValueError("unsupported token mode")
     _ws_uid = webproxy_uid_for_mode(verified["mode"])
+    if not _ws_uid:
+        _WEB_STATS["ws_rejects"] += 1
+        _webproxy_log("ws_reject", "no WEB proxy link for this port")
+        raise ValueError("no WEB proxy link for this port")
     _ws_ip = ""
     try:
         _client = getattr(websocket, "client", None)
