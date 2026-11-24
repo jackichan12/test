@@ -128,6 +128,8 @@ def _mtproxy_candidates():
 
 
 def _mtproxy_match_plain(init):
+    if init[0] == 0xEF:
+        return None, None
     for uid, secret in _mtproxy_candidates():
         try:
             enc_key, enc_iv, dec_key, dec_iv = _derive_obfs_keys(init, secret)
@@ -1144,11 +1146,28 @@ def webproxy_link(host, port):
     return "tg://webproxy?server=" + str(host) + suffix + "&secret=" + secret
 
 
+def webproxy_link_https(host, port):
+    port = int(port)
+    secret = webproxy_per_port_secret(port)
+    suffix = "" if port == 443 else "&port=" + str(port)
+    return "https://t.me/webproxy?server=" + str(host) + suffix + "&secret=" + secret
+
+
 def webproxy_links(host):
     out = []
     for port in WEB_PROXY_PORTS:
-        out.append({"port": port, "secret": webproxy_per_port_secret(port), "link": webproxy_link(host, port)})
+        out.append({"port": port, "secret": webproxy_per_port_secret(port), "link": webproxy_link(host, port), "link_https": webproxy_link_https(host, port)})
     return out
+
+
+def webproxy_port_for_secret(secret):
+    raw = _webproxy_parse_secret(secret)
+    if raw is None:
+        return None
+    for port in WEB_PROXY_PORTS:
+        if webproxy_per_port_secret_bytes(port) == raw:
+            return port
+    return None
 
 
 def _b64u_encode(data):
@@ -1243,8 +1262,34 @@ def _webproxy_secret_for_mode(mode):
     return None
 
 
+def _webproxy_decode_capability(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    decoded = _b64u_decode_strict(text)
+    if decoded is not None and len(decoded) == 32:
+        return decoded
+    cleaned = text.replace(" ", "+").replace("-", "+").replace("_", "/")
+    padded = cleaned + "=" * ((4 - len(cleaned) % 4) % 4)
+    try:
+        raw = base64.b64decode(padded.encode("ascii"), validate=True)
+    except (ValueError, TypeError):
+        raw = None
+    if raw is not None and len(raw) == 32:
+        return raw
+    lowered = text.lower()
+    if len(lowered) == 64 and all(c in "0123456789abcdef" for c in lowered):
+        try:
+            return bytes.fromhex(lowered)
+        except ValueError:
+            return None
+    return None
+
+
 def webproxy_verify_bridge_capability(host, capability, port=None):
-    provided = _b64u_decode_strict(capability)
+    provided = _webproxy_decode_capability(capability)
     if provided is None or len(provided) != 32:
         return -1
     host = str(host).strip().lower()
