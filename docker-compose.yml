@@ -3,29 +3,12 @@ services:
     build: .
     image: sulgx-panel:1.5.8
     container_name: sulgx-panel
+    env_file:
+      - .env
     environment:
-      - PORT=8000
       - DB_PATH=/data/panel.db
-      - TRUSTED_PROXY_IPS=127.0.0.1,::1
-      - STEALTH_MODE=0
-      - SOCKS_PORT=0
-      - TG_PROXY_PORT=0
-      - HTTP_PROXY_PORT=0
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
-      - SECRET_KEY=${SECRET_KEY:-}
-      - DOMAIN=${DOMAIN:-}
-      - DATABASE_URL=${DATABASE_URL:-}
-      - PROXY_ENCRYPTION_KEY=${PROXY_ENCRYPTION_KEY:-}
-      - PANEL_PREFIX=${PANEL_PREFIX:-}
-      - PANEL_ALLOWED_ORIGINS=${PANEL_ALLOWED_ORIGINS:-}
-      - PROXY_WHITELIST=${PROXY_WHITELIST:-}
-      - TG_PROXY_SECRET=${TG_PROXY_SECRET:-}
-      - TG_WEB_SECRET=${TG_WEB_SECRET:-}
-      - LANDING_REDIRECT=${LANDING_REDIRECT:-}
-      - CAMOUFLAGE_URL=${CAMOUFLAGE_URL:-}
-      - SUB_FILENAME=${SUB_FILENAME:-}
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     volumes:
       - sulgx-data:/data
     restart: unless-stopped
