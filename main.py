@@ -2397,8 +2397,14 @@ else:
     async def init_db():
         global db_conn
         db_path = CONFIG["db_path"]
+        db_dir = os.path.dirname(db_path) or "."
         try:
-            test_file = os.path.join(os.path.dirname(db_path), ".write_test")
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Cannot create database directory for {db_path}: {e}")
+            raise RuntimeError("Cannot write to database directory for " + db_path + ". Fix DB_PATH permissions instead of using a fallback database.")
+        try:
+            test_file = os.path.join(db_dir, ".write_test")
             with open(test_file, "w") as f:
                 f.write("ok")
             os.remove(test_file)
