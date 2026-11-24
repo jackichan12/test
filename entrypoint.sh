@@ -51,6 +51,7 @@ SULGX_GENERATED_ADMIN=no
 if [ -z "${DATABASE_URL:-}" ]; then
   if [ "$SULGX_DB_HAS_ADMIN_HASH" = "no" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
     case "${ADMIN_PASSWORD}" in
+      admin) ;;
       ????????*) ;;
       *)
         printf '%s\n' "SulgX entrypoint: ADMIN_PASSWORD must be at least 8 characters" >&2
@@ -59,9 +60,9 @@ if [ -z "${DATABASE_URL:-}" ]; then
     esac
   fi
   if [ "$SULGX_DB_HAS_ADMIN_HASH" = "no" ] && [ -z "${ADMIN_PASSWORD:-}" ]; then
-    SULGX_NEW_ADMIN_PASSWORD="$(python3 -c "import secrets; alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@%^*()-_=+'; lower = secrets.choice('abcdefghijklmnopqrstuvwxyz'); upper = secrets.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ'); digit = secrets.choice('0123456789'); symbol = secrets.choice('!@%^*()-_=+'); chars = [lower, upper, digit, symbol] + [secrets.choice(alphabet) for _ in range(16)]; secrets.SystemRandom().shuffle(chars); print(''.join(chars))")"
-    printf '%s\n' "ADMIN_PASSWORD='$SULGX_NEW_ADMIN_PASSWORD'" >> "$ENV_FILE"
-    export ADMIN_PASSWORD="$SULGX_NEW_ADMIN_PASSWORD"
+    SULGX_NEW_ADMIN_PASSWORD="admin"
+    printf '%s\n' "ADMIN_PASSWORD='admin'" >> "$ENV_FILE"
+    export ADMIN_PASSWORD="admin"
     SULGX_GENERATED_ADMIN=yes
   fi
   if [ "$SULGX_DB_HAS_SECRET" = "no" ] && [ -z "${SECRET_KEY:-}" ]; then
@@ -84,7 +85,7 @@ if [ "$SULGX_GENERATED_ADMIN" = "yes" ]; then
   printf '%s\n' "SulgX Panel first-boot admin credentials" "Admin password: $SULGX_NEW_ADMIN_PASSWORD" "Change this password from the panel after first login." > "$CRED_FILE"
   chmod 600 "$CRED_FILE"
   chown sulgx:sulgx "$CRED_FILE"
-  printf '%s\n' "SulgX first boot: generated admin password (shown once, also saved to $CRED_FILE): $SULGX_NEW_ADMIN_PASSWORD"
+  printf '%s\n' "SulgX first boot: using default admin password 'admin' (change it after first login, also saved to $CRED_FILE)"
 fi
 if [ -z "${1:-}" ]; then
   set -- python main.py
