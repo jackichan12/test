@@ -4,7 +4,7 @@ services:
     image: sulgx-panel:1.5.8
     container_name: sulgx-panel
     env_file:
-      - .env
+      - .env.bunnyshell
     environment:
       - DB_PATH=/data/panel.db
     ports:
