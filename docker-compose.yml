@@ -3,10 +3,11 @@ services:
     build: .
     image: sulgx-panel:1.5.8
     container_name: sulgx-panel
-    env_file:
-      - .env.bunnyshell
     environment:
+      - PORT=${PORT:-8000}
       - DB_PATH=/data/panel.db
+      - TRUSTED_PROXY_IPS=127.0.0.1,::1
+      - STEALTH_MODE=0
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:
