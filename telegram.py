@@ -971,6 +971,9 @@ WEBPROXY_ME_CONSTANTS = {
 }
 _WEB_BASE = None
 _WEB_BASE_FROM = ""
+_WEB_CONFIGURED = False
+_WEB_CONFIGURE_ERROR = ""
+_WEB_CONFIGURE_SOURCE = ""
 _WEB_STARTED = time.time()
 _WEB_STATS = {
     "sessions": 0,
@@ -1083,24 +1086,37 @@ def _webproxy_parse_secret(value):
 
 
 def webproxy_configure(base_secret=None, secret_key=None):
-    global _WEB_BASE, _WEB_BASE_FROM
-    if base_secret is not None:
-        if isinstance(base_secret, (bytes, bytearray)):
-            if len(base_secret) != 16:
-                raise ValueError("web proxy base secret must be 16 bytes")
-            _WEB_BASE = bytes(base_secret)
+    global _WEB_BASE, _WEB_BASE_FROM, _WEB_CONFIGURED, _WEB_CONFIGURE_ERROR, _WEB_CONFIGURE_SOURCE
+    try:
+        if base_secret is not None:
+            if isinstance(base_secret, (bytes, bytearray)):
+                if len(base_secret) != 16:
+                    raise ValueError("web proxy base secret must be 16 bytes")
+                _WEB_BASE = bytes(base_secret)
+            else:
+                parsed = _webproxy_parse_secret(base_secret)
+                if parsed is None:
+                    raise ValueError("web proxy base secret must be 32 hex chars or dd plus 32 hex chars")
+                _WEB_BASE = parsed
+            _WEB_BASE_FROM = "explicit"
+        elif secret_key is not None:
+            _WEB_BASE = hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(secret_key).encode("utf-8")).digest()[:16]
+            _WEB_BASE_FROM = "SECRET_KEY"
         else:
-            parsed = _webproxy_parse_secret(base_secret)
-            if parsed is None:
-                raise ValueError("web proxy base secret must be 32 hex chars or dd plus 32 hex chars")
-            _WEB_BASE = parsed
-        _WEB_BASE_FROM = "explicit"
-    elif secret_key is not None:
-        _WEB_BASE = hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(secret_key).encode("utf-8")).digest()[:16]
-        _WEB_BASE_FROM = "SECRET_KEY"
-    else:
-        raise ValueError("webproxy_configure needs base_secret or secret_key")
+            raise ValueError("webproxy_configure needs base_secret or secret_key")
+    except (ValueError, TypeError) as exc:
+        _WEB_CONFIGURED = False
+        _WEB_CONFIGURE_ERROR = str(exc)
+        _WEB_CONFIGURE_SOURCE = ""
+        raise
+    _WEB_CONFIGURED = True
+    _WEB_CONFIGURE_ERROR = ""
+    _WEB_CONFIGURE_SOURCE = _WEB_BASE_FROM
     return {"configured": True, "source": _WEB_BASE_FROM}
+
+
+def webproxy_configure_state():
+    return {"configured": bool(_WEB_CONFIGURED and _WEB_BASE is not None), "source": _WEB_CONFIGURE_SOURCE, "error": _WEB_CONFIGURE_ERROR}
 
 
 def _webproxy_base_secret():
@@ -2215,6 +2231,8 @@ def webproxy_status():
     except (RuntimeError, ValueError):
         configured = False
         source = ""
+    if _WEB_BASE is None and _WEB_CONFIGURE_ERROR:
+        configured = False
     return {
         "version": WEBPROXY_VERSION,
         "carrier": WEBPROXY_CARRIER,
@@ -2222,6 +2240,7 @@ def webproxy_status():
         "me_supported": WEBPROXY_ME_SUPPORTED,
         "configured": configured,
         "secret_source": source,
+        "configure_error": _WEB_CONFIGURE_ERROR,
         "ports": list(WEB_PROXY_PORTS),
         "sessions": _WEB_STATS["sessions"],
         "sessions_active": _WEB_STATS["sessions_active"],
@@ -2235,6 +2254,52 @@ def webproxy_status():
         "dc_probe": list(_WEB_LAST_PROBE),
         "recent_events": list(_WEB_LOG[-60:]),
     }
+
+
+def webproxy_capability_for(host, port):
+    port = int(port)
+    secret = webproxy_per_port_secret_bytes(port)
+    host = str(host).strip().lower()
+    mac = hmac_mod.new(secret, ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(port)).encode("utf-8"), hashlib.sha256).digest()
+    return _b64u_encode(mac)
+
+
+def webproxy_build_client_obfs_header(secret, dc=1, tag=None):
+    if tag is None:
+        tag = TAG_ABRIDGED
+    init = bytearray(os.urandom(64))
+    while init[0] == 0xEF:
+        init[0] = os.urandom(1)[0]
+    init[56:60] = tag
+    init[60:62] = struct.pack("<h", int(dc))
+    enc_key, enc_iv, _dk, _di = _derive_obfs_keys(bytes(init), bytes(secret))
+    cipher = _aes_ctr(enc_key, enc_iv).encryptor()
+    encrypted = cipher.update(bytes(init))
+    return bytes(init[:56]) + encrypted[56:64]
+
+
+def webproxy_self_check(host):
+    if not _WEB_CONFIGURED or _WEB_BASE is None:
+        if _WEB_CONFIGURE_ERROR:
+            return {"ok": False, "detail": "web proxy configure failed: " + _WEB_CONFIGURE_ERROR}
+        return {"ok": False, "detail": "web proxy was never configured at startup"}
+    try:
+        host = str(host or "").strip().lower() or "localhost"
+        capability = webproxy_capability_for(host, 443)
+        mode = webproxy_verify_bridge_capability(host, capability, 443)
+        if mode != WEBPROXY_PORT_MODE_BASE:
+            return {"ok": False, "detail": "web proxy capability for port 443 did not verify (mode " + str(mode) + "); the secret used to build links is not the secret the bridge verifies with"}
+        bootstrap = webproxy_bootstrap_token(mode=mode)
+        verified = webproxy_verify_token(bootstrap, WEBPROXY_TOKEN_BOOTSTRAP)
+        if verified is None or verified.get("mode") != mode:
+            return {"ok": False, "detail": "web proxy bootstrap token did not verify"}
+        issued = webproxy_issue_session(bootstrap, WEBPROXY_HANDSHAKE)
+        session_token = issued.get("session_token", "")
+        if not session_token or webproxy_verify_token(session_token, WEBPROXY_TOKEN_SESSION) is None:
+            return {"ok": False, "detail": "web proxy session token did not verify"}
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "detail": "web proxy self-check failed: " + str(exc)}
+    return {"ok": True, "detail": "capability verifies for port 443, bootstrap and session tokens issue and verify"}
 
 
 async def _webproxy_probe_one(dc, timeout):
