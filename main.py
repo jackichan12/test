@@ -2066,6 +2066,33 @@ def _proxy_listener_warning(protocol):
     return ""
 
 
+def _listener_cards(public_port):
+    port = str(public_port or "")
+    ws_path = "/ws/{uuid} · /{random}/ws/{uuid} · /xhttp/{session}"
+    cards = [
+        {"id": "vless", "name": "VLESS", "protocol": "vless-ws", "tag": "ws-in · xhttp-in", "port": port, "path": ws_path, "enabled": True, "reason": "", "reason_code": "running_panel"},
+        {"id": "vmess", "name": "VMess", "protocol": "vmess-ws", "tag": "ws-in · xhttp-in", "port": port, "path": ws_path, "enabled": True, "reason": "", "reason_code": "running_panel"},
+        {"id": "trojan", "name": "Trojan", "protocol": "trojan-ws", "tag": "ws-in · xhttp-in", "port": port, "path": ws_path, "enabled": True, "reason": "", "reason_code": "running_panel"},
+        {"id": "shadowsocks", "name": "Shadowsocks", "protocol": "ss-ws", "tag": "ws-in · xhttp-in", "port": port, "path": ws_path, "enabled": True, "reason": "", "reason_code": "running_panel"},
+    ]
+    for _pid, _pname, _pport, _ptag in (("socks5", "SOCKS5", SOCKS_PORT, "socks5-in"), ("mtproto", "MTProto", TG_PROXY_PORT, "mtproxy-in"), ("http-proxy", "HTTP proxy", HTTP_PROXY_PORT, "http-proxy-in")):
+        _on = _proxy_listener_enabled(_pid)
+        if _on:
+            _code = "running"
+            _why = ""
+        elif not _pport:
+            _code = "no_port"
+            _why = _proxy_disabled_reason(_pid)
+        else:
+            _err = (TG_PROXY_STATUS.get({"socks5": "socks", "mtproto": "mtproxy", "http-proxy": "http"}.get(_pid, ""), {}) or {}).get("error", "") or ""
+            _code = "listener_failed" if _err else "disabled"
+            _why = _proxy_disabled_reason(_pid)
+        cards.append({"id": _pid, "name": _pname, "protocol": _pid, "tag": _ptag, "port": str(_pport) if _pport else "—", "path": "Raw TCP listener, NOT the panel HTTPS port", "enabled": bool(_on), "reason": _why, "reason_code": _code})
+    _web_on = _proxy_listener_enabled("webproxy")
+    cards.append({"id": "webproxy", "name": "WEB proxy", "protocol": "webproxy", "tag": "webproxy-in", "port": str(WEBPROXY_PUBLIC_PORT), "path": "panel HTTPS port, bridge at /tgweb and at / with a valid capability", "enabled": bool(_web_on), "reason": "" if _web_on else _proxy_disabled_reason("webproxy"), "reason_code": "running_panel" if _web_on else "not_configured"})
+    return cards
+
+
 PROXY_LISTENER_PROBE_TTL = 30.0
 _PROXY_LISTENER_PROBE_AT = 0.0
 _PROXY_LISTENER_PROBE_LOCK = asyncio.Lock()
@@ -6096,7 +6123,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
 async def list_inbounds(request: Request, _=Depends(require_auth)):
     defs = get_inbound_definitions()
     _domain, _domain_source, _tls, public_port, _ws_scheme, _http_scheme = _test_public_address(request)
-    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_status": TG_PROXY_STATUS, "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {}}
+    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_status": TG_PROXY_STATUS, "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {}, "listener_cards": _listener_cards(public_port)}
 
 
 @app.get("/api/outbounds")
@@ -17532,28 +17559,51 @@ async function fetchJsonTimeout(url,ms){
     throw e;
   }finally{clearTimeout(timer);}
 }
+function inbOutReasonText(c){
+  const base={
+    running_panel: lang==='fa'?'روی پورت HTTPS پنل در حال کار است':'Running on the panel HTTPS port',
+    running: lang==='fa'?'در حال کار است':'Running',
+    no_port: lang==='fa'?'پورت ۰ — روی این هاست شنونده‌ای نیست':'Port 0 — no listener on this host',
+    listener_failed: lang==='fa'?'شنونده خطا داد':'Listener failed',
+    disabled: lang==='fa'?'روی این هاست خاموش است':'Disabled on this host',
+    not_configured: lang==='fa'?'پیکربندی نشده است':'Not configured'
+  }[c.reason_code]||(lang==='fa'?'نامشخص':'Unknown');
+  return c.reason ? base+' — '+c.reason : base;
+}
+function inbOutCardHtml(c, desc){
+  const on=!!c.enabled;
+  const dot=on?'var(--green)':'var(--red)';
+  const glow=on?'rgba(74,222,128,.25)':'rgba(248,113,113,.25)';
+  const lbl=on?(lang==='fa'?'روشن':'ON'):(lang==='fa'?'خاموش':'OFF');
+  const tagCls=on?'tag-on':'tag-off';
+  const portLbl=lang==='fa'?'پورت':'Port';
+  return '<div style="border:1px solid var(--border);border-radius:12px;padding:12px;background:var(--surface);min-width:0;">'
+    +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+    +'<span style="width:12px;height:12px;border-radius:50%;background:'+dot+';box-shadow:0 0 0 3px '+glow+';flex:none;"></span>'
+    +'<b>'+esc(c.name||'')+'</b>'
+    +'<span class="tag '+tagCls+'">'+lbl+'</span>'
+    +(c.tag?'<span class="tag">'+esc(c.tag)+'</span>':'')
+    +'<span style="margin-inline-start:auto;color:var(--text3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String(c.port||'—'))+'</span></span>'
+    +'</div>'
+    +'<div style="color:var(--text3);font-size:0.85rem;margin-top:8px;direction:ltr;text-align:left;word-break:break-all;">'+esc(c.path||'')+'</div>'
+    +(desc?'<div style="color:var(--text2);font-size:0.85rem;margin-top:4px;">'+esc(desc)+'</div>':'')
+    +'<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">'+esc(inbOutReasonText(c))+'</div>'
+    +'</div>';
+}
 async function loadInbOutCard(){
   const body=$m('inb-out-body');
   if(body)body.innerHTML='<div style="color:var(--text3);font-size:0.9rem;"><span class="hc-spin"></span> '+(lang==='fa'?'در حال بارگذاری…':'Loading…')+'</div>';
   try{
     const [di,dout,dpro]=await Promise.all([fetchJsonTimeout('/api/inbounds',15000),fetchJsonTimeout('/api/outbounds',15000),fetchJsonTimeout('/api/protocols',15000)]);
+    if(!di.listener_cards||!di.listener_cards.length)throw new Error('listener_cards missing');
     const pubPort=di.single_port_host?(di.webproxy_public_port||443):(di.panel_port||window.location.port||'');
-    const shownPort=(p)=>{
-      if(p==='PORT env')return String(pubPort);
-      if(p==='SOCKS_PORT env')return String(di.socks_port||0);
-      if(p==='TG_PROXY_PORT env')return String(di.mtproxy_port||0);
-      if(p==='HTTP_PROXY_PORT env')return String(di.http_proxy_port||0);
-      return String(p||'');
-    };
-    const proto=(dpro.protocols||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.id||'')+'</b><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.description||'')+'</div></div>').join('')||'<div>No protocols</div>';
-    const inb=(di.inbounds||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.tag||'')+'</b> <span class="tag">'+esc(x.type||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.path||'')+' · port: '+esc(shownPort(x.port))+'</div><div style="color:var(--text3);font-size:0.85rem;">'+esc((x.protocols||[]).join(', '))+'</div>'+(x.note?'<div style="color:var(--text3);font-size:0.85rem;">'+esc(x.note)+'</div>':'')+'</div>').join('')||'<div>No inbounds</div>';
-    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.flag||'')+' '+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>' + t('noProxyLines') + '</div>';
+    const descs={};(dpro.protocols||[]).forEach(x=>{descs[x.id]=x.description||'';});
+    const xhttpModes=(dpro.protocols||[]).filter(x=>(x.id||'').indexOf('xhttp')===0).map(x=>x.id).join(', ');
+    const cards=di.listener_cards.map(c=>{let d=descs[c.protocol]||'';if(c.id==='vless'&&xhttpModes)d+=' · XHTTP: '+xhttpModes;return inbOutCardHtml(c,d);}).join('');
     const headIn=(lang==='fa'?'اینباندها (WS/XHTTP روی پورت ':'Inbounds (WS/XHTTP on port ')+esc(String(pubPort))+')';
     const headOut=lang==='fa'?'خروجی‌ها (پروکسی لاین‌ها)':'Outbounds (proxy lines)';
-    const headProto=lang==='fa'?'پروتکل‌ها':'Protocols';
-    const socksLbl=lang==='fa'?'پورت SOCKS5: ':'SOCKS5 port: ';
-    const mtpLbl=lang==='fa'?'پورت MTProto: ':'MTProto port: ';
-    if(body){body.innerHTML='<div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">'+headIn+'</div>'+inb+'<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">'+socksLbl+esc(String(di.socks_port||0))+' · '+mtpLbl+esc(String(di.mtproxy_port||0))+'</div></div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">'+headOut+'</div>'+out+'</div><div style="min-width:0;"><div class="card-title" style="margin-bottom:6px;">'+headProto+'</div>'+proto+'</div>';body.setAttribute('data-loaded','1');}
+    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.flag||'')+' '+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>'+t('noProxyLines')+'</div>';
+    if(body){body.innerHTML='<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headIn+'</div></div>'+cards+'<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headOut+'</div>'+out+'</div>';body.setAttribute('data-loaded','1');}
     return true;
   }catch(e){ const b=$m('inb-out-body'); if(b)b.innerHTML='<div style="color:var(--red);font-size:0.9rem;">'+(lang==='fa'?'بارگذاری ورودی‌ها و خروجی‌ها ناموفق بود: ':'Failed to load Inbounds and Outbounds: ')+esc(String(e&&e.message?e.message:e))+'</div><button class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="loadInbOutCard()" data-en="Retry" data-fa="تلاش دوباره">Retry</button>'; return false; }
 }
