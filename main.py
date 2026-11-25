@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import hashlib
@@ -22,7 +23,7 @@ except ImportError:
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher
     from cryptography.hazmat.primitives.ciphers.algorithms import AES
-    from cryptography.hazmat.primitives.ciphers.modes import ECB
+    from cryptography.hazmat.primitives.ciphers.modes import ECB, CTR
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
@@ -110,7 +111,382 @@ TG_PROXY_PORT = int(os.environ.get("TG_PROXY_PORT", "8443") or 0)
 HTTP_PROXY_PORT = int(os.environ.get("HTTP_PROXY_PORT", "3128") or 0)
 TG_PROXY_STATUS = {"socks": {"enabled": False, "port": 0, "error": ""}, "mtproxy": {"enabled": False, "port": 0, "error": ""}, "http": {"enabled": False, "port": 0, "error": ""}, "webproxy": {"enabled": False, "port": 0, "error": ""}}
 SINGLE_PORT_HOST = not SOCKS_PORT and not TG_PROXY_PORT and not HTTP_PROXY_PORT
-WEBPROXY_STATE = {"configure_error": "", "self_check": {"ok": False, "detail": "not run yet"}}
+WEBPROXY_STATE = {"configure_error": "", "startup_lane_check": {"ok": False, "detail": "not run yet"}, "child_errors": {}}
+TELEMT_HEALTH = {"available": False, "mtproto": False, "web": False, "error": ""}
+_TELEMT_WEB_STATUS_CACHE = {}
+_TELEMT_PROVISIONED = {"web": set(), "mtproto": set()}
+_TELEMT_ROOT_UID = ""
+_TELEMT_ROOT_CHILD_UID = "legacy-root"
+_TELEMT_ROOT_CHILD_TOKEN = "legacy-root"
+_PROXY_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def _tg_fn(name):
+    if tgproxy is None:
+        return None
+    return getattr(tgproxy, name, None)
+
+
+async def _tg_call(name, *args, **kwargs):
+    fn = _tg_fn(name)
+    if fn is None:
+        return None
+    result = fn(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _b64u_encode(data):
+    return base64.urlsafe_b64encode(bytes(data)).rstrip(b"=").decode("ascii")
+
+
+def _web_base_secret_bytes():
+    raw = os.environ.get("TG_WEB_SECRET", "").strip()
+    if raw:
+        text = raw[2:] if raw.lower().startswith("dd") else raw
+        try:
+            parsed = bytes.fromhex(text)
+        except ValueError:
+            raise ValueError("TG_WEB_SECRET invalid — set a valid 32-hex secret or delete the variable")
+        if len(parsed) != 16:
+            raise ValueError("TG_WEB_SECRET invalid — set a valid 32-hex secret or delete the variable")
+        return parsed
+    return hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(CONFIG["secret_key"]).encode("utf-8")).digest()[:16]
+
+
+def _web_token_secret_bytes(token):
+    base = _web_base_secret_bytes()
+    material = hashlib.sha256(b"proxygosha-web-token-secret-v1\n" + base + b"\n" + str(token).strip().lower().encode("ascii")).digest()
+    return material[:16]
+
+
+def _web_token_secret_hex(token):
+    return _web_token_secret_bytes(token).hex()
+
+
+def _web_token_link_secret(token):
+    return _b64u_encode(b"\x70\xdd" + _web_token_secret_bytes(token))
+
+
+def _web_link(host, token):
+    token = str(token or "").strip().lower()
+    if not token:
+        return ""
+    return "tg://webproxy?server=" + str(host) + "/" + token + "&secret=" + _web_token_link_secret(token)
+
+
+def _web_link_https(host, token):
+    token = str(token or "").strip().lower()
+    if not token:
+        return ""
+    return "https://t.me/webproxy?server=" + str(host) + "/" + token + "&secret=" + _web_token_link_secret(token)
+
+
+def _web_capability(host, token):
+    secret = _web_token_secret_bytes(token)
+    mac = hmac_mod.new(b"\xdd" + secret, ("tdesktop-web-proxy-bridge-v2\n" + str(host).strip().lower() + "\n" + str(token).strip().lower()).encode("utf-8"), hashlib.sha256).digest()
+    return _b64u_encode(mac)
+
+
+def _web_capability_v1(host, token):
+    secret = _web_token_secret_bytes(token)
+    mac = hmac_mod.new(b"\xdd" + secret, ("tdesktop-web-proxy-bridge-v1\n" + str(host).strip().lower()).encode("utf-8"), hashlib.sha256).digest()
+    return _b64u_encode(mac)
+
+
+def _gen_proxy_code(n=12):
+    taken = {str(l.get("proxy_username") or "").strip() for l in LINKS.values() if str(l.get("proxy_username") or "").strip()}
+    for _attempt in range(64):
+        code = "".join(secrets.choice(_PROXY_CODE_ALPHABET) for _ in range(int(n)))
+        if code not in taken:
+            return code
+    raise RuntimeError("could not allocate a unique proxy credential code")
+
+
+def _validate_proxy_creds(user, pw):
+    user = str(user or "").strip()
+    pw = str(pw or "").strip()
+    if not user and not pw:
+        return
+    if not user or not pw:
+        raise HTTPException(status_code=400, detail="Proxy username and password must both be set")
+    if len(user) < 1 or len(user) > 64 or len(pw) < 1 or len(pw) > 64:
+        raise HTTPException(status_code=400, detail="Proxy username and password must each be 1 to 64 characters")
+    forbidden_user = set(":@/?#")
+    for ch in user:
+        if ch in forbidden_user or ch.isspace() or ord(ch) < 32 or ord(ch) == 127:
+            raise HTTPException(status_code=400, detail="Proxy username must not contain : @ / ? # whitespace or control characters")
+    for ch in pw:
+        if ch.isspace() or ord(ch) < 32 or ord(ch) == 127:
+            raise HTTPException(status_code=400, detail="Proxy password must not contain whitespace or control characters")
+
+
+def _proxy_creds_for_link(link):
+    user = str((link or {}).get("proxy_username") or "").strip()
+    pw = str((link or {}).get("proxy_password") or "").strip()
+    if user and pw:
+        return user, pw
+    uid = str((link or {}).get("uid") or "")
+    return uid, uid
+
+
+def _link_by_proxy_username(username):
+    username = str(username or "").strip()
+    if not username:
+        return None
+    link = LINKS.get(username)
+    if link is not None:
+        return link
+    for candidate in LINKS.values():
+        if str(candidate.get("proxy_username") or "").strip() == username:
+            return candidate
+    return None
+
+
+def _link_for_proxy_session(username):
+    return _link_by_proxy_username(username)
+
+
+def _oldest_active_web():
+    rows = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]
+    if not rows:
+        return None
+    rows.sort(key=lambda l: str(l.get("created_at") or ""))
+    return rows[0]
+
+
+def _telemt_web_port_for_uid(uid):
+    fn = _tg_fn("telemt_web_port")
+    if fn is None:
+        return None
+    try:
+        port = fn(uid)
+    except Exception:
+        return None
+    if inspect.isawaitable(port):
+        try:
+            port.close()
+        except Exception:
+            pass
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    return port if port > 0 else None
+
+
+def _telemt_web_status_cached(uid):
+    entry = _TELEMT_WEB_STATUS_CACHE.get(uid)
+    if not entry:
+        return {}
+    return entry[0] if isinstance(entry, tuple) else {}
+
+
+def _telemt_web_sessions_value(status):
+    sessions = (status or {}).get("sessions")
+    if isinstance(sessions, list):
+        return sessions
+    if isinstance(sessions, int):
+        return sessions
+    return 0
+
+
+async def _telemt_refresh_web_status(uid=None):
+    targets = []
+    if uid:
+        link = LINKS.get(uid)
+        if link is not None and (link.get("protocol") or "") == "webproxy":
+            targets = [link]
+    else:
+        targets = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]
+    for link in targets:
+        try:
+            status = await _tg_call("telemt_web_status", link.get("uid", ""))
+        except Exception:
+            status = None
+        if isinstance(status, dict):
+            _TELEMT_WEB_STATUS_CACHE[link.get("uid", "")] = (status, time.monotonic())
+
+
+async def _telemt_sync_root_vhost():
+    global _TELEMT_ROOT_UID
+    oldest = _oldest_active_web()
+    oldest_uid = str(oldest.get("uid", "")) if oldest else ""
+    if not oldest_uid:
+        if _TELEMT_ROOT_UID:
+            try:
+                await _tg_call("telemt_stop_web", _TELEMT_ROOT_CHILD_UID)
+            except Exception:
+                pass
+            _TELEMT_PROVISIONED["web"].discard(_TELEMT_ROOT_CHILD_UID)
+            _TELEMT_ROOT_UID = ""
+        return
+    if oldest_uid == _TELEMT_ROOT_UID and _TELEMT_ROOT_CHILD_UID in _TELEMT_PROVISIONED.get("web", set()):
+        return
+    try:
+        await _tg_call("telemt_stop_web", _TELEMT_ROOT_CHILD_UID)
+    except Exception:
+        pass
+    _TELEMT_PROVISIONED["web"].discard(_TELEMT_ROOT_CHILD_UID)
+    _TELEMT_ROOT_UID = ""
+    try:
+        secret_hex = _web_token_secret_hex(str(oldest.get("webproxy_token") or ""))
+    except ValueError:
+        return
+    host = get_domain()
+    public_ip = None
+    try:
+        resolved = await resolve_domain_to_ip(host)
+        if resolved:
+            public_ip = resolved
+    except Exception:
+        public_ip = None
+    max_sessions = int(oldest.get("max_connections") or 0)
+    if max_sessions <= 0:
+        max_sessions = 8
+    result = await _tg_call("telemt_start_web", _TELEMT_ROOT_CHILD_UID, _TELEMT_ROOT_CHILD_TOKEN, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip)
+    if not isinstance(result, dict) or not result.get("enabled"):
+        err = str(result.get("error") or "telemt root WEB child did not start") if isinstance(result, dict) else "telemt root WEB child did not start"
+        WEBPROXY_STATE["child_errors"][_TELEMT_ROOT_CHILD_UID] = err
+        logger.error("telemt legacy-root WEB child failed to start: " + err)
+        return
+    rooted = await _tg_call("telemt_web_set_root", _TELEMT_ROOT_CHILD_UID, True)
+    if rooted is False:
+        WEBPROXY_STATE["child_errors"][_TELEMT_ROOT_CHILD_UID] = "telemt root vhost could not be enabled on the legacy-root child"
+        logger.error("telemt legacy-root WEB child failed to enable its root vhost")
+        return
+    _TELEMT_PROVISIONED["web"].add(_TELEMT_ROOT_CHILD_UID)
+    _TELEMT_ROOT_UID = oldest_uid
+    WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+
+
+async def _telemt_provision_web(link):
+    uid = str(link.get("uid", ""))
+    token = str(link.get("webproxy_token") or "").strip().lower()
+    if not token:
+        raise ValueError("WEB inbound has no token")
+    secret_hex = _web_token_secret_hex(token)
+    host = get_domain()
+    public_ip = None
+    try:
+        resolved = await resolve_domain_to_ip(host)
+        if resolved:
+            public_ip = resolved
+    except Exception:
+        public_ip = None
+    max_sessions = int(link.get("max_connections") or 0)
+    if max_sessions <= 0:
+        max_sessions = 8
+    result = await _tg_call("telemt_start_web", uid, token, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip)
+    if isinstance(result, dict) and not result.get("enabled"):
+        raise ValueError(str(result.get("error") or "telemt WEB child did not start"))
+    if result is None and _tg_fn("telemt_start_web") is None:
+        raise ValueError("telemt WEB start is not available in the telegram module")
+    _TELEMT_PROVISIONED["web"].add(uid)
+
+
+async def _telemt_provision_mtproto(link):
+    uid = str(link.get("uid", ""))
+    secret_fn = _tg_fn("mtproxy_secret_for_uid")
+    if secret_fn is None:
+        raise ValueError("MTProto secret derivation is not available in the telegram module")
+    secret = secret_fn(uid)
+    if isinstance(secret, (bytes, bytearray)):
+        secret_hex = bytes(secret).hex()
+    else:
+        secret_hex = str(secret).strip()
+    variant = str(link.get("mtproto_variant") or "dd").strip().lower() or "dd"
+    domain = str(link.get("mtproto_domain") or "www.google.com").strip() or "www.google.com"
+    max_conns = int(link.get("max_connections") or 0)
+    limit_bytes = int(link.get("limit_bytes") or 0)
+    expires_at = link.get("expires_at") or None
+    result = await _tg_call("telemt_mtproto_upsert_user", uid, secret_hex, variant=variant, domain=domain, max_conns=max_conns, limit_bytes=limit_bytes, expires_at=expires_at)
+    if result is False:
+        raise ValueError("telemt MTProto user provisioning was rejected")
+    if result is None and _tg_fn("telemt_mtproto_upsert_user") is None:
+        raise ValueError("telemt MTProto provisioning is not available in the telegram module")
+    _TELEMT_PROVISIONED["mtproto"].add(uid)
+
+
+async def _telemt_remove_web(uid):
+    global _TELEMT_ROOT_UID
+    uid = str(uid or "")
+    try:
+        await _tg_call("telemt_stop_web", uid)
+    except Exception:
+        pass
+    _TELEMT_PROVISIONED["web"].discard(uid)
+    _TELEMT_WEB_STATUS_CACHE.pop(uid, None)
+    if _TELEMT_ROOT_UID == uid:
+        _TELEMT_ROOT_UID = ""
+
+
+async def _telemt_remove_mtproto(uid):
+    uid = str(uid or "")
+    try:
+        await _tg_call("telemt_mtproto_remove_user", uid)
+    except Exception:
+        pass
+    _TELEMT_PROVISIONED["mtproto"].discard(uid)
+
+
+async def _telemt_sync_link(link, previous=None):
+    if link is None:
+        return
+    uid = str(link.get("uid", ""))
+    protocol = (link.get("protocol") or "")
+    prev_protocol = str((previous or {}).get("protocol") or "") if previous else ""
+    prev_active = bool((previous or {}).get("active")) if previous else None
+    now_active = bool(link.get("active"))
+    if prev_protocol and prev_protocol != protocol:
+        if prev_protocol == "webproxy":
+            await _telemt_remove_web(uid)
+        elif prev_protocol == "mtproto":
+            await _telemt_remove_mtproto(uid)
+        previous = None
+        prev_active = None
+    if not now_active:
+        if prev_active or previous is None:
+            if protocol == "webproxy":
+                await _telemt_remove_web(uid)
+            elif protocol == "mtproto":
+                await _telemt_remove_mtproto(uid)
+        if protocol == "webproxy":
+            await _telemt_sync_root_vhost()
+        _invalidate_card_usability()
+        return
+    relevant = ("webproxy_token", "mtproto_variant", "mtproto_domain", "max_connections", "limit_bytes", "expires_at", "active", "protocol")
+    changed = False
+    if previous is None:
+        changed = True
+    else:
+        for key in relevant:
+            if str((previous or {}).get(key) or "") != str(link.get(key) or ""):
+                changed = True
+                break
+    if protocol == "webproxy":
+        provisioned = uid in _TELEMT_PROVISIONED["web"]
+        if changed or not provisioned:
+            try:
+                if provisioned:
+                    await _telemt_remove_web(uid)
+                await _telemt_provision_web(link)
+            except Exception as exc:
+                WEBPROXY_STATE["child_errors"][uid] = str(exc)
+                logger.error("telemt WEB provisioning failed for " + uid + ": " + str(exc))
+            else:
+                WEBPROXY_STATE["child_errors"].pop(uid, None)
+        await _telemt_sync_root_vhost()
+    elif protocol == "mtproto":
+        provisioned = uid in _TELEMT_PROVISIONED["mtproto"]
+        if changed or not provisioned:
+            try:
+                await _telemt_provision_mtproto(link)
+            except Exception as exc:
+                logger.error("telemt MTProto provisioning failed for " + uid + ": " + str(exc))
+    _invalidate_card_usability()
 PROXY_START_ERRORS = {"socks": "", "mtproxy": "", "http": ""}
 VALID_PROTOCOLS = (
     "vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one", "xhttp-auto",
@@ -178,16 +554,7 @@ def map_protocol_credentials(protocol, body):
     elif protocol in ("socks5", "http-proxy"):
         user = str(body.get("proxy_username") or "").strip()
         pw = str(body.get("proxy_password") or "").strip()
-        if user or pw:
-            if not user or not pw:
-                raise HTTPException(status_code=400, detail="Proxy username and password must both be set")
-            if user != pw:
-                raise HTTPException(status_code=400, detail="Proxy username and password must be identical: both are the link UUID used for auth")
-            try:
-                uuid_lib.UUID(user)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Proxy username and password must be a UUID")
-            body["uuid"] = user
+        _validate_proxy_creds(user, pw)
     elif protocol == "ss-ws":
         raw = str(body.get("ss_password") or "").strip()
         if raw:
@@ -196,11 +563,21 @@ def map_protocol_credentials(protocol, body):
 
 def validate_patch_protocol_fields(link, body):
     uid = link.get("uid", "")
-    for key in ("uuid", "password", "proxy_username", "proxy_password"):
+    for key in ("uuid", "password"):
         if key in body:
             if str(body.get(key) or "").strip() and str(body.get(key)).strip() != uid:
                 raise HTTPException(status_code=400, detail="The credential identity cannot be changed here: use Regenerate UUID or Clone")
             body.pop(key, None)
+    if "proxy_username" in body or "proxy_password" in body:
+        user = str(body.get("proxy_username") or "").strip()
+        pw = str(body.get("proxy_password") or "").strip()
+        if not user and not pw:
+            body.pop("proxy_username", None)
+            body.pop("proxy_password", None)
+        else:
+            _validate_proxy_creds(user, pw)
+            body["proxy_username"] = user
+            body["proxy_password"] = pw
     if "ss_password" in body:
         raw = str(body.get("ss_password") or "").strip()
         body.pop("ss_password", None)
@@ -372,11 +749,22 @@ def _proxy_session_count(uid):
         return 0
     total = 0
     try:
-        total += sum(1 for s in tgproxy.active_proxy_sessions() if s.get("username") == uid)
+        for s in tgproxy.active_proxy_sessions():
+            username = s.get("username") or ""
+            if username == uid:
+                total += 1
+                continue
+            link = _link_for_proxy_session(username)
+            if link is not None and str(link.get("uid") or "") == uid:
+                total += 1
     except Exception:
         pass
     try:
-        total += sum(1 for s in tgproxy.webproxy_active_sessions() if s.get("username") == uid)
+        sessions = _telemt_web_sessions_value(_telemt_web_status_cached(uid))
+        if isinstance(sessions, list):
+            total += len(sessions)
+        elif isinstance(sessions, int):
+            total += sessions
     except Exception:
         pass
     return total
@@ -400,14 +788,22 @@ def _session_limit_reason(link, uuid, client_ip, exclude_conn_id=None):
             if tgproxy is not None:
                 try:
                     for s in tgproxy.active_proxy_sessions():
-                        if s.get("username") in uids:
+                        username = s.get("username") or ""
+                        if username in uids:
+                            n += 1
+                            continue
+                        link = _link_for_proxy_session(username)
+                        if link is not None and str(link.get("uid") or "") in uids:
                             n += 1
                 except Exception:
                     pass
                 try:
-                    for s in tgproxy.webproxy_active_sessions():
-                        if s.get("username") in uids:
-                            n += 1
+                    for member_uid in uids:
+                        sessions = _telemt_web_sessions_value(_telemt_web_status_cached(member_uid))
+                        if isinstance(sessions, list):
+                            n += len(sessions)
+                        elif isinstance(sessions, int):
+                            n += sessions
                 except Exception:
                     pass
             if n >= max_sess:
@@ -2064,27 +2460,6 @@ def _webproxy_shared_443():
     return count > 1
 
 
-def _webproxy_token_from_request(request):
-    query_token = (request.query_params.get("token", "") or "").strip().lower()
-    if _webproxy_valid_token(query_token):
-        return query_token
-    header_token = (request.headers.get("x-tgweb-token", "") or "").strip().lower()
-    if _webproxy_valid_token(header_token):
-        return header_token
-    server_param = (request.query_params.get("server", "") or "").strip()
-    if "/" in server_param:
-        tail = server_param.rsplit("/", 1)[-1].strip().lower()
-        if _webproxy_valid_token(tail):
-            return tail
-    parts = [p for p in str(request.url.path or "").split("/") if p]
-    for part in parts:
-        if part == "tgweb":
-            continue
-        if _webproxy_valid_token(part):
-            return part
-    return ""
-
-
 def _webproxy_port_in_use(port, exclude_uid=""):
     return _webproxy_conflict(port, exclude_uid) is not None
 
@@ -2098,11 +2473,11 @@ def _next_free_webproxy_port(exclude_uid=""):
 
 def _proxy_effective_port(protocol):
     if protocol == "socks5":
-        return SOCKS_PORT
+        return int((TG_PROXY_STATUS.get("socks", {}) or {}).get("port") or SOCKS_PORT or 0)
     if protocol == "mtproto":
-        return TG_PROXY_PORT
+        return int((TG_PROXY_STATUS.get("mtproxy", {}) or {}).get("port") or TG_PROXY_PORT or 0)
     if protocol == "http-proxy":
-        return HTTP_PROXY_PORT
+        return int((TG_PROXY_STATUS.get("http", {}) or {}).get("port") or HTTP_PROXY_PORT or 0)
     return 0
 
 
@@ -2120,6 +2495,9 @@ def _proxy_listener_enabled(protocol):
 
 def _proxy_disabled_reason(protocol):
     if protocol == "webproxy":
+        child_errors = WEBPROXY_STATE.get("child_errors") or {}
+        if child_errors:
+            return "WEB proxy child failed: " + str(next(iter(child_errors.values())))
         err = (TG_PROXY_STATUS.get("webproxy", {}) or {}).get("error", "") or ""
         if err:
             return "WEB proxy is not configured: " + err
@@ -2180,30 +2558,35 @@ async def _card_web_usable(domain):
         return False, "not_configured"
     if not _proxy_listener_enabled("webproxy"):
         return False, "not_configured"
-    link = None
     async with LINKS_LOCK:
         rows = list(LINKS.values())
+    link = None
     for row in rows:
-        if (row.get("protocol") or "") == "webproxy" and row.get("active") and int(row.get("port") or 443) == int(WEBPROXY_PUBLIC_PORT):
+        if (row.get("protocol") or "") == "webproxy" and row.get("active"):
             link = row
             break
     if link is None:
-        for row in rows:
-            if (row.get("protocol") or "") == "webproxy" and row.get("active"):
-                link = row
-                break
-    if link is None:
         return False, "no_inbound"
-    port = int(link.get("port") or 443)
-    try:
-        _ok, verdict, _detail = await asyncio.wait_for(_test_webproxy_real_session(link, domain, port, dc_timeout=5.0), timeout=20.0)
-    except (asyncio.TimeoutError, Exception):
-        return False, "no_traffic"
-    if verdict == "pass":
+    uid = str(link.get("uid") or "")
+    await _telemt_refresh_web_status(uid)
+    status = _telemt_web_status_cached(uid)
+    if not status:
+        if uid in _TELEMT_PROVISIONED.get("web", set()):
+            return True, "running"
+        return False, "listener_failed"
+    if status.get("error"):
+        return False, "listener_failed"
+    if status.get("enabled") and status.get("healthy") is not False:
         return True, "running"
-    if verdict == "not_available":
-        return False, "not_configured"
-    return False, "no_traffic"
+    if uid in _TELEMT_PROVISIONED.get("web", set()) and status.get("enabled"):
+        return True, "running"
+    return False, "listener_failed"
+
+
+def _invalidate_card_usability():
+    global _CARD_USABILITY_AT, _CARD_USABILITY
+    _CARD_USABILITY_AT = 0.0
+    _CARD_USABILITY = {}
 
 
 async def _card_usability(domain):
@@ -2347,38 +2730,33 @@ async def refresh_proxy_listener_status(force=False):
             entry["verified_at"] = verified_at
             TG_PROXY_STATUS[key] = entry
         web_entry = TG_PROXY_STATUS.get("webproxy", {})
-        web_status = {}
-        if tgproxy is not None:
-            try:
-                web_status = tgproxy.webproxy_status()
-            except Exception:
-                web_status = {}
-        web_configured = bool(web_status.get("configured"))
-        web_route = any(getattr(route, "path", "") == "/tgweb" for route in app.routes)
-        web_error = str(web_status.get("configure_error") or WEBPROXY_STATE.get("configure_error") or "")
+        health = None
         try:
-            WEBPROXY_STATE["self_check"] = tgproxy.webproxy_self_check(get_domain()) if tgproxy is not None else {"ok": False, "detail": "telegram proxy module is not loaded"}
-        except Exception as exc:
-            WEBPROXY_STATE["self_check"] = {"ok": False, "detail": "web proxy self-check failed: " + str(exc)}
-        self_check = WEBPROXY_STATE.get("self_check") or {}
+            health = await _tg_call("telemt_health")
+        except Exception:
+            health = None
+        if isinstance(health, dict):
+            TELEMT_HEALTH["available"] = bool(health.get("available"))
+            TELEMT_HEALTH["mtproto"] = bool(health.get("mtproto"))
+            TELEMT_HEALTH["web"] = bool(health.get("web"))
+            TELEMT_HEALTH["error"] = str(health.get("error") or "")
         web_entry["port"] = WEBPROXY_PUBLIC_PORT
         if WEBPROXY_STATE.get("configure_error"):
             web_entry["enabled"] = False
             web_entry["error"] = str(WEBPROXY_STATE["configure_error"])
-        elif self_check.get("ok") is False and str(self_check.get("detail") or "") not in ("", "not run yet"):
+        elif not TELEMT_HEALTH.get("available"):
             web_entry["enabled"] = False
-            web_entry["error"] = str(self_check.get("detail"))
-        elif not web_configured:
-            web_entry["enabled"] = False
-            web_entry["error"] = web_error or "web proxy bridge is not configured"
-        elif not web_route:
-            web_entry["enabled"] = False
-            web_entry["error"] = "web proxy bridge route /tgweb is not registered"
+            web_entry["error"] = "telemt binary is not available on this host (Telegram proxies need telemt)"
         else:
             web_entry["enabled"] = True
             web_entry["error"] = ""
         web_entry["verified_at"] = verified_at
         TG_PROXY_STATUS["webproxy"] = web_entry
+        try:
+            await _telemt_refresh_web_status()
+        except Exception:
+            pass
+        _invalidate_card_usability()
         _PROXY_LISTENER_PROBE_AT = time.monotonic()
         return TG_PROXY_STATUS
 
@@ -2396,11 +2774,13 @@ def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.goog
     if protocol == "socks5":
         if not _proxy_listener_enabled("socks5"):
             return ""
-        return tgproxy.socks5_link(host, SOCKS_PORT, uid, uid) if tgproxy is not None else ""
+        user, pw = _proxy_creds_for_link(LINKS.get(uid) or {"uid": uid})
+        return tgproxy.socks5_link(host, SOCKS_PORT, user, pw) if tgproxy is not None else ""
     if protocol == "http-proxy":
         if not _proxy_listener_enabled("http-proxy"):
             return ""
-        return tgproxy.http_proxy_link(host, HTTP_PROXY_PORT, uid, uid) if tgproxy is not None else ""
+        user, pw = _proxy_creds_for_link(LINKS.get(uid) or {"uid": uid})
+        return tgproxy.http_proxy_link(host, HTTP_PROXY_PORT, user, pw) if tgproxy is not None else ""
     if protocol == "mtproto":
         if not _proxy_listener_enabled("mtproto"):
             return ""
@@ -2408,13 +2788,14 @@ def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.goog
             return ""
         return tgproxy.mtproxy_link_for_uid(host, TG_PROXY_PORT, uid, variant, domain)
     if protocol == "webproxy":
-        if tgproxy is None:
-            return ""
         if not _proxy_listener_enabled("webproxy"):
             return ""
+        token = str(token or "").strip().lower()
+        if not token:
+            return ""
         try:
-            return tgproxy.webproxy_link(host, int(port) if int(port) in WEBPROXY_PORTS else 443, str(token or "").strip().lower() or None)
-        except (TypeError, ValueError, RuntimeError):
+            return _web_link(host, token)
+        except ValueError:
             return ""
     return ""
 
@@ -2430,24 +2811,32 @@ def proxy_links_for_link(link, host):
     if protocol == "mtproto" and tgproxy is not None:
         out["variants"] = tgproxy.mtproxy_links_for_uid(host, TG_PROXY_PORT, uid, domain) if _proxy_listener_enabled("mtproto") else {"plain": "", "dd": "", "faketls": ""}
         out["variant"] = variant
-    if protocol == "webproxy" and tgproxy is not None:
+    if protocol == "webproxy":
         if token and _proxy_listener_enabled("webproxy"):
-            out["all_ports"] = [{"port": port, "token": token, "secret": tgproxy.webproxy_token_secret(token), "link": tgproxy.webproxy_link(host, port, token), "link_https": tgproxy.webproxy_link_https(host, port, token)}]
+            try:
+                out["all_ports"] = [{"port": port, "token": token, "secret": _web_token_link_secret(token), "link": _web_link(host, token), "link_https": _web_link_https(host, token)}]
+            except ValueError:
+                out["all_ports"] = []
         else:
-            out["all_ports"] = [x for x in tgproxy.webproxy_links(host) if int(x.get("port") or 0) == int(port)] if _proxy_listener_enabled("webproxy") else []
+            out["all_ports"] = []
     if protocol in ("socks5", "http-proxy"):
-        out["username"] = uid
-        out["password"] = uid
+        user, pw = _proxy_creds_for_link(link)
+        out["username"] = user
+        out["password"] = pw
         out["port"] = _proxy_effective_port(protocol)
     if protocol == "webproxy":
         out["port"] = port if port in WEBPROXY_PORTS else 443
         out["webproxy_token"] = token
-        if token and tgproxy is not None and _proxy_listener_enabled("webproxy"):
-            out["secret"] = tgproxy.webproxy_token_secret(token)
-            out["link_https"] = tgproxy.webproxy_link_https(host, out["port"], token)
+        if token and _proxy_listener_enabled("webproxy"):
+            try:
+                out["secret"] = _web_token_link_secret(token)
+                out["link_https"] = _web_link_https(host, token)
+            except ValueError:
+                out["secret"] = ""
+                out["link_https"] = ""
         else:
-            out["secret"] = tgproxy.webproxy_per_port_secret(out["port"]) if tgproxy is not None and _proxy_listener_enabled("webproxy") else ""
-            out["link_https"] = tgproxy.webproxy_link_https(host, out["port"]) if tgproxy is not None and _proxy_listener_enabled("webproxy") else ""
+            out["secret"] = ""
+            out["link_https"] = ""
     return out
 
 
@@ -2512,7 +2901,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     active BOOLEAN DEFAULT TRUE, expires_at TEXT,
                     custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
                     custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
-                    color TEXT DEFAULT '#39ff14',
+                    color TEXT DEFAULT '#3b82f6',
                     flag TEXT DEFAULT '',
                     fragment TEXT DEFAULT '',
                     ip_profile_id TEXT DEFAULT '',
@@ -2623,6 +3012,8 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                 ("mtproto_variant", "TEXT DEFAULT 'dd'"),
                 ("mtproto_domain", "TEXT DEFAULT 'www.google.com'"),
                 ("webproxy_token", "TEXT DEFAULT ''"),
+                ("proxy_username", "TEXT DEFAULT ''"),
+                ("proxy_password", "TEXT DEFAULT ''"),
                 ("last_test_ok", "INTEGER DEFAULT 0"),
                 ("last_test_ms", "INTEGER DEFAULT 0"),
                 ("last_test_detail", "TEXT DEFAULT ''"),
@@ -2712,7 +3103,7 @@ else:
                 active INTEGER DEFAULT 1, expires_at TEXT,
                 custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
                 custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
-                color TEXT DEFAULT '#39ff14',
+                color TEXT DEFAULT '#3b82f6',
                 flag TEXT DEFAULT '',
                 fragment TEXT DEFAULT '',
                 ip_profile_id TEXT DEFAULT '',
@@ -2796,6 +3187,8 @@ else:
             ("mtproto_variant", "TEXT DEFAULT 'dd'"),
             ("mtproto_domain", "TEXT DEFAULT 'www.google.com'"),
             ("webproxy_token", "TEXT DEFAULT ''"),
+            ("proxy_username", "TEXT DEFAULT ''"),
+            ("proxy_password", "TEXT DEFAULT ''"),
             ("smux_enabled", "INTEGER DEFAULT 0"),
             ("ip_limit", "INTEGER DEFAULT 0"),
             ("protocol", "TEXT DEFAULT 'vless-ws'"),
@@ -2995,7 +3388,7 @@ LINK_ROW_DEFAULTS = {
     "label": "Imported", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0,
     "created_at": "", "active": 1, "expires_at": None,
     "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
-    "color": "#39ff14", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
+    "color": "#3b82f6", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
     "tfo": 0, "ech_enabled": 0, "ech_sni": "", "ech_doh": "",
     "fragment_mode": "off", "fragment_length": "100-200", "fragment_interval": "10-20",
     "allow_insecure": 0, "random_path": 0, "enable_ipv6": 1,
@@ -3008,6 +3401,7 @@ LINK_ROW_DEFAULTS = {
     "outbound_proxy": "", "outbound_proxy_pass": "",
     "mtproto_variant": "dd", "mtproto_domain": "www.google.com",
     "webproxy_token": "",
+    "proxy_username": "", "proxy_password": "",
     "last_test_ok": 0, "last_test_ms": 0, "last_test_detail": "", "last_test_at": "",
     "last_test_target": "", "last_test_verdict": "",
 }
@@ -3030,6 +3424,10 @@ def _normalize_link_dict(link_dict):
         link_dict["protocol"] = "vless-ws"
     _norm_ss = normalize_ss_method(link_dict.get("ss_method"))
     link_dict["ss_method"] = _norm_ss if _norm_ss is not None else "2022-blake3-aes-256-gcm"
+    if (link_dict.get("protocol") or "") in ("socks5", "http-proxy"):
+        if not str(link_dict.get("proxy_username") or "").strip() or not str(link_dict.get("proxy_password") or "").strip():
+            link_dict["proxy_username"] = str(link_dict.get("uid") or "")
+            link_dict["proxy_password"] = str(link_dict.get("uid") or "")
     if link_dict.get("vmess_security") not in VMESS_SECURITY_METHODS:
         link_dict["vmess_security"] = "auto"
     return link_dict
@@ -3061,7 +3459,7 @@ async def load_initial_data():
             "uid": default_uuid, "label": "This Server is Free", "limit_bytes": 0, "used_bytes": 0,
             "max_connections": 0, "created_at": now, "active": 1, "expires_at": None,
             "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
-            "color": "#39ff14", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
+            "color": "#3b82f6", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
             "tfo": 0, "ech_enabled": 0, "ech_sni": "", "ech_doh": "",
             "fragment_mode": "off", "fragment_length": "100-200", "fragment_interval": "10-20",
             "allow_insecure": 0, "random_path": 0, "enable_ipv6": 1,
@@ -3090,7 +3488,7 @@ async def load_initial_data():
                 "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
                 (default_uuid, "This Server is Free", 0, 0, 0, now, 1, None,
                  "", "", "", "chrome",
-                 "#39ff14", "", "", "", "default",
+                 "#3b82f6", "", "", "", "default",
                  0, 0, "", "",
                  "off", "100-200", "10-20",
                  0, 0, 1,
@@ -3615,7 +4013,6 @@ async def lifespan(app: FastAPI):
         logger.warning("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.")
         print("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.", flush=True)
     if tgproxy is not None:
-        _mtproxy_port_for_start = TG_PROXY_PORT
         _secret_env = ""
         try:
             _secret_env = os.environ.get("TG_PROXY_SECRET", "").strip()
@@ -3632,27 +4029,49 @@ async def lifespan(app: FastAPI):
                 PROXY_START_ERRORS["mtproxy"] = "TG_PROXY_SECRET is not valid (must be 32 hex chars, optionally prefixed with dd): " + str(exc)
             else:
                 PROXY_START_ERRORS["mtproxy"] = "MTProto secret invalid: " + str(exc)
-            _mtproxy_port_for_start = 0
             logger.error("MTProto configure failed, MTProto listener will not start: " + str(exc))
-        _web_ok = True
+        _web_base_ok = True
         WEBPROXY_STATE["configure_error"] = ""
         try:
-            _tg_web_env = os.environ.get("TG_WEB_SECRET", "").strip()
-            if _tg_web_env:
-                try:
-                    tgproxy.webproxy_configure(base_secret=_tg_web_env)
-                except Exception as exc:
-                    raise ValueError("TG_WEB_SECRET is not a valid web proxy secret (need 32 hex chars or dd plus 32 hex chars): " + str(exc))
-            else:
-                tgproxy.webproxy_configure(secret_key=CONFIG["secret_key"])
-        except Exception as exc:
-            _web_ok = False
+            _web_base_secret_bytes()
+        except ValueError as exc:
+            _web_base_ok = False
             WEBPROXY_STATE["configure_error"] = str(exc)
             logger.error("web proxy configure failed: " + str(exc))
+        _telemt_ok = False
+        try:
+            _telemt_ok = bool(await _tg_call("telemt_available"))
+        except Exception:
+            _telemt_ok = False
+        if _telemt_ok:
+            TELEMT_HEALTH["available"] = True
+            TELEMT_HEALTH["error"] = ""
+            try:
+                _mt_result = await _tg_call("telemt_start_mtproto")
+            except Exception as exc:
+                _mt_result = None
+                logger.error("telemt MTProto child failed to start: " + str(exc))
+            if isinstance(_mt_result, dict):
+                TELEMT_HEALTH["mtproto"] = bool(_mt_result.get("enabled"))
+                if not _mt_result.get("enabled"):
+                    logger.error("telemt MTProto child failed to start: " + str(_mt_result.get("error") or "unknown error"))
+                else:
+                    logger.info("SulgX startup: telemt MTProto child listening on " + str(_mt_result.get("port")))
+                    print("SulgX startup: telemt MTProto child listening on " + str(_mt_result.get("port")), flush=True)
+        else:
+            TELEMT_HEALTH["available"] = False
+            TELEMT_HEALTH["error"] = "telemt binary is not available on this host"
+            logger.error("SulgX startup: telemt binary is not available, Telegram proxy children will not start")
+            print("SulgX startup: telemt binary is not available, Telegram proxy children will not start", flush=True)
 
         def _tg_auth(username, password):
-            link = LINKS.get(username)
-            if not link or password != username:
+            link = _link_by_proxy_username(username)
+            if link is None:
+                return None
+            stored_user, stored_pw = _proxy_creds_for_link(link)
+            if str(username or "").strip() != stored_user:
+                return None
+            if not hmac_mod.compare_digest(str(password or ""), str(stored_pw or "")):
                 return None
             if not link.get("active"):
                 return None
@@ -3681,73 +4100,46 @@ async def lifespan(app: FastAPI):
         async def _tg_quota_ok():
             return not await monthly_quota_exceeded()
 
-        def _tg_session_allowed(uid, client_ip):
-            link = LINKS.get(uid)
+        def _tg_session_allowed(uid_or_user, client_ip):
+            link = LINKS.get(uid_or_user)
+            if link is None:
+                link = _link_by_proxy_username(uid_or_user)
             if link is None:
                 return False
             try:
-                return _session_limit_reason(link, uid, client_ip) is None
+                return _session_limit_reason(link, str(link.get("uid", "")), client_ip) is None
             except Exception:
                 return True
 
-        def _webproxy_uid_for_mode(mode, token=None):
+        multi_ports = []
+        for _p in (SOCKS_PORT, HTTP_PROXY_PORT, TG_PROXY_PORT):
+            _p = int(_p or 0)
+            if _p and _p not in multi_ports:
+                multi_ports.append(_p)
+        if multi_ports:
+            _start_result = None
             try:
-                mode = int(mode)
-            except (TypeError, ValueError):
-                return ""
-            if mode == tgproxy.WEBPROXY_TOKEN_MODE:
-                want_token = str(token or "").strip().lower()
-                if not want_token:
-                    return ""
-                found = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and str(l.get("webproxy_token") or "").strip().lower() == want_token and l.get("active")]
-                found.sort(key=lambda l: str(l.get("created_at") or ""))
-                return found[0]["uid"] if found else ""
-            if mode == 0:
-                want = 443
-            elif 10 <= mode < 10 + len(WEBPROXY_PORTS):
-                want = WEBPROXY_PORTS[mode - 10]
+                _start_result = await _tg_call("start_all", multi_ports, _tg_auth, _tg_count, _tg_quota_ok, _tg_session_allowed)
+            except Exception as exc:
+                logger.error("telegram proxy listeners failed to start: " + str(exc))
+            if isinstance(_start_result, dict):
+                TG_PROXY_STATUS.update(_start_result)
             else:
-                return ""
-            found = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and int(l.get("port") or 443) == want and l.get("active")]
-            found.sort(key=lambda l: str(l.get("created_at") or ""))
-            return found[0]["uid"] if found else ""
-
-        def _webproxy_quota_ok_sync(uid):
-            link = LINKS.get(uid)
-            if not link or not link.get("active"):
-                return False
-            if link.get("limit_bytes", 0) > 0 and link.get("used_bytes", 0) >= link["limit_bytes"]:
-                return False
-            return True
-
-        try:
-            TG_PROXY_STATUS.update(await tgproxy.start_all(SOCKS_PORT, _mtproxy_port_for_start, _tg_auth, _tg_count, _tg_quota_ok, _tg_session_allowed, http_port=HTTP_PROXY_PORT))
-        except Exception as exc:
-            logger.error("telegram proxy listeners failed to start: " + str(exc))
+                for _key, _port in (("socks", SOCKS_PORT), ("mtproxy", TG_PROXY_PORT), ("http", HTTP_PROXY_PORT)):
+                    TG_PROXY_STATUS[_key] = {"enabled": False, "port": int(_port), "error": "telegram proxy multiplexer is not available in this telegram module build"}
+        else:
+            for _key, _port in (("socks", SOCKS_PORT), ("mtproxy", TG_PROXY_PORT), ("http", HTTP_PROXY_PORT)):
+                TG_PROXY_STATUS[_key] = {"enabled": False, "port": int(_port), "error": ""}
         if PROXY_START_ERRORS.get("mtproxy"):
             TG_PROXY_STATUS["mtproxy"] = {"enabled": False, "port": TG_PROXY_PORT, "error": PROXY_START_ERRORS["mtproxy"]}
-        TG_PROXY_STATUS["webproxy"] = {"enabled": bool(_web_ok), "port": WEBPROXY_PUBLIC_PORT, "error": "" if _web_ok else WEBPROXY_STATE["configure_error"]}
+        if _web_base_ok:
+            for _l in sorted([l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")], key=lambda l: str(l.get("created_at") or "")):
+                await _telemt_sync_link(_l)
+            await _telemt_sync_root_vhost()
         for _l in list(LINKS.values()):
-            if (_l.get("protocol") or "") == "mtproto":
-                try:
-                    tgproxy.mtproxy_register_link(_l["uid"])
-                except Exception:
-                    pass
-        try:
-            tgproxy.webproxy_set_hooks(count=_tg_count, quota_ok=_tg_quota_ok, session_allowed=_tg_session_allowed, uid_for_mode=_webproxy_uid_for_mode, quota_ok_sync=_webproxy_quota_ok_sync)
-        except Exception as exc:
-            logger.error("web proxy hooks failed: " + str(exc))
-        try:
-            WEBPROXY_STATE["self_check"] = tgproxy.webproxy_self_check(get_domain())
-        except Exception as exc:
-            WEBPROXY_STATE["self_check"] = {"ok": False, "detail": "web proxy self-check failed: " + str(exc)}
-        if WEBPROXY_STATE["self_check"].get("ok"):
-            logger.info("SulgX startup: WEB proxy self-check passed: " + str(WEBPROXY_STATE["self_check"].get("detail")))
-            print("SulgX startup: WEB proxy self-check passed", flush=True)
-        else:
-            logger.error("SulgX startup: WEB proxy self-check failed: " + str(WEBPROXY_STATE["self_check"].get("detail")))
-            print("SulgX startup: WEB proxy self-check failed: " + str(WEBPROXY_STATE["self_check"].get("detail")), flush=True)
-            TG_PROXY_STATUS["webproxy"] = {"enabled": False, "port": WEBPROXY_PUBLIC_PORT, "error": WEBPROXY_STATE["configure_error"] or str(WEBPROXY_STATE["self_check"].get("detail"))}
+            if (_l.get("protocol") or "") == "mtproto" and _l.get("active"):
+                await _telemt_sync_link(_l)
+        TG_PROXY_STATUS["webproxy"] = {"enabled": bool(_web_base_ok and _telemt_ok), "port": WEBPROXY_PUBLIC_PORT, "error": "" if (_web_base_ok and _telemt_ok) else (WEBPROXY_STATE["configure_error"] or "telemt binary is not available on this host")}
         asyncio.create_task(_webproxy_startup_lane_check())
         asyncio.create_task(_proxy_listener_refresh_loop())
     await migrate_proxy_passwords()
@@ -3856,6 +4248,19 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(cleanup_link_cache())
     asyncio.create_task(cleanup_telegram_create_steps())
     yield
+    try:
+        await _tg_call("telemt_stop_all")
+    except Exception:
+        pass
+    if tgproxy is not None:
+        try:
+            _stop_fn = _tg_fn("stop_all")
+            if _stop_fn is not None:
+                _stop_result = _stop_fn()
+                if inspect.isawaitable(_stop_result):
+                    await _stop_result
+        except Exception:
+            pass
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
@@ -4044,7 +4449,7 @@ async def telegram_webhook(request: Request):
                         "uid": uid, "label": label, "limit_bytes": int(limit*1073741824) if limit else 0, "used_bytes": 0,
                         "max_connections": 0, "created_at": now, "active": 1, "expires_at": expires,
                         "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
-                        "color": "#39ff14", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
+                        "color": "#3b82f6", "flag": "", "fragment": "", "ip_profile_id": "", "naming_mode": "default",
                         "tfo": 0, "ech_enabled": 0, "ech_sni": "", "ech_doh": "",
                         "fragment_mode": "off", "fragment_length": "100-200", "fragment_interval": "10-20",
                         "allow_insecure": 0, "random_path": 0, "enable_ipv6": 1,
@@ -4139,6 +4544,7 @@ async def telegram_webhook(request: Request):
                 _gone = LINKS.pop(_uid, None)
             if _gone:
                 await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (_uid,))
+                _invalidate_card_usability()
                 await send_telegram_message(chat_id, f"✅ Deleted: {_gone['label']}" if lang == "en" else f"✅ حذف شد: {_gone['label']}")
             else:
                 await send_telegram_message(chat_id, "Inbound not found." if lang == "en" else "اینباند یافت نشد.")
@@ -4162,6 +4568,17 @@ async def telegram_webhook(request: Request):
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    path = request.url.path
+    accept = request.headers.get("accept", "")
+    if path.startswith("/api/") or "text/html" not in accept:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    root_path = request.scope.get("root_path", "") or ""
+    html = NOTFOUND_HTML.replace("/panel", root_path + "/panel")
+    return HTMLResponse(status_code=404, content=html)
 app.add_middleware(CORSMiddleware, allow_origins=PANEL_ALLOWED_ORIGINS, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
@@ -4429,11 +4846,7 @@ def format_host_port(host: str, port: int = 443) -> str:
 def code_to_flag(code: str) -> str:
     if not code or len(code) != 2:
         return ""
-    code = code.upper()
-    try:
-        return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
-    except (IndexError, TypeError, ValueError):
-        return ""
+    return code.upper()
 
 def get_effective_path(link: dict) -> str:
     custom = link.get("custom_path", "")
@@ -4632,154 +5045,313 @@ def parse_user_agent(ua: str) -> tuple:
         browser = "Unknown"
     return browser, os_name
 
+NOTFOUND_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>404 - SulgX Panel</title>
+<style>
+:root{
+  --bg:#0b0c0f;
+  --surface:#131519;
+  --surface-2:#1a1d23;
+  --surface-3:#22262e;
+  --border:#262b33;
+  --border-strong:#3a414c;
+  --text:#f2f3f5;
+  --text-2:#a7adb8;
+  --text-3:#6e7681;
+  --accent:#3b82f6;
+  --accent-hover:#2563eb;
+  --accent-soft:rgba(59,130,246,0.12);
+  --accent-border:rgba(59,130,246,0.35);
+  --on-accent:#ffffff;
+  --success:#4ade80;
+  --success-soft:rgba(74,222,128,0.12);
+  --success-border:rgba(74,222,128,0.35);
+  --success-ink:#166534;
+  --warning:#fbbf24;
+  --warning-soft:rgba(251,191,36,0.12);
+  --warning-border:rgba(251,191,36,0.35);
+  --warning-ink:#92400e;
+  --danger:#f87171;
+  --danger-soft:rgba(248,113,113,0.12);
+  --danger-border:rgba(248,113,113,0.35);
+  --danger-ink:#991b1b;
+  --info:var(--accent);
+  --info-soft:var(--accent-soft);
+  --info-border:var(--accent-border);
+  --focus:rgba(59,130,246,0.55);
+  --radius-xs:4px;
+  --radius-sm:6px;
+  --radius-md:8px;
+  --radius-lg:12px;
+  --radius-xl:16px;
+  --radius-full:9999px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
+  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
+  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
+  --transition:120ms ease-out;
+}
+body.light-mode{
+  --bg:#fafafa;
+  --surface:#ffffff;
+  --surface-2:#f4f4f5;
+  --surface-3:#e4e4e7;
+  --border:#e4e4e7;
+  --border-strong:#d4d4d8;
+  --text:#171717;
+  --text-2:#52525b;
+  --text-3:#71717a;
+  --accent:#1d4ed8;
+  --accent-hover:#1e40af;
+  --accent-soft:rgba(29,78,216,0.08);
+  --accent-border:rgba(29,78,216,0.30);
+  --on-accent:#ffffff;
+  --success:#15803d;
+  --success-soft:#dcfce7;
+  --success-border:#86efac;
+  --warning:#b45309;
+  --warning-soft:#fef3c7;
+  --warning-border:#fcd34d;
+  --danger:#dc2626;
+  --danger-soft:#fee2e2;
+  --danger-border:#fca5a5;
+  --focus:rgba(29,78,216,0.45);
+  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
+  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
+  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
+}
+body.blue-dark{
+  --bg:#0f172a;
+  --surface:#1e293b;
+  --surface-2:#273449;
+  --surface-3:#334155;
+  --border:#2b3a4f;
+  --border-strong:#475569;
+  --text:#e2e8f0;
+  --text-2:#94a3b8;
+  --text-3:#64748b;
+}
+.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
+.ic svg{width:100%;height:100%;display:block}
+.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
+.status-dot.ok{background:var(--success)}
+.status-dot.warn{background:var(--warning)}
+.status-dot.err{background:var(--danger)}
+.status-dot.off{background:var(--text-3)}
+.hidden{display:none}
+.ltr{direction:ltr;unicode-bidi:isolate}
+[dir="rtl"] .ic-flip{transform:scaleX(-1)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
+.nf-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:min(400px,calc(100vw - 32px));text-align:center;box-shadow:var(--shadow-md)}
+.nf-logo{display:flex;align-items:center;justify-content:center;gap:10px;font-size:28px;font-weight:700;letter-spacing:-0.02em}
+.nf-logo-dot{width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none}
+.nf-code{font-family:var(--font-mono);font-size:48px;font-weight:700;color:var(--accent);margin:24px 0 8px}
+.nf-msg{color:var(--text-2);margin:0 0 24px}
+.nf-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:var(--on-accent);border:none;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}
+.nf-btn:hover{background:var(--accent-hover)}
+</style>
+</head>
+<body>
+<div class="nf-card">
+<div class="nf-logo"><span class="nf-logo-dot"></span>SulgX Panel</div>
+<div class="nf-code">404</div>
+<p class="nf-msg">Page not found</p>
+<a class="nf-btn" href="/panel">Back to Panel</a>
+</div>
+</body>
+</html>"""
+
 LANDING_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title data-en="SulgX - Welcome" data-fa="SulgX - خوش‌آمدید">SulgX - Welcome</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --primary:#39ff14; --primary-dim:rgba(57,255,20,0.20); --primary-glass:rgba(57,255,20,0.10);
-  --bg:#09090b; --bg2:#111113; --bg3:#18181b;
-  --surface:rgba(18,18,20,0.8); --surface2:rgba(24,24,27,0.92); --surface3:rgba(30,30,35,0.88);
-  --border:rgba(57,255,20,0.14); --border2:rgba(57,255,20,0.30);
-  --text:#f0f0f4; --text2:#a1a1aa; --text3:#71717a;
-  --green:#4ade80; --red:#f87171; --yellow:#fbbf24;
-  --header-h:68px; --footer-h:52px;
-  --radius-sm:12px; --radius-md:18px; --radius-lg:26px;
-  --shadow:0 12px 40px rgba(0,0,0,0.6);
-  --shadow-soft:0 6px 24px rgba(0,0,0,0.35);
-  --shadow-glow:0 0 35px var(--primary-dim);
-  --transition:0.3s cubic-bezier(0.20,0.80,0.40,1);
-  --halo-color-1:rgba(57,255,20,0.22); --halo-color-2:rgba(57,255,20,0.10); --halo-color-3:rgba(57,255,20,0.05);
+  --bg:#0b0c0f;
+  --surface:#131519;
+  --surface-2:#1a1d23;
+  --surface-3:#22262e;
+  --border:#262b33;
+  --border-strong:#3a414c;
+  --text:#f2f3f5;
+  --text-2:#a7adb8;
+  --text-3:#6e7681;
+  --accent:#3b82f6;
+  --accent-hover:#2563eb;
+  --accent-soft:rgba(59,130,246,0.12);
+  --accent-border:rgba(59,130,246,0.35);
+  --on-accent:#ffffff;
+  --success:#4ade80;
+  --success-soft:rgba(74,222,128,0.12);
+  --success-border:rgba(74,222,128,0.35);
+  --success-ink:#166534;
+  --warning:#fbbf24;
+  --warning-soft:rgba(251,191,36,0.12);
+  --warning-border:rgba(251,191,36,0.35);
+  --warning-ink:#92400e;
+  --danger:#f87171;
+  --danger-soft:rgba(248,113,113,0.12);
+  --danger-border:rgba(248,113,113,0.35);
+  --danger-ink:#991b1b;
+  --info:var(--accent);
+  --info-soft:var(--accent-soft);
+  --info-border:var(--accent-border);
+  --focus:rgba(59,130,246,0.55);
+  --radius-xs:4px;
+  --radius-sm:6px;
+  --radius-md:8px;
+  --radius-lg:12px;
+  --radius-xl:16px;
+  --radius-full:9999px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
+  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
+  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
+  --transition:120ms ease-out;
 }
-body.light-mode {
-  --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.20); --primary-glass:rgba(46,125,50,0.10);
-  --bg:#f5f9f5; --bg2:#ffffff; --bg3:#eaf1ea;
-  --surface:rgba(255,255,255,0.8); --surface2:rgba(255,255,255,0.94); --surface3:rgba(245,250,245,0.90);
-  --border:rgba(0,0,0,0.12); --border2:rgba(0,0,0,0.22);
-  --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
-  --shadow:0 12px 36px rgba(0,0,0,0.10); --shadow-soft:0 6px 20px rgba(0,0,0,0.06); --shadow-glow:0 0 30px rgba(46,125,50,0.25);
-  --halo-color-1:rgba(46,125,50,0.20); --halo-color-2:rgba(46,125,50,0.10); --halo-color-3:rgba(46,125,50,0.05);
+body.light-mode{
+  --bg:#fafafa;
+  --surface:#ffffff;
+  --surface-2:#f4f4f5;
+  --surface-3:#e4e4e7;
+  --border:#e4e4e7;
+  --border-strong:#d4d4d8;
+  --text:#171717;
+  --text-2:#52525b;
+  --text-3:#71717a;
+  --accent:#1d4ed8;
+  --accent-hover:#1e40af;
+  --accent-soft:rgba(29,78,216,0.08);
+  --accent-border:rgba(29,78,216,0.30);
+  --on-accent:#ffffff;
+  --success:#15803d;
+  --success-soft:#dcfce7;
+  --success-border:#86efac;
+  --warning:#b45309;
+  --warning-soft:#fef3c7;
+  --warning-border:#fcd34d;
+  --danger:#dc2626;
+  --danger-soft:#fee2e2;
+  --danger-border:#fca5a5;
+  --focus:rgba(29,78,216,0.45);
+  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
+  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
+  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
 }
-body.blue-mode {
-  --primary:#3b82f6; --primary-dim:rgba(59,130,246,0.20); --primary-glass:rgba(59,130,246,0.10);
-  --bg:#0f172a; --bg2:#1e293b; --bg3:#1e293b;
-  --surface:rgba(30,41,59,0.82); --surface2:rgba(30,41,59,0.94); --surface3:rgba(51,65,85,0.90);
-  --border:rgba(59,130,246,0.14); --border2:rgba(59,130,246,0.34);
-  --text:#e2e8f0; --text2:#94a3b8; --text3:#64748b;
-  --shadow:0 12px 40px rgba(0,0,0,0.5); --shadow-soft:0 6px 24px rgba(0,0,0,0.3); --shadow-glow:0 0 35px rgba(59,130,246,0.35);
-  --halo-color-1:rgba(59,130,246,0.22); --halo-color-2:rgba(59,130,246,0.10); --halo-color-3:rgba(59,130,246,0.05);
+body.blue-dark{
+  --bg:#0f172a;
+  --surface:#1e293b;
+  --surface-2:#273449;
+  --surface-3:#334155;
+  --border:#2b3a4f;
+  --border-strong:#475569;
+  --text:#e2e8f0;
+  --text-2:#94a3b8;
+  --text-3:#64748b;
 }
-html,body{height:100%;overflow-x:hidden}
+.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
+.ic svg{width:100%;height:100%;display:block}
+.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
+.status-dot.ok{background:var(--success)}
+.status-dot.warn{background:var(--warning)}
+.status-dot.err{background:var(--danger)}
+.status-dot.off{background:var(--text-3)}
+.hidden{display:none}
+.ltr{direction:ltr;unicode-bidi:isolate}
+[dir="rtl"] .ic-flip{transform:scaleX(-1)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
 body{
-  font-family:'Inter','Vazirmatn',sans-serif; color:var(--text); display:flex; flex-direction:column;
-  background:var(--bg); transition:background 0.5s,color 0.5s; position:relative; line-height:1.65;
+  font-family:var(--font-sans); color:var(--text); display:flex; flex-direction:column;
+  background:var(--bg); transition:background-color 120ms ease-out,color 120ms ease-out; line-height:1.55;
   -webkit-font-smoothing:antialiased;
 }
-body::before{
-  content:''; position:fixed; top:-50%; left:-30%; width:90%; height:110%;
-  background:radial-gradient(ellipse at 35% 45%,var(--halo-color-1) 0%,transparent 60%);
-  animation:haloFloat1 28s infinite alternate ease-in-out; z-index:0; pointer-events:none;
-  filter:blur(70px); mix-blend-mode:screen; opacity:0.85;
-}
-body::after{
-  content:''; position:fixed; bottom:-50%; right:-30%; width:90%; height:110%;
-  background:radial-gradient(ellipse at 65% 55%,var(--halo-color-2) 0%,transparent 60%);
-  animation:haloFloat2 32s infinite alternate ease-in-out; z-index:0; pointer-events:none;
-  filter:blur(90px); mix-blend-mode:screen; opacity:0.85;
-}
-@keyframes haloFloat1{0%{transform:translate(0,0) scale(1)}100%{transform:translate(8%,10%) scale(1.15)}}
-@keyframes haloFloat2{0%{transform:translate(0,0) scale(1)}100%{transform:translate(-8%,-10%) scale(1.15)}}
-body[dir="rtl"]{direction:rtl;text-align:right}
+body[dir="rtl"]{direction:rtl;text-align:start}
 a{text-decoration:none;color:inherit}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .header{
-  min-height:var(--header-h); background:var(--surface); border-bottom:1px solid var(--border);
-  display:flex; align-items:center; justify-content:center; padding:0 28px;
-  backdrop-filter:blur(30px) saturate(150%); position:sticky; top:0; z-index:101;
-  box-shadow:0 2px 20px rgba(0,0,0,0.2);
+  min-height:56px; background:var(--surface); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:center; padding:0 16px;
+  position:sticky; top:0; z-index:101;
 }
-.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1440px;flex-wrap:nowrap;gap:16px}
+.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1200px;flex-wrap:wrap;gap:12px}
 .logo{
-  font-family:'Orbitron',sans-serif; font-size:1.9rem; font-weight:900; color:var(--primary);
-  letter-spacing:2px; text-shadow:0 0 20px var(--primary-dim); transition:text-shadow 0.3s,transform 0.3s; flex-shrink:0
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--font-sans); font-size:20px; font-weight:700; color:var(--text);
+  letter-spacing:-0.02em; flex-shrink:0;
 }
-.logo:hover{text-shadow:0 0 38px var(--primary-dim);transform:scale(1.04)}
-.header-right{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;flex-shrink:0}
-.lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:var(--radius-sm);padding:3px;backdrop-filter:blur(8px)}
+.logo::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none}
+.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0}
+.lang-switch{display:flex;gap:2px;background:var(--surface-2);border-radius:var(--radius-sm);padding:3px}
 .lang-btn{
-  padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.8rem;font-weight:700;
-  border-radius:8px;cursor:pointer;font-family:inherit;transition:all var(--transition)
+  padding:6px 14px;border:none;background:transparent;color:var(--text-3);font-size:13px;font-weight:600;
+  border-radius:var(--radius-sm);cursor:pointer;font-family:inherit;transition:background-color 120ms ease-out,color 120ms ease-out;
 }
-.lang-btn.active{background:var(--primary);color:#000;box-shadow:0 0 16px var(--primary-dim)}
+.lang-btn.active{background:var(--accent);color:var(--on-accent)}
 .btn-icon{
-  background:var(--surface3);border:1px solid var(--border);color:var(--text3);border-radius:var(--radius-sm);
-  padding:10px;cursor:pointer;transition:all var(--transition);font-size:1.1rem;backdrop-filter:blur(8px);
-  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;position:relative;overflow:hidden
+  background:var(--surface);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-sm);
+  width:32px;height:32px;padding:0;cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
+  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
 }
-.btn-icon:hover{color:var(--primary);border-color:transparent;background:var(--primary-glass);transform:translateY(-2px)}
-.main{flex:1;display:flex;align-items:center;justify-content:center;padding:36px 24px;position:relative;z-index:1}
+.btn-icon:hover{color:var(--text);background:var(--surface-2)}
+.main{flex:1;display:flex;align-items:center;justify-content:center;padding:24px 16px;position:relative;z-index:1}
 .card{
-  background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-lg);
-  padding:42px 28px;max-width:520px;width:100%;box-shadow:var(--shadow),0 0 45px var(--primary-dim);
-  backdrop-filter:blur(20px) saturate(110%);text-align:center;position:relative;overflow:hidden
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);
+  padding:24px;width:min(400px,calc(100vw - 32px));box-shadow:var(--shadow-sm);
+  text-align:center;position:relative;
 }
-.card::before{
-  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
-  pointer-events: none;
-  background:conic-gradient(from var(--angle,0deg),transparent,var(--primary),transparent);
-  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-  mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-  -webkit-mask-composite:xor;mask-composite:exclude;
-  animation:borderRotate 5s linear infinite paused;opacity:0;transition:opacity 0.4s
+h1{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);
+  letter-spacing:-0.02em;margin-bottom:12px;
 }
-.card:hover::before{opacity:1;animation-play-state:running}
-@property --angle{syntax:'<angle>';initial-value:0deg;inherits:false}
-@keyframes borderRotate{from{--angle:0deg}to{--angle:360deg}}
-h1{font-family:'Orbitron',sans-serif;color:var(--primary);font-size:2.2rem;margin-bottom:12px;text-shadow:0 0 20px var(--primary-dim)}
-.subtitle{color:var(--text3);font-size:0.95rem;margin-bottom:32px;min-height:2em;line-height:1.5}
-.steps{text-align:left;margin-bottom:24px}
+h1::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none}
+.subtitle{color:var(--text-2);font-size:14px;margin-bottom:24px;line-height:1.55}
+.steps{text-align:start;margin-bottom:24px}
 .step{
-  display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;padding:14px;
-  background:var(--surface3);border-radius:var(--radius-sm);border:1px solid var(--border);
-  backdrop-filter:blur(8px);transition:all var(--transition)
+  display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;padding:12px;
+  background:var(--surface-2);border-radius:var(--radius-md);border:1px solid var(--border);
+  transition:border-color 120ms ease-out;
 }
-.step:hover{border-color:var(--primary);background:var(--primary-glass)}
-.step-num{font-size:1.2rem;font-weight:900;color:var(--primary);min-width:32px;text-align:center}
-.step-text{font-size:0.9rem;color:var(--text);line-height:1.5}
+.step:hover{border-color:var(--border-strong)}
+.step-num{
+  width:28px;height:28px;border-radius:var(--radius-full);flex:none;
+  background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);
+  font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;
+}
+.step-text{font-size:14px;color:var(--text);line-height:1.55}
 .btn{
-  font-family:inherit;font-size:0.9rem;font-weight:700;border-radius:var(--radius-sm);
-  padding:12px 26px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
-  gap:8px;border:none;transition:all var(--transition);backdrop-filter:blur(10px);
-  position:relative;overflow:hidden;letter-spacing:0.3px;margin:6px
+  font-family:inherit;font-size:14px;font-weight:500;border-radius:var(--radius-sm);
+  padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+  gap:8px;border:1px solid transparent;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
+  margin:6px;
 }
-.btn::after{
-  content:'';position:absolute;top:0;left:0;width:100%;height:100%;
-  background:linear-gradient(45deg,transparent,rgba(255,255,255,0.2),transparent);
-  transform:translateX(-100%);transition:transform 0.8s
-}
-.btn:hover::after{transform:translateX(100%)}
-.btn-primary{
-  background:linear-gradient(135deg,var(--primary),color-mix(in srgb,var(--primary) 80%,black));
-  color:#000;box-shadow:0 6px 28px var(--primary-dim);border:1px solid transparent
-}
-.btn-primary:hover{filter:brightness(1.2);box-shadow:0 10px 40px var(--primary-dim);transform:translateY(-3px)}
+.btn-primary{background:var(--accent);color:var(--on-accent)}
+.btn-primary:hover{background:var(--accent-hover)}
 .footer{
-  height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;
-  color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto
+  min-height:52px;display:flex;align-items:center;justify-content:center;font-size:13px;
+  color:var(--text-3);border-top:1px solid var(--border);background:var(--surface);padding:12px 16px;margin-top:auto;
 }
-.footer-inner{display:flex;align-items:center;justify-content:center;gap:36px;flex-wrap:wrap}
-.footer-inner a{color:var(--primary);text-decoration:none;font-weight:600;transition:all var(--transition)}
-.footer-inner a:hover{text-shadow:0 0 18px var(--primary)}
-@media(max-width:500px){
-  .header{padding:10px 18px;min-height:auto}
-  .logo{font-size:1.5rem}
-  .card{padding:28px 16px}
-  h1{font-size:1.6rem}
-  .btn{padding:10px 18px}
+.footer-inner{display:flex;align-items:center;justify-content:center;gap:24px;flex-wrap:wrap}
+.footer-inner a{color:var(--accent);text-decoration:none;font-weight:600;transition:color 120ms ease-out}
+.footer-inner a:hover{color:var(--accent-hover)}
+@media (max-width: 480px){
+  .header{padding:8px 16px}
+  .card{padding:20px 16px}
 }
 </style>
 </head>
@@ -4792,7 +5364,7 @@ h1{font-family:'Orbitron',sans-serif;color:var(--primary);font-size:2.2rem;margi
         <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
-      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم">🌙</button>
+      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم" aria-label="Toggle theme"><span id="theme-icon"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span></span></button>
     </div>
   </div>
 </div>
@@ -4838,13 +5410,14 @@ function setLang(l){
   document.querySelectorAll('[data-en-title]').forEach(el=>{ const v = el.getAttribute('data-'+l+'-title'); if(v) el.title = v; });
   localStorage.setItem('ll', l);
 }
+const THEME_ICONS={dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',blue:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'};
 function setTheme(t){
   theme = t;
   document.body.classList.toggle('light-mode', t==='light');
-  document.body.classList.toggle('blue-mode', t==='blue-dark');
+  document.body.classList.toggle('blue-dark', t==='blue-dark');
   localStorage.setItem('theme', t);
-  const themeBtn = document.getElementById('theme-toggle-btn');
-  if (themeBtn) themeBtn.textContent = t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');
+  const themeIcon = document.getElementById('theme-icon');
+  if (themeIcon) themeIcon.innerHTML = t==='light' ? THEME_ICONS.light : THEME_ICONS.dark;
 }
 function toggleTheme(){
   const themes = ['dark','light','blue-dark'];
@@ -5006,85 +5579,193 @@ async def test_proxy_line(pid: int, request: Request, _=Depends(require_auth)):
     result = await perform_proxy_test(proxy_row)
     return result
 
-def _webproxy_bridge_for_request(request):
-    if tgproxy is None:
-        return None
-    host = get_domain(request)
-    capability = request.query_params.get("bridge", "") or request.query_params.get("capability", "") or request.query_params.get("cap", "") or request.headers.get("x-tgweb-capability", "")
-    port_param = request.query_params.get("port")
+_FORWARDER_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length"}
+
+
+def _forwarder_client_ip(request):
+    ip = get_real_remote_address(request)
     try:
-        port = int(port_param) if port_param else None
-    except (TypeError, ValueError):
-        port = None
-    token = _webproxy_token_from_request(request)
-    mode = -1
-    mode_token = ""
-    if capability:
+        parsed = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return "127.0.0.1"
+    return str(parsed)
+
+
+def _forwarder_headers(request, host, client_ip):
+    headers = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower in _FORWARDER_HOP_BY_HOP:
+            continue
+        if lower.startswith("x-forwarded-") or lower in ("forwarded",) or lower.startswith("cf-"):
+            continue
+        headers[key] = value
+    headers["host"] = host
+    headers["x-forwarded-for"] = client_ip
+    return headers
+
+
+async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"", body=b""):
+    port = _telemt_web_port_for_uid(uid)
+    if not port:
+        return JSONResponse(status_code=502, content={"ok": False, "detail": "telemt WEB child is not running for this inbound"})
+    host = get_domain(request)
+    client_ip = _forwarder_client_ip(request)
+    upstream = "http://127.0.0.1:" + str(port) + upstream_path
+    if upstream_query:
+        upstream += "?" + upstream_query.decode("latin-1")
+    headers = _forwarder_headers(request, host, client_ip)
+    timeout = httpx.Timeout(70.0, connect=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            req = client.build_request(request.method, upstream, headers=headers, content=body)
+            resp = await client.send(req, stream=True)
+            resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _FORWARDER_HOP_BY_HOP}
+            status = resp.status_code
+            chunks = []
+            total_down = 0
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+                total_down += len(chunk)
+            if total_down:
+                try:
+                    await consume_quota_partial(uid, total_down)
+                except Exception:
+                    pass
+            return Response(content=b"".join(chunks), status_code=status, headers=resp_headers)
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "detail": "upstream WEB proxy timed out"})
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"ok": False, "detail": "upstream WEB proxy error: " + str(exc)})
+
+
+async def _forward_ws_to_telemt(websocket, uid, upstream_path):
+    port = _telemt_web_port_for_uid(uid)
+    if not port:
+        await websocket.close(code=1011)
+        return
+    host = get_domain(websocket)
+    client_ip = _forwarder_client_ip(websocket)
+    offered = websocket.headers.get("sec-websocket-protocol", "")
+    subprotocols = [part.strip() for part in offered.split(",") if part.strip()] or None
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(10.0)
+    try:
+        raw.connect(("127.0.0.1", int(port)))
+    except OSError:
         try:
-            mode, mode_token = tgproxy.webproxy_verify_bridge_capability(host, capability, port, token or None)
+            raw.close()
+        except OSError:
+            pass
+        await websocket.close(code=1011)
+        return
+    raw.settimeout(None)
+    url = "ws://" + host + upstream_path
+    try:
+        upstream_ws = await websockets.connect(url, sock=raw, subprotocols=subprotocols, extra_headers={"X-Forwarded-For": client_ip}, open_timeout=10.0, ping_interval=None)
+    except Exception:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        await websocket.close(code=1011)
+        return
+    await websocket.accept(subprotocol=upstream_ws.subprotocol)
+    down_total = 0
+    up_total = 0
+
+    async def _client_to_upstream():
+        nonlocal up_total
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                data = message.get("bytes")
+                if data is None:
+                    text = message.get("text")
+                    data = text.encode("utf-8") if text else b""
+                if data:
+                    up_total += len(data)
+                    await upstream_ws.send(data)
         except Exception:
-            mode = -1
-            mode_token = ""
-    if mode < 0 and capability and not token:
-        for _row in list(LINKS.values()):
-            _row_token = str(_row.get("webproxy_token") or "").strip().lower()
-            if (_row.get("protocol") or "") != "webproxy" or not _row_token:
-                continue
-            try:
-                mode, mode_token = tgproxy.webproxy_verify_bridge_capability(host, capability, port, _row_token)
-            except Exception:
-                continue
-            if mode >= 0:
-                token = _row_token
-                break
-    if mode < 0:
-        secret_param = request.query_params.get("secret", "") or request.headers.get("x-tgweb-secret", "")
-        if secret_param:
-            if token:
+            pass
+
+    async def _upstream_to_client():
+        nonlocal down_total
+        try:
+            while True:
                 try:
-                    _match = tgproxy.webproxy_token_secret_matches(token, secret_param)
-                except Exception:
-                    _match = False
-                if _match:
-                    mode = tgproxy.WEBPROXY_TOKEN_MODE
-                    mode_token = token
-            else:
-                try:
-                    secret_port = tgproxy.webproxy_port_for_secret(secret_param)
-                except Exception:
-                    secret_port = None
-                if secret_port is not None:
-                    mode = tgproxy.webproxy_port_mode(secret_port)
-                else:
-                    for _row in list(LINKS.values()):
-                        _row_token = str(_row.get("webproxy_token") or "").strip().lower()
-                        if (_row.get("protocol") or "") != "webproxy" or not _row_token:
-                            continue
-                        try:
-                            _match = tgproxy.webproxy_token_secret_matches(_row_token, secret_param)
-                        except Exception:
-                            _match = False
-                        if _match:
-                            mode = tgproxy.WEBPROXY_TOKEN_MODE
-                            mode_token = _row_token
-                            token = _row_token
-                            break
-    if mode < 0:
+                    data = await asyncio.wait_for(upstream_ws.recv(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    try:
+                        await upstream_ws.ping()
+                    except Exception:
+                        break
+                    continue
+                if isinstance(data, str):
+                    data = data.encode("utf-8")
+                down_total += len(data)
+                await websocket.send_bytes(data)
+        except Exception:
+            pass
+
+    await asyncio.gather(_client_to_upstream(), _upstream_to_client())
+    try:
+        await upstream_ws.close()
+    except Exception:
+        pass
+    try:
+        await websocket.close()
+    except Exception:
+        pass
+    try:
+        if up_total:
+            await consume_quota_partial(uid, up_total)
+    except Exception:
+        pass
+    try:
+        if down_total:
+            await consume_quota_partial(uid, down_total)
+    except Exception:
+        pass
+
+
+def _web_link_for_token(token):
+    token = str(token or "").strip().lower()
+    if not _webproxy_valid_token(token):
         return None
-    if mode == tgproxy.WEBPROXY_TOKEN_MODE:
-        return tgproxy.webproxy_bridge_html(host, WEBPROXY_PUBLIC_PORT, mode_token or token)
-    if mode >= tgproxy.WEBPROXY_PORT_MODE_BASE:
-        web_port = tgproxy.WEB_PROXY_PORTS[mode - tgproxy.WEBPROXY_PORT_MODE_BASE]
-    else:
-        web_port = 443
-    return tgproxy.webproxy_bridge_html(host, web_port)
+    for row in LINKS.values():
+        if (row.get("protocol") or "") == "webproxy" and str(row.get("webproxy_token") or "").strip().lower() == token and row.get("active"):
+            return row
+    return None
+
+
+async def _root_bridge_response(request):
+    capability = request.query_params.get("bridge", "") or request.query_params.get("capability", "") or request.query_params.get("cap", "") or request.headers.get("x-tgweb-capability", "")
+    if not capability:
+        return None
+    oldest = _oldest_active_web()
+    if oldest is None:
+        return Response(content="no active WEB proxy inbound", status_code=404, media_type="text/plain")
+    host = get_domain(request)
+    token = str(oldest.get("webproxy_token") or "").strip().lower()
+    try:
+        expected_v2 = _web_capability(host, token)
+        expected_v1 = _web_capability_v1(host, token)
+    except ValueError:
+        return Response(content="WEB proxy secret is not configured", status_code=404, media_type="text/plain")
+    if not (hmac_mod.compare_digest(capability, expected_v2) or hmac_mod.compare_digest(capability, expected_v1)):
+        return Response(content="invalid bridge capability", status_code=404, media_type="text/plain")
+    query = request.url.query.encode("latin-1") if request.url.query else b""
+    return await _forward_http_to_telemt(request, _TELEMT_ROOT_CHILD_UID, "/", query, body=b"")
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root(request: Request):
-    bridge = _webproxy_bridge_for_request(request)
+    bridge = await _root_bridge_response(request)
     if bridge is not None:
-        return HTMLResponse(content=bridge)
+        return bridge
     if CAMOUFLAGE_URL:
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
@@ -5403,18 +6084,12 @@ async def save_settings(request: Request, _=Depends(require_auth)):
     global ENABLE_LOGGING, TIMEZONE_OFFSET, KEEP_ALIVE_ENABLED, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_MODE, DEFAULT_PATH, DOH_ENABLED
     global STEALTH_MODE, LANDING_REDIRECT, CAMOUFLAGE_URL, SUB_FILENAME, PANEL_PREFIX, DEFAULT_XHTTP_PATH
     body = await request.json()
+    keep_alive_value = None
+    timezone_value = None
     if "keep_alive_interval" in body:
-        try:
-            int(body["keep_alive_interval"])
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid keep_alive_interval")
+        keep_alive_value = _parse_int_value(body["keep_alive_interval"], "keep_alive_interval", 60, 60, 31536000)
     if "timezone_offset" in body:
-        try:
-            offset_value = float(body["timezone_offset"])
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid timezone_offset")
-        if offset_value < -12 or offset_value > 14:
-            raise HTTPException(status_code=400, detail="Invalid timezone_offset")
+        timezone_value = _parse_float_value(body["timezone_offset"], "timezone_offset", TIMEZONE_OFFSET, -12, 14)
     for k in ('tg_bot_token', 'tg_chat_id', 'max_scan_ips', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
               'telegram_events', 'telegram_interval', 'keep_alive_interval', 'keep_alive_enabled', 'keep_alive_mode',
@@ -5439,9 +6114,9 @@ async def save_settings(request: Request, _=Depends(require_auth)):
     if 'keep_alive_mode' in body:
         KEEP_ALIVE_MODE = body['keep_alive_mode']
     if 'keep_alive_interval' in body:
-        KEEP_ALIVE_INTERVAL = max(60, int(body['keep_alive_interval']))
+        KEEP_ALIVE_INTERVAL = keep_alive_value
     if 'timezone_offset' in body:
-        TIMEZONE_OFFSET = float(body['timezone_offset'])
+        TIMEZONE_OFFSET = timezone_value
     if 'default_path' in body:
         new_path = str(body['default_path']).strip()
         if not new_path:
@@ -5802,7 +6477,7 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
             custom_sni = restore_str(link.get("custom_sni"), "custom_sni", "")
             custom_host = restore_str(link.get("custom_host"), "custom_host", "")
             custom_fp = restore_str(link.get("custom_fp"), "custom_fp", "chrome")
-            color = restore_str(link.get("color"), "color", "#39ff14")
+            color = restore_str(link.get("color"), "color", "#3b82f6")
             flag = restore_str(link.get("flag"), "flag", "")
             fragment = restore_str(link.get("fragment"), "fragment", "")
             ip_profile_id = restore_str(link.get("ip_profile_id"), "ip_profile_id", "")
@@ -5932,13 +6607,9 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
             LINKS.clear()
             LINKS.update(new_links)
         stats["total_bytes"] = sum(item["used_bytes"] for item in clean_links)
+        _invalidate_card_usability()
         for _item in clean_links:
             await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4 WHERE uid = $5", (_item.get("mtproto_variant", "dd"), _item.get("mtproto_domain", "www.google.com"), _item.get("vmess_security", "auto") or "auto", _item.get("webproxy_token", "") or "", _item["uid"]))
-            if _item.get("protocol") == "mtproto" and tgproxy is not None:
-                try:
-                    tgproxy.mtproxy_register_link(_item["uid"])
-                except Exception:
-                    pass
     if "addresses" in body:
         async with CUSTOM_ADDRESSES_LOCK:
             CUSTOM_ADDRESSES[:] = [addr for addr, flag in clean_addresses]
@@ -6001,7 +6672,7 @@ async def create_proxy_line(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Name is required")
     proxy_type = body.get("type", "socks5")
     host = (body.get("host") or "").strip()
-    port = int(body.get("port") or 0)
+    port = _parse_int_value(body.get("port"), "port", 0, 0, 65535)
     if not host or port <= 0:
         raise HTTPException(status_code=400, detail="Host and valid port are required")
     username = body.get("username", "")
@@ -6027,6 +6698,8 @@ async def update_proxy_line(pid: int, request: Request, _=Depends(require_auth))
             updates["password"] = ""
         elif new_password:
             updates["password"] = encrypt_proxy_password(new_password)
+    if "port" in updates:
+        updates["port"] = _parse_int_value(updates["port"], "port", 0, 1, 65535)
     if not updates:
         return {"ok": True}
 
@@ -6065,6 +6738,14 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Invalid protocol")
     validate_protocol_fields(protocol, body)
     map_protocol_credentials(protocol, body)
+    _proxy_user = ""
+    _proxy_pw = ""
+    if protocol in ("socks5", "http-proxy"):
+        _proxy_user = str(body.get("proxy_username") or "").strip()
+        _proxy_pw = str(body.get("proxy_password") or "").strip()
+        if not _proxy_user and not _proxy_pw:
+            _proxy_user = _gen_proxy_code()
+            _proxy_pw = _proxy_user
     uuid_input = (body.get("uuid") or "").strip()
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
         raise HTTPException(status_code=400, detail="Remark must contain only English letters, numbers, and characters: - _ . space")
@@ -6082,13 +6763,22 @@ async def create_link(request: Request, _=Depends(require_auth)):
 
     proxy_line_id = body.get("proxy_line_id")
     if proxy_line_id is not None:
-        proxy_line_id = int(proxy_line_id)
+        proxy_line_id = _parse_int_value(proxy_line_id, "proxy_line_id", 0, 0, 2147483647)
     else:
         proxy_line_id = None
 
-    default_limit = int(defaults.get("default_limit_bytes") or 0)
-    default_expiry_days = int(defaults.get("default_expiry_days") or 0)
-    default_max_conn = int(defaults.get("default_max_connections") or 0)
+    try:
+        default_limit = int(defaults.get("default_limit_bytes") or 0)
+    except (ValueError, TypeError):
+        default_limit = 0
+    try:
+        default_expiry_days = int(defaults.get("default_expiry_days") or 0)
+    except (ValueError, TypeError):
+        default_expiry_days = 0
+    try:
+        default_max_conn = int(defaults.get("default_max_connections") or 0)
+    except (ValueError, TypeError):
+        default_max_conn = 0
 
     limit_val = _parse_float_value(body.get("limit_value"), "limit_value", default_limit, 0, 100000)
     limit_unit = str(body.get("limit_unit") or "GB").upper()
@@ -6111,7 +6801,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     custom_sni = body.get("custom_sni", "")
     custom_host = body.get("custom_host", "")
     custom_fp = body.get("custom_fp", "chrome")
-    color = body.get("color", "#39ff14")
+    color = body.get("color", "#3b82f6")
     flag = body.get("flag", "")
     fragment = body.get("fragment", "")
     ip_profile_id = body.get("ip_profile_id", "")
@@ -6127,8 +6817,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     random_path = 1 if body.get("random_path") else 0
     enable_ipv6 = 1 if body.get("enable_ipv6", True) else 0
     smux_enabled = 1 if body.get("smux_enabled") else 0
-    ip_limit = int(body.get("ip_limit") or 0)
-    if ip_limit < 0: ip_limit = 0
+    ip_limit = _parse_int_value(body.get("ip_limit"), "ip_limit", 0, 0, 100000)
     default_ss_method = normalize_ss_method(defaults.get("default_ss_method")) or "2022-blake3-aes-256-gcm"
     default_outbound_mode = defaults.get("default_outbound_mode") if defaults.get("default_outbound_mode") in OUTBOUND_MODES else "auto"
     default_gaming_profile = defaults.get("default_gaming_profile") if defaults.get("default_gaming_profile") in GAMING_PROFILES else "balanced"
@@ -6173,7 +6862,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
             ss_psk = base64.b64encode(secrets.token_bytes(ss_key_len(ss_method))).decode()
     fingerprint = body.get("fingerprint", "chrome")
     alpn = body.get("alpn", "")
-    port = int(body.get("port") or 443)
+    port = _parse_int_value(body.get("port"), "port", 443, 0, 65535)
     mtproto_variant = str(body.get("mtproto_variant") or "dd").strip().lower()
     if mtproto_variant not in MTPROTO_VARIANTS:
         mtproto_variant = "dd"
@@ -6182,7 +6871,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Invalid fake-TLS domain")
     _web_token = ""
     if protocol == "webproxy":
-        port = int(body.get("port") or 443)
+        port = _parse_int_value(body.get("port"), "port", 443, 0, 65535)
         if port not in WEBPROXY_PORTS:
             raise HTTPException(status_code=400, detail="WEB proxy port must be one of 443, 2053, 2083, 2087, 2096, 8443")
         if port not in _webproxy_allowed_ports():
@@ -6257,7 +6946,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "outbound_proxy_pass": outbound_proxy_pass,
         "mtproto_variant": mtproto_variant,
         "mtproto_domain": mtproto_domain,
-        "webproxy_token": _web_token
+        "webproxy_token": _web_token,
+        "proxy_username": _proxy_user,
+        "proxy_password": _proxy_pw
     }
     async with LINKS_LOCK:
         if protocol == "webproxy":
@@ -6277,19 +6968,15 @@ async def create_link(request: Request, _=Depends(require_auth)):
         except Exception as e:
             raise HTTPException(status_code=500, detail="Database insert failed: " + str(e))
         LINKS[uid] = link_data
-    await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4 WHERE uid = $5", (mtproto_variant, mtproto_domain, vmess_security, _web_token, uid))
-    if protocol == "mtproto" and tgproxy is not None:
-        try:
-            tgproxy.mtproxy_register_link(uid)
-        except Exception:
-            pass
+    await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ?, proxy_username = ?, proxy_password = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4, proxy_username = $5, proxy_password = $6 WHERE uid = $7", (mtproto_variant, mtproto_domain, vmess_security, _web_token, _proxy_user, _proxy_pw, uid))
+    await _telemt_sync_link(LINKS.get(uid))
     extra = {"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp, "fragment": fragment,
              "tfo": tfo, "ech_enabled": ech_enabled, "ech_sni": ech_sni, "ech_doh": ech_doh,
              "fragment_mode": fragment_mode, "fragment_length": fragment_length, "fragment_interval": fragment_interval,
              "allow_insecure": allow_insecure, "random_path": random_path, "enable_ipv6": enable_ipv6,
              "smux_enabled": smux_enabled, "ip_limit": ip_limit,
              "protocol": protocol, "fingerprint": fingerprint, "alpn": alpn, "port": port,
-             "udp_enabled": udp_enabled, "outbound_proxy": outbound_proxy, "outbound_proxy_has_pass": bool(outbound_proxy_pass), "mtproto_variant": mtproto_variant, "mtproto_domain": mtproto_domain, "webproxy_token": _web_token, "ss_method": ss_method, "ss_psk": ss_psk, "vmess_security": vmess_security, "uid": uid}
+             "udp_enabled": udp_enabled, "outbound_proxy": outbound_proxy, "outbound_proxy_has_pass": bool(outbound_proxy_pass), "mtproto_variant": mtproto_variant, "mtproto_domain": mtproto_domain, "webproxy_token": _web_token, "ss_method": ss_method, "ss_psk": ss_psk, "vmess_security": vmess_security, "uid": uid, "proxy_username": _proxy_user, "proxy_password": _proxy_pw}
     log_event("Inbound", f"Created inbound {label} ({uid})")
     domain = get_domain(request)
     created_link = _safe_protocol_link(uid, remark=f"SulgX-{label}", extra=extra, server_domain=domain)
@@ -6316,6 +7003,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "mtproto_variant": mtproto_variant,
         "mtproto_domain": mtproto_domain,
         "webproxy_token": _web_token,
+        "proxy_username": _proxy_user,
+        "proxy_password": _proxy_pw,
         "proxy": _link_proxy_view(link_data, domain),
         "warning": _proxy_listener_warning(protocol)
     }
@@ -6396,7 +7085,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "custom_sni": extra["custom_sni"],
             "custom_host": extra["custom_host"],
             "custom_fp": extra["custom_fp"],
-            "color": row.get("color", "#39ff14"),
+            "color": row.get("color", "#3b82f6"),
             "flag": row.get("flag", ""),
             "fragment": extra["fragment"],
             "ip_profile_id": row.get("ip_profile_id", ""),
@@ -6442,6 +7131,8 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "mtproto_variant": extra["mtproto_variant"],
             "mtproto_domain": extra["mtproto_domain"],
             "webproxy_token": extra["webproxy_token"],
+            "proxy_username": row.get("proxy_username", "") or "",
+            "proxy_password": row.get("proxy_password", "") or "",
             "proxy": _link_proxy_view(row, domain),
             "last_test_ok": bool(row.get("last_test_ok", 0)),
             "last_test_ms": row.get("last_test_ms", 0) or 0,
@@ -6459,7 +7150,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
 async def list_inbounds(request: Request, _=Depends(require_auth)):
     defs = get_inbound_definitions()
     _domain, _domain_source, _tls, public_port, _ws_scheme, _http_scheme = _test_public_address(request)
-    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_status": TG_PROXY_STATUS, "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {}, "listener_cards": await _listener_cards(public_port, request)}
+    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_status": TG_PROXY_STATUS, "webproxy_status": dict(TELEMT_HEALTH), "listener_cards": await _listener_cards(public_port, request)}
 
 
 @app.get("/api/outbounds")
@@ -6561,10 +7252,7 @@ async def create_user(request: Request, _=Depends(require_auth)):
     now = datetime.now(UTC).isoformat()
     chat_id = str(body.get("telegram_chat_id") or "").strip()
     notes = str(body.get("notes") or "").strip()
-    try:
-        max_sess = max(0, int(body.get("max_sessions") or 0))
-    except (TypeError, ValueError):
-        max_sess = 0
+    max_sess = _parse_int_value(body.get("max_sessions"), "max_sessions", 0, 0, 100000)
     await db_execute("INSERT INTO users (id, name, telegram_chat_id, notes, max_sessions, created_at) VALUES (?, ?, ?, ?, ?, ?)", "INSERT INTO users (id, name, telegram_chat_id, notes, max_sessions, created_at) VALUES ($1, $2, $3, $4, $5, $6)", (user_id, name, chat_id, notes, max_sess, now))
     USER_MAX_SESSIONS[user_id] = max_sess
     USER_NAMES[user_id] = name
@@ -6600,10 +7288,7 @@ async def update_user(user_id: str, request: Request, _=Depends(require_auth)):
     if "notes" in body:
         await db_execute("UPDATE users SET notes = ? WHERE id = ?", "UPDATE users SET notes = $1 WHERE id = $2", (str(body["notes"] or "").strip(), user_id))
     if "max_sessions" in body:
-        try:
-            max_sess = max(0, int(body.get("max_sessions") or 0))
-        except (TypeError, ValueError):
-            max_sess = 0
+        max_sess = _parse_int_value(body.get("max_sessions"), "max_sessions", 0, 0, 100000)
         await db_execute("UPDATE users SET max_sessions = ? WHERE id = ?", "UPDATE users SET max_sessions = $1 WHERE id = $2", (max_sess, user_id))
         USER_MAX_SESSIONS[user_id] = max_sess
     return {"ok": True}
@@ -6635,7 +7320,7 @@ async def user_links(user_id: str, request: Request, _=Depends(require_auth)):
         owned = [dict(l) for l in LINKS.values() if l.get("owner_user_id") == user_id]
     items = []
     for l in owned:
-        items.append({"uid": l["uid"], "label": l["label"], "protocol": l.get("protocol", "vless-ws"), "active": bool(l["active"]), "used_bytes": l.get("used_bytes", 0), "limit_bytes": l.get("limit_bytes", 0), "expires_at": l.get("expires_at"), "protocol_link": generate_protocol_link(l["uid"], remark=f"SulgX-{l['label']}", extra=l, server_domain=domain), "outbound_proxy": l.get("outbound_proxy", ""), "outbound_proxy_has_pass": bool(l.get("outbound_proxy_pass", "")), "socks": {"host": domain, "port": SOCKS_PORT, "username": l["uid"], "password": l["uid"], "enabled": bool(SOCKS_PORT)} if l.get("protocol") == "socks5" else None})
+        items.append({"uid": l["uid"], "label": l["label"], "protocol": l.get("protocol", "vless-ws"), "active": bool(l["active"]), "used_bytes": l.get("used_bytes", 0), "limit_bytes": l.get("limit_bytes", 0), "expires_at": l.get("expires_at"), "protocol_link": generate_protocol_link(l["uid"], remark=f"SulgX-{l['label']}", extra=l, server_domain=domain), "outbound_proxy": l.get("outbound_proxy", ""), "outbound_proxy_has_pass": bool(l.get("outbound_proxy_pass", "")), "socks": {"host": domain, "port": SOCKS_PORT, "username": _proxy_creds_for_link(l)[0], "password": _proxy_creds_for_link(l)[1], "enabled": bool(SOCKS_PORT)} if l.get("protocol") == "socks5" else None})
     return {"user": {"id": row["id"], "name": row["name"]}, "links": items, "used_bytes": sum(l.get("used_bytes", 0) for l in owned), "limit_bytes": sum(l.get("limit_bytes", 0) for l in owned)}
 
 
@@ -6645,19 +7330,21 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
     domain = get_domain(request)
     domain_source = get_domain_source(request)
     web_enabled = bool(TG_PROXY_STATUS.get("webproxy", {}).get("enabled"))
-    web_links = tgproxy.webproxy_links(domain) if tgproxy is not None and web_enabled else []
+    web_links = []
     web_link_443 = ""
     web_link_https_443 = ""
-    for _wl in web_links:
-        if int(_wl.get("port") or 0) == 443:
-            web_link_443 = _wl.get("link", "")
-            web_link_https_443 = _wl.get("link_https", "")
-    _web_rows_443 = [l for l in list(LINKS.values()) if (l.get("protocol") or "") == "webproxy" and l.get("active") and int(l.get("port") or 443) == int(WEBPROXY_PUBLIC_PORT)]
-    _web_rows_443.sort(key=lambda l: str(l.get("created_at") or ""))
-    if _web_rows_443 and str(_web_rows_443[0].get("webproxy_token") or "").strip():
-        _tok0 = str(_web_rows_443[0].get("webproxy_token") or "").strip().lower()
-        web_link_443 = tgproxy.webproxy_link(domain, 443, _tok0)
-        web_link_https_443 = tgproxy.webproxy_link_https(domain, 443, _tok0)
+    _oldest_web = _oldest_active_web()
+    if _oldest_web is not None and web_enabled:
+        _tok0 = str(_oldest_web.get("webproxy_token") or "").strip().lower()
+        if _tok0:
+            try:
+                web_link_443 = _web_link(domain, _tok0)
+                web_link_https_443 = _web_link_https(domain, _tok0)
+                web_links = [{"port": 443, "token": _tok0, "secret": _web_token_link_secret(_tok0), "link": web_link_443, "link_https": web_link_https_443}]
+            except ValueError:
+                web_links = []
+                web_link_443 = ""
+                web_link_https_443 = ""
     single_port_host = not SOCKS_PORT and not TG_PROXY_PORT and not HTTP_PROXY_PORT
     bot_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
     chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
@@ -6690,7 +7377,7 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
         "http": TG_PROXY_STATUS["http"],
         "http_port": HTTP_PROXY_PORT,
         "webproxy": TG_PROXY_STATUS["webproxy"],
-        "webproxy_status": tgproxy.webproxy_status() if tgproxy is not None else {},
+        "webproxy_status": dict(TELEMT_HEALTH),
         "webproxy_links": web_links,
         "webproxy_link": web_link_443,
         "webproxy_link_https": web_link_https_443,
@@ -6699,7 +7386,7 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
         "webproxy_allowed_ports": _webproxy_allowed_ports(),
         "mtproxy_per_link_secret": True,
         "mtproxy_note": "MTProto links are per inbound: each MTProto inbound carries its own derived secret, so no shared link is published here. Open the inbound row on the Links page to copy its own tg://proxy link.",
-        "http_link_note": "HTTP proxy auth is the link UUID for both username and password, per inbound",
+        "http_link_note": "SOCKS5 / HTTP proxy auth is the per-inbound username and password shown on the inbound row (a generated code when left empty at create time)",
         "next_steps": next_steps,
         "deployment_notes": [
             "Cloady / Render expose a single public HTTPS port, so only the WEB proxy works there. SOCKS5, MTProto and HTTP proxy need their own raw TCP ports and stay disabled.",
@@ -6711,98 +7398,12 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
 
 
 
-@app.post("/api/v1/session")
-async def webproxy_create_session(request: Request):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="not found")
-    auth = request.headers.get("authorization", "")
-    token = auth[7:] if auth.lower().startswith("bearer ") else ""
-    body = await request.body()
-    try:
-        result = tgproxy.webproxy_issue_session(token, body)
-    except Exception:
-        raise HTTPException(status_code=404, detail="not found")
-    return Response(content=result["welcome"], media_type="application/octet-stream", headers={"X-Carrier-Mode": result["carrier"], "X-Session-Token": result["session_token"]})
-
-
-@app.delete("/api/v1/session")
-async def webproxy_delete_session_route(request: Request):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="not found")
-    auth = request.headers.get("authorization", "")
-    token = auth[7:] if auth.lower().startswith("bearer ") else ""
-    try:
-        valid = tgproxy.webproxy_delete_session(token)
-    except Exception:
-        valid = False
-    if not valid:
-        raise HTTPException(status_code=404, detail="not found")
-    return Response(status_code=200)
-
-
-@app.websocket("/api/v1/ws")
-async def webproxy_websocket_route(websocket: WebSocket):
-    if tgproxy is None:
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
-        return
-    try:
-        await tgproxy.webproxy_websocket_handler(websocket)
-    except Exception:
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
-
-
-@app.get("/api/v1/webproxy/status")
-async def webproxy_status_route(_=Depends(require_auth)):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="web proxy not loaded")
-    status = tgproxy.webproxy_status()
-    status["enabled"] = bool(TG_PROXY_STATUS.get("webproxy", {}).get("enabled"))
-    status["ports"] = list(WEBPROXY_PORTS)
-    return status
-
-
-@app.get("/api/v1/webproxy/links")
-async def webproxy_links_route(request: Request, _=Depends(require_auth)):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="web proxy not loaded")
-    domain = get_domain(request)
-    return {"domain": domain, "links": tgproxy.webproxy_links(domain)}
-
-
-@app.post("/api/v1/webproxy/probe")
-async def webproxy_probe_route(_=Depends(require_auth)):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="web proxy not loaded")
-    results = await tgproxy.webproxy_dc_probe()
-    return {"results": results}
-
-
 @app.get("/tgweb")
-async def tgweb_bridge(request: Request):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="not found")
-    bridge = _webproxy_bridge_for_request(request)
+async def tgweb_retired(request: Request):
+    bridge = await _root_bridge_response(request)
     if bridge is not None:
-        return HTMLResponse(content=bridge)
-    return HTMLResponse(content=tgproxy.webproxy_decoy_html())
-
-
-@app.get("/{webproxy_token}/tgweb")
-async def tgweb_token_bridge(request: Request, webproxy_token: str):
-    if tgproxy is None:
-        raise HTTPException(status_code=404, detail="not found")
-    if not _webproxy_valid_token(webproxy_token):
-        raise HTTPException(status_code=404, detail="not found")
-    bridge = _webproxy_bridge_for_request(request)
-    if bridge is not None:
-        return HTMLResponse(content=bridge)
-    return HTMLResponse(content=tgproxy.webproxy_decoy_html())
+        return bridge
+    return Response(content="the /tgweb bridge path is retired: use the tg://webproxy link from a WEB proxy inbound", status_code=404, media_type="text/plain")
 
 
 def active_sessions_snapshot():
@@ -6870,7 +7471,8 @@ def active_sessions_snapshot():
                 up_bps = 0
                 down_bps = 0
             _ACTIVE_LAST[sid] = (now, up, down)
-            link = LINKS.get(s.get("username") or "")
+            link = _link_for_proxy_session(s.get("username") or "")
+            _row_uid = str(link.get("uid") or "") if link else str(s.get("username") or "")
             proto = s.get("protocol", "")
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
@@ -6879,7 +7481,7 @@ def active_sessions_snapshot():
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
-                "uid": s.get("username", ""),
+                "uid": _row_uid,
                 "label": link.get("label", "") if link else ("MTProto (shared secret)" if proto == "mtproto" else ""),
                 "user": USER_NAMES.get(owner, owner) if owner else "",
                 "owner_user_id": owner,
@@ -6900,15 +7502,20 @@ def active_sessions_snapshot():
                 "used_bytes": used,
                 "bytes_flushed": flushed,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
-                "link_sessions": _link_session_count(s.get("username", "")) + _proxy_session_count(s.get("username", "")),
+                "link_sessions": _link_session_count(_row_uid) + _proxy_session_count(_row_uid),
             })
-    if tgproxy is not None:
-        try:
-            web_sessions = tgproxy.webproxy_active_sessions()
-        except Exception:
+    for _wlink in [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]:
+        _wuid = str(_wlink.get("uid", ""))
+        _wstatus = _telemt_web_status_cached(_wuid)
+        _wsessions = _telemt_web_sessions_value(_wstatus)
+        if isinstance(_wsessions, list):
+            web_sessions = _wsessions
+        elif isinstance(_wsessions, int) and _wsessions > 0:
+            web_sessions = [{"id": "aggregate-" + str(i), "bytes_up": 0, "bytes_down": 0, "started_at": "", "client_ip": ""} for i in range(_wsessions)]
+        else:
             web_sessions = []
         for s in web_sessions:
-            sid = "proxy:" + s.get("id", "")
+            sid = "proxy:web:" + _wuid + ":" + str(s.get("id", ""))
             live.add(sid)
             up = int(s.get("bytes_up", 0) or 0)
             down = int(s.get("bytes_down", 0) or 0)
@@ -6921,7 +7528,7 @@ def active_sessions_snapshot():
                 up_bps = 0
                 down_bps = 0
             _ACTIVE_LAST[sid] = (now, up, down)
-            link = LINKS.get(s.get("username") or "")
+            link = _wlink
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
             flushed = int(s.get("bytes_flushed", 0) or 0)
@@ -6929,7 +7536,7 @@ def active_sessions_snapshot():
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
-                "uid": s.get("username", ""),
+                "uid": _wuid,
                 "label": link.get("label", "") if link else "WEB proxy (shared)",
                 "user": USER_NAMES.get(owner, owner) if owner else "",
                 "owner_user_id": owner,
@@ -6950,7 +7557,7 @@ def active_sessions_snapshot():
                 "used_bytes": used,
                 "bytes_flushed": flushed,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
-                "link_sessions": _link_session_count(s.get("username", "")) + _proxy_session_count(s.get("username", "")),
+                "link_sessions": _link_session_count(_wuid) + _proxy_session_count(_wuid),
             })
     for dead in list(_ACTIVE_LAST):
         if dead not in live:
@@ -6960,6 +7567,10 @@ def active_sessions_snapshot():
 
 @app.get("/api/active-users")
 async def list_active_users(_=Depends(require_auth)):
+    try:
+        await _telemt_refresh_web_status()
+    except Exception:
+        pass
     sessions = active_sessions_snapshot()
     return {"sessions": sessions, "total": len(sessions), "total_up_bps": sum(s["up_bps"] for s in sessions), "total_down_bps": sum(s["down_bps"] for s in sessions)}
 
@@ -6969,12 +7580,8 @@ async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
     if conn_id.startswith("proxy:"):
         if tgproxy is not None and tgproxy.disconnect_proxy_session(conn_id[6:]):
             return {"ok": True}
-        if tgproxy is not None:
-            try:
-                if tgproxy.webproxy_disconnect_session(conn_id[6:]):
-                    return {"ok": True}
-            except Exception:
-                pass
+        if conn_id.startswith("proxy:web:"):
+            raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
         raise HTTPException(status_code=404, detail="proxy session not found")
     ws = connection_sockets.get(conn_id)
     if ws is not None:
@@ -7038,7 +7645,7 @@ async def import_links(request: Request, _=Depends(require_auth)):
         custom_sni = item.get("custom_sni", "")
         custom_host = item.get("custom_host", "")
         custom_fp = item.get("custom_fp", "chrome")
-        color = item.get("color", "#39ff14")
+        color = item.get("color", "#3b82f6")
         flag = item.get("flag", "")
         fragment = item.get("fragment", "")
         ip_profile_id = item.get("ip_profile_id", "")
@@ -7130,6 +7737,20 @@ async def import_links(request: Request, _=Depends(require_auth)):
             if not _import_token:
                 _import_token = _webproxy_new_token()
             new_link["webproxy_token"] = _import_token
+        if protocol in ("socks5", "http-proxy"):
+            _import_user = str(item.get("proxy_username") or "").strip()
+            _import_pw = str(item.get("proxy_password") or "").strip()
+            if not _import_user or not _import_pw:
+                _import_user = uid_input
+                _import_pw = uid_input
+            else:
+                try:
+                    _validate_proxy_creds(_import_user, _import_pw)
+                except HTTPException:
+                    _import_user = uid_input
+                    _import_pw = uid_input
+            new_link["proxy_username"] = _import_user
+            new_link["proxy_password"] = _import_pw
         async with LINKS_LOCK:
             if uid_input in LINKS:
                 failed += 1
@@ -7158,12 +7779,8 @@ async def import_links(request: Request, _=Depends(require_auth)):
             continue
         async with LINKS_LOCK:
             LINKS[uid_input] = new_link
-        await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4 WHERE uid = $5", (item.get("mtproto_variant", "dd") or "dd", item.get("mtproto_domain", "www.google.com") or "www.google.com", item.get("vmess_security", "auto") or "auto", new_link.get("webproxy_token", "") or "", uid_input))
-        if protocol == "mtproto" and tgproxy is not None:
-            try:
-                tgproxy.mtproxy_register_link(uid_input)
-            except Exception:
-                pass
+        await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ?, proxy_username = ?, proxy_password = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4, proxy_username = $5, proxy_password = $6 WHERE uid = $7", (item.get("mtproto_variant", "dd") or "dd", item.get("mtproto_domain", "www.google.com") or "www.google.com", item.get("vmess_security", "auto") or "auto", new_link.get("webproxy_token", "") or "", new_link.get("proxy_username", "") or "", new_link.get("proxy_password", "") or "", uid_input))
+        await _telemt_sync_link(LINKS.get(uid_input))
         imported += 1
     return {"ok": True, "imported": imported, "failed": failed, "errors": errors}
 
@@ -7173,29 +7790,49 @@ async def batch_links(request: Request, _=Depends(require_auth)):
     body = await request.json()
     uids = body.get("uids", [])
     action = body.get("action", "")
+    touched = []
+    removed = []
     async with LINKS_LOCK:
         for uid in uids:
             link = LINKS.get(uid)
             if not link:
                 continue
             if action == "activate":
+                prev = dict(link)
                 await db_execute("UPDATE links SET active=1 WHERE uid=?", "UPDATE links SET active=TRUE WHERE uid=$1", (uid,))
                 link["active"] = 1
+                touched.append((uid, prev))
             elif action == "deactivate":
                 if is_default_inbound(uid):
                     continue
+                prev = dict(link)
                 await db_execute("UPDATE links SET active=0 WHERE uid=?", "UPDATE links SET active=FALSE WHERE uid=$1", (uid,))
                 link["active"] = 0
                 await close_connections_for_link(uid)
+                touched.append((uid, prev))
             elif action == "reset_usage":
                 await db_execute("UPDATE links SET used_bytes=0 WHERE uid=?", "UPDATE links SET used_bytes=0 WHERE uid=$1", (uid,))
                 link["used_bytes"] = 0
             elif action == "delete":
                 if is_default_inbound(uid):
                     continue
+                removed.append((uid, link.get("protocol") or ""))
                 await db_execute("DELETE FROM links WHERE uid=?", "DELETE FROM links WHERE uid=$1", (uid,))
                 LINKS.pop(uid, None)
                 await close_connections_for_link(uid)
+    for uid, prev in touched:
+        current = LINKS.get(uid)
+        if current is not None:
+            await _telemt_sync_link(current, previous=prev)
+    for uid, proto in removed:
+        if proto == "webproxy":
+            await _telemt_remove_web(uid)
+        elif proto == "mtproto":
+            await _telemt_remove_mtproto(uid)
+    if removed and any(p == "webproxy" for _u, p in removed):
+        await _telemt_sync_root_vhost()
+    if removed or touched:
+        _invalidate_card_usability()
     return {"ok": True}
 
 
@@ -7222,6 +7859,16 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
                 info["uuid"] = new_uid
             if uid in link_ip_map:
                 link_ip_map[new_uid] = link_ip_map.pop(uid)
+        if (link.get("protocol") or "") in ("socks5", "http-proxy"):
+            if str(link.get("proxy_username") or "") == uid and str(link.get("proxy_password") or "") == uid:
+                link["proxy_username"] = new_uid
+                link["proxy_password"] = new_uid
+                await db_execute("UPDATE links SET proxy_username = ?, proxy_password = ? WHERE uid = ?", "UPDATE links SET proxy_username = $1, proxy_password = $2 WHERE uid = $3", (new_uid, new_uid, new_uid))
+        if (link.get("protocol") or "") == "webproxy":
+            await _telemt_remove_web(uid)
+        elif (link.get("protocol") or "") == "mtproto":
+            await _telemt_remove_mtproto(uid)
+        await _telemt_sync_link(link, previous=None)
         log_event("Inbound", f"UUID regenerated for {link['label']}: {uid} -> {new_uid}")
         return {"new_uuid": new_uid}
 
@@ -7229,6 +7876,14 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
 @app.post("/api/links/{uid}/disconnect")
 async def disconnect_link(uid: str, _=Depends(require_auth)):
     await close_connections_for_link(uid)
+    if tgproxy is not None:
+        try:
+            for s in tgproxy.active_proxy_sessions():
+                _slink = _link_for_proxy_session(s.get("username") or "")
+                if _slink is not None and str(_slink.get("uid") or "") == uid:
+                    tgproxy.disconnect_proxy_session(s.get("id", ""))
+        except Exception:
+            pass
     log_event("Inbound", f"Disconnected all connections for {uid}")
     return {"ok": True}
 
@@ -7282,6 +7937,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         "mtproto_variant": ("mtproto_variant", str),
         "mtproto_domain": ("mtproto_domain", str),
         "webproxy_token": ("webproxy_token", str),
+        "proxy_username": ("proxy_username", str),
+        "proxy_password": ("proxy_password", str),
         "outbound_mode": ("outbound_mode", str),
         "gaming_profile": ("gaming_profile", str),
         "ss_method": ("ss_method", str),
@@ -7331,15 +7988,16 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             if _patch_token_conflict is not None:
                 raise HTTPException(status_code=400, detail="WEB proxy token " + _patch_token + " is already used by inbound '" + str(_patch_token_conflict.get("label", "")) + "' (" + str(_patch_token_conflict.get("uid", "")) + "). Each WEB proxy inbound needs its own token.")
         body["webproxy_token"] = _patch_token
-    if "protocol" in body and body["protocol"] == "webproxy" and "port" in body and int(body["port"] or 0) not in WEBPROXY_PORTS:
+    _patch_port_parsed = _parse_int_value(body.get("port"), "port", 0, 0, 65535) if "port" in body else None
+    if "protocol" in body and body["protocol"] == "webproxy" and "port" in body and _patch_port_parsed not in WEBPROXY_PORTS:
         raise HTTPException(status_code=400, detail="WEB proxy port must be one of 443, 2053, 2083, 2087, 2096, 8443")
     _patch_proto = body.get("protocol") or link.get("protocol", "")
-    _patch_port = body.get("port") if "port" in body else link.get("port")
-    _patch_conflict = _webproxy_conflict(int(_patch_port), exclude_uid=link.get("uid", "")) if _patch_proto == "webproxy" and _patch_port is not None else None
-    if _patch_proto == "webproxy" and _patch_port is not None and int(_patch_port) not in _webproxy_allowed_ports():
-        raise HTTPException(status_code=400, detail="WEB proxy port " + str(int(_patch_port)) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Change this inbound to port 443.")
+    _patch_port = _patch_port_parsed if "port" in body else link.get("port")
+    _patch_conflict = _webproxy_conflict(_patch_port, exclude_uid=link.get("uid", "")) if _patch_proto == "webproxy" and _patch_port is not None else None
+    if _patch_proto == "webproxy" and _patch_port is not None and _patch_port not in _webproxy_allowed_ports():
+        raise HTTPException(status_code=400, detail="WEB proxy port " + str(_patch_port) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Change this inbound to port 443.")
     if _patch_conflict is not None:
-        raise HTTPException(status_code=400, detail="WEB proxy port " + str(int(_patch_port)) + " is already used by inbound '" + str(_patch_conflict.get("label", "")) + "' (" + str(_patch_conflict.get("uid", "")) + "). Each WEB proxy link needs its own port because the port selects its secret (443, 2053, 2083, 2087, 2096, 8443).")
+        raise HTTPException(status_code=400, detail="WEB proxy port " + str(_patch_port) + " is already used by inbound '" + str(_patch_conflict.get("label", "")) + "' (" + str(_patch_conflict.get("uid", "")) + "). Each WEB proxy link needs its own port because the port selects its secret (443, 2053, 2083, 2087, 2096, 8443).")
     if "protocol" in body and body["protocol"] in ("socks5", "mtproto", "http-proxy"):
         body["port"] = _proxy_effective_port(body["protocol"])
     _owner_sessions_updated = False
@@ -7378,7 +8036,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             continue
         value = body[key]
         if key == "limit_value":
-            limit_val = float(value or 0)
+            limit_val = _parse_float_value(value, "limit_value", 0, 0, 100000)
             unit = body.get("limit_unit") or "GB"
             updates["limit_bytes"] = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, unit)
         elif key == "reset_usage" and value:
@@ -7418,6 +8076,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
 
     logger.info(f"Applying updates to {uid}: {updates}")
 
+    previous = dict(link)
     async with LINKS_LOCK:
         link.update(updates)
 
@@ -7447,11 +8106,9 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             async with LINKS_LOCK:
                 LINKS[uid] = norm_refreshed
 
-    if LINKS.get(uid, {}).get("protocol") == "mtproto" and tgproxy is not None:
-        try:
-            tgproxy.mtproxy_register_link(uid)
-        except Exception:
-            pass
+    _refreshed_link = LINKS.get(uid)
+    if _refreshed_link is not None:
+        await _telemt_sync_link(_refreshed_link, previous=previous)
     log_event("Inbound", f"Updated inbound {uid}")
     return {"ok": True, "warning": _proxy_listener_warning(LINKS.get(uid, {}).get("protocol", ""))}
 
@@ -7465,12 +8122,13 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (uid,))
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
-    if tgproxy is not None:
-        try:
-            tgproxy.mtproxy_unregister_link(uid)
-        except Exception:
-            pass
+    if (link or {}).get("protocol") == "webproxy":
+        await _telemt_remove_web(uid)
+        await _telemt_sync_root_vhost()
+    elif (link or {}).get("protocol") == "mtproto":
+        await _telemt_remove_mtproto(uid)
     await close_connections_for_link(uid)
+    _invalidate_card_usability()
     log_event("Inbound", f"Deleted inbound {uid}")
     return {"ok": True}
 
@@ -7497,21 +8155,21 @@ async def clone_link(uid: str, _=Depends(require_auth)):
                 new_link["port"] = _free_port
         new_link["used_bytes"] = 0
         new_link["created_at"] = datetime.now(UTC).isoformat()
+        if new_link.get("protocol") in ("socks5", "http-proxy"):
+            _clone_code = _gen_proxy_code()
+            new_link["proxy_username"] = _clone_code
+            new_link["proxy_password"] = _clone_code
         try:
             await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48)",
-            (new_uid, new_link["label"], new_link["limit_bytes"], 0, new_link["max_connections"], new_link["created_at"], 1 if new_link.get("active") else 0, new_link.get("expires_at"), new_link.get("custom_path", ""), new_link.get("custom_sni", ""), new_link.get("custom_host", ""), new_link.get("custom_fp", "chrome"), new_link.get("color", "#39ff14"), new_link.get("flag", ""), new_link.get("fragment", ""), new_link.get("ip_profile_id", ""), new_link.get("naming_mode", "default"), new_link.get("tfo", 0), new_link.get("ech_enabled", 0), new_link.get("ech_sni", ""), new_link.get("ech_doh", ""), new_link.get("fragment_mode", "off"), new_link.get("fragment_length", "100-200"), new_link.get("fragment_interval", "10-20"), new_link.get("allow_insecure", 0), new_link.get("random_path", 0), new_link.get("enable_ipv6", 1), new_link.get("smux_enabled", 0), new_link.get("ip_limit", 0), new_link.get("protocol", "vless-ws"), new_link.get("fingerprint", "chrome"), new_link.get("alpn", ""), new_link.get("port", 443), new_link.get("proxy_line_id"), new_link.get("bypass_iran", 1), new_link.get("bypass_china", 0), new_link.get("bypass_russia", 0), new_link.get("xray_dns_mode", "doh"), new_link.get("xray_doh_url", ""), new_link.get("xray_allowed_domains", ""), new_link.get("udp_enabled", 1), new_link.get("outbound_mode", "auto"), new_link.get("gaming_profile", "balanced"), new_link.get("ss_method", "2022-blake3-aes-256-gcm"), new_link.get("ss_psk", ""), new_link.get("owner_user_id", ""), new_link.get("outbound_proxy", ""), new_link.get("outbound_proxy_pass", "")),
+            (new_uid, new_link["label"], new_link["limit_bytes"], 0, new_link["max_connections"], new_link["created_at"], 1 if new_link.get("active") else 0, new_link.get("expires_at"), new_link.get("custom_path", ""), new_link.get("custom_sni", ""), new_link.get("custom_host", ""), new_link.get("custom_fp", "chrome"), new_link.get("color", "#3b82f6"), new_link.get("flag", ""), new_link.get("fragment", ""), new_link.get("ip_profile_id", ""), new_link.get("naming_mode", "default"), new_link.get("tfo", 0), new_link.get("ech_enabled", 0), new_link.get("ech_sni", ""), new_link.get("ech_doh", ""), new_link.get("fragment_mode", "off"), new_link.get("fragment_length", "100-200"), new_link.get("fragment_interval", "10-20"), new_link.get("allow_insecure", 0), new_link.get("random_path", 0), new_link.get("enable_ipv6", 1), new_link.get("smux_enabled", 0), new_link.get("ip_limit", 0), new_link.get("protocol", "vless-ws"), new_link.get("fingerprint", "chrome"), new_link.get("alpn", ""), new_link.get("port", 443), new_link.get("proxy_line_id"), new_link.get("bypass_iran", 1), new_link.get("bypass_china", 0), new_link.get("bypass_russia", 0), new_link.get("xray_dns_mode", "doh"), new_link.get("xray_doh_url", ""), new_link.get("xray_allowed_domains", ""), new_link.get("udp_enabled", 1), new_link.get("outbound_mode", "auto"), new_link.get("gaming_profile", "balanced"), new_link.get("ss_method", "2022-blake3-aes-256-gcm"), new_link.get("ss_psk", ""), new_link.get("owner_user_id", ""), new_link.get("outbound_proxy", ""), new_link.get("outbound_proxy_pass", "")),
         )
         except Exception as e:
             raise HTTPException(status_code=500, detail="Database insert failed: " + str(e))
         LINKS[new_uid] = new_link
-        await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4 WHERE uid = $5", (new_link.get("mtproto_variant", "dd") or "dd", new_link.get("mtproto_domain", "www.google.com") or "www.google.com", new_link.get("vmess_security", "auto") or "auto", new_link.get("webproxy_token", "") or "", new_uid))
-        if new_link.get("protocol") == "mtproto" and tgproxy is not None:
-            try:
-                tgproxy.mtproxy_register_link(new_uid)
-            except Exception:
-                pass
+        await db_execute("UPDATE links SET mtproto_variant = ?, mtproto_domain = ?, vmess_security = ?, webproxy_token = ?, proxy_username = ?, proxy_password = ? WHERE uid = ?", "UPDATE links SET mtproto_variant = $1, mtproto_domain = $2, vmess_security = $3, webproxy_token = $4, proxy_username = $5, proxy_password = $6 WHERE uid = $7", (new_link.get("mtproto_variant", "dd") or "dd", new_link.get("mtproto_domain", "www.google.com") or "www.google.com", new_link.get("vmess_security", "auto") or "auto", new_link.get("webproxy_token", "") or "", new_link.get("proxy_username", "") or "", new_link.get("proxy_password", "") or "", new_uid))
+        await _telemt_sync_link(LINKS.get(new_uid))
         log_event("Inbound", f"Cloned inbound {uid} -> {new_uid}")
         return {"new_uuid": new_uid, "label": new_link["label"]}
 
@@ -7658,7 +8316,20 @@ async def get_ip_profiles(_=Depends(require_auth)):
     async with IP_PROFILES_LOCK:
         profiles = []
         for pid, pdata in IP_PROFILES.items():
-            profiles.append({"id": pid, "name": pdata["name"], "address_count": len(pdata["addresses"])})
+            addrs = list(pdata.get("addresses") or [])
+            first_ip = ""
+            last_ip = ""
+            parsed = []
+            for addr in addrs:
+                try:
+                    parsed.append(ipaddress.ip_address(str(addr).strip()))
+                except ValueError:
+                    continue
+            v4 = [ip for ip in parsed if ip.version == 4]
+            if v4:
+                first_ip = str(min(v4))
+                last_ip = str(max(v4))
+            profiles.append({"id": pid, "name": pdata["name"], "address_count": len(pdata["addresses"]), "first_ip": first_ip, "last_ip": last_ip})
     return profiles
 
 async def get_ip_location(ip: str) -> dict:
@@ -8189,13 +8860,12 @@ async def user_dashboard(uid: str, request: Request):
     expires = parse_expires_at(link.get("expires_at"))
     if expires and expires < datetime.now(UTC):
         raise HTTPException(status_code=403, detail="User expired")
-    status = "Active ✅"
-    if link.get("limit_bytes") > 0 and link["used_bytes"] >= link["limit_bytes"]:
-        status = "Quota Exceeded 🚫"
+    quota_exceeded = link.get("limit_bytes") > 0 and link["used_bytes"] >= link["limit_bytes"]
+    status_html = '<span class="status"><span class="status-dot warn"></span><span>Quota Exceeded</span></span>' if quota_exceeded else '<span class="status"><span class="status-dot ok"></span><span>Active</span></span>' 
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     usage_percent = 0 if limit == 0 else min(100, round(used / limit * 100, 1))
-    usage_bar_color = "#4ade80" if usage_percent < 80 else ("#fbbf24" if usage_percent < 95 else "#f87171")
+    usage_bar_class = "err" if usage_percent >= 95 else ("warn" if usage_percent >= 80 else "")
     remaining = (limit - used) if limit > 0 else None
     remaining_str = "∞" if remaining is None else _fmt_bytes(max(0, remaining))
     is_proxy_link = (link.get("protocol") or "") in PROXY_PROTOCOLS
@@ -8211,14 +8881,14 @@ async def user_dashboard(uid: str, request: Request):
     clash_url = f"https://{domain}/sub/{uid}/clash"
     singbox_url = f"https://{domain}/sub/{uid}/singbox"
 
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={quote(protocol_link if is_proxy and protocol_link else sub_url)}"
-    if status == "Quota Exceeded 🚫":
+    qr_text = protocol_link if is_proxy and protocol_link else sub_url
+    if quota_exceeded:
         vless_link = ""
         protocol_link = ""
         sub_url = ""
         clash_url = ""
         singbox_url = ""
-        qr_url = ""
+        qr_text = ""
     expiry_str = "Unlimited ∞" if not expires else expires.strftime("%Y-%m-%d %H:%M (UTC)")
     daily_usage = await db_fetchall(
         "SELECT day, bytes FROM daily_traffic WHERE uid = ? ORDER BY day DESC LIMIT 7",
@@ -8227,146 +8897,184 @@ async def user_dashboard(uid: str, request: Request):
     )
     daily_data = [{"day": d["day"], "mb": round(d["bytes"]/1048576, 1)} for d in daily_usage]
     label_esc = html.escape(link['label'])
-    status_esc = html.escape(status)
     expiry_str_esc = html.escape(expiry_str)
     vless_link_esc = html.escape(vless_link)
     sub_url_esc = html.escape(sub_url)
     clash_url_esc = html.escape(clash_url)
     singbox_url_esc = html.escape(singbox_url)
-    qr_url_esc = html.escape(qr_url)
+    qr_text_js = json.dumps(qr_text)
     if is_proxy:
         if protocol_link:
-            actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('proxy_copied'))">📋 <span data-en="Copy Proxy Link" data-fa="کپی لینک پروکسی">Copy Proxy Link</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))">🔗 <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
-    <button class="btn btn-outline" onclick="toggleLinkText()">👁 <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
+            actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('proxy_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span> <span data-en="Copy Proxy Link" data-fa="کپی لینک پروکسی">Copy Proxy Link</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="21" x2="9" y2="21"/></svg></span> <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
+    <button class="btn btn-outline" onclick="toggleLinkText()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span> <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
         else:
             actions_html = """<div style="color:#f87171;">Proxy listener is disabled on this host, so no working link exists for this inbound.</div>"""
     else:
-        actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))">🔗 <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{clash_url_esc}', t('clash_copied'))">🐱 <span data-en="Copy Clash" data-fa="کپی کلش">Copy Clash</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{singbox_url_esc}', t('singbox_copied'))">🧩 <span data-en="Copy Sing‑Box" data-fa="کپی سینگ‌باکس">Copy Sing‑Box</span></button>
-    <button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('vless_copied'))">📋 <span data-en="{copy_label_en}" data-fa="{copy_label_fa}">{copy_label_en}</span></button>
-    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'single')">⚙️ <span data-en="Xray Config" data-fa="کانفیگ Xray (تکی)">Xray Config</span></button>
-    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'balancer')">⚖️ <span data-en="Xray Balancer" data-fa="Xray بالانسر">Xray Balancer</span></button>
-    <button class="btn btn-outline" onclick="toggleLinkText()">👁 <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
+        actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="21" x2="9" y2="21"/></svg></span> <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{clash_url_esc}', t('clash_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l3 3-3 3-3-3z"/><path d="M6 11l3 3-3 3-3-3z"/><path d="M18 11l3 3-3 3-3-3z"/></svg></span> <span data-en="Copy Clash" data-fa="کپی کلش">Copy Clash</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{singbox_url_esc}', t('singbox_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg></span> <span data-en="Copy Sing‑Box" data-fa="کپی سینگ‌باکس">Copy Sing‑Box</span></button>
+    <button class="btn btn-outline" onclick="copyToClip('{vless_link_esc}', t('vless_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span> <span data-en="{copy_label_en}" data-fa="{copy_label_fa}">{copy_label_en}</span></button>
+    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'single')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></span> <span data-en="Xray Config" data-fa="کانفیگ Xray (تکی)">Xray Config</span></button>
+    <button class="btn btn-outline" onclick="copyXrayConfig('{uid}', 'balancer')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></span> <span data-en="Xray Balancer" data-fa="Xray بالانسر">Xray Balancer</span></button>
+    <button class="btn btn-outline" onclick="toggleLinkText()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span> <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Dashboard | {label_esc}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="/static/chart.umd.js"></script>
 <style>
-*{{margin:0;padding:0;box-sizing:border-box}}
 :root{{
-  --primary:#39ff14; --primary-dim:rgba(57,255,20,0.20); --primary-glass:rgba(57,255,20,0.10);
-  --bg:#09090b; --bg2:#111113; --bg3:#18181b;
-  --surface:rgba(18,18,20,0.8); --surface2:rgba(24,24,27,0.92); --surface3:rgba(30,30,35,0.88);
-  --border:rgba(57,255,20,0.14); --border2:rgba(57,255,20,0.30);
-  --text:#f0f0f4; --text2:#a1a1aa; --text3:#71717a;
-  --green:#4ade80; --red:#f87171; --yellow:#fbbf24;
-  --radius-sm:12px; --radius-md:18px; --radius-lg:26px;
-  --shadow:0 12px 40px rgba(0,0,0,0.6);
-  --shadow-soft:0 6px 24px rgba(0,0,0,0.35);
-  --shadow-glow:0 0 35px var(--primary-dim);
-  --transition:0.3s cubic-bezier(0.20,0.80,0.40,1);
-  --halo-color-1:rgba(57,255,20,0.22); --halo-color-2:rgba(57,255,20,0.10); --halo-color-3:rgba(57,255,20,0.05);
+  --bg:#0b0c0f;
+  --surface:#131519;
+  --surface-2:#1a1d23;
+  --surface-3:#22262e;
+  --border:#262b33;
+  --border-strong:#3a414c;
+  --text:#f2f3f5;
+  --text-2:#a7adb8;
+  --text-3:#6e7681;
+  --accent:#3b82f6;
+  --accent-hover:#2563eb;
+  --accent-soft:rgba(59,130,246,0.12);
+  --accent-border:rgba(59,130,246,0.35);
+  --on-accent:#ffffff;
+  --success:#4ade80;
+  --success-soft:rgba(74,222,128,0.12);
+  --success-border:rgba(74,222,128,0.35);
+  --success-ink:#166534;
+  --warning:#fbbf24;
+  --warning-soft:rgba(251,191,36,0.12);
+  --warning-border:rgba(251,191,36,0.35);
+  --warning-ink:#92400e;
+  --danger:#f87171;
+  --danger-soft:rgba(248,113,113,0.12);
+  --danger-border:rgba(248,113,113,0.35);
+  --danger-ink:#991b1b;
+  --info:var(--accent);
+  --info-soft:var(--accent-soft);
+  --info-border:var(--accent-border);
+  --focus:rgba(59,130,246,0.55);
+  --radius-xs:4px;
+  --radius-sm:6px;
+  --radius-md:8px;
+  --radius-lg:12px;
+  --radius-xl:16px;
+  --radius-full:9999px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
+  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
+  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
+  --transition:120ms ease-out;
 }}
-body.light-mode {{
-  --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.20); --primary-glass:rgba(46,125,50,0.10);
-  --bg:#f5f9f5; --bg2:#ffffff; --bg3:#eaf1ea;
-  --surface:rgba(255,255,255,0.8); --surface2:rgba(255,255,255,0.94); --surface3:rgba(245,250,245,0.90);
-  --border:rgba(0,0,0,0.12); --border2:rgba(0,0,0,0.22);
-  --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
-  --shadow:0 12px 36px rgba(0,0,0,0.10); --shadow-soft:0 6px 20px rgba(0,0,0,0.06); --shadow-glow:0 0 30px rgba(46,125,50,0.25);
-  --halo-color-1:rgba(46,125,50,0.20); --halo-color-2:rgba(46,125,50,0.10); --halo-color-3:rgba(46,125,50,0.05);
+body.light-mode{{
+  --bg:#fafafa;
+  --surface:#ffffff;
+  --surface-2:#f4f4f5;
+  --surface-3:#e4e4e7;
+  --border:#e4e4e7;
+  --border-strong:#d4d4d8;
+  --text:#171717;
+  --text-2:#52525b;
+  --text-3:#71717a;
+  --accent:#1d4ed8;
+  --accent-hover:#1e40af;
+  --accent-soft:rgba(29,78,216,0.08);
+  --accent-border:rgba(29,78,216,0.30);
+  --on-accent:#ffffff;
+  --success:#15803d;
+  --success-soft:#dcfce7;
+  --success-border:#86efac;
+  --warning:#b45309;
+  --warning-soft:#fef3c7;
+  --warning-border:#fcd34d;
+  --danger:#dc2626;
+  --danger-soft:#fee2e2;
+  --danger-border:#fca5a5;
+  --focus:rgba(29,78,216,0.45);
+  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
+  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
+  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
 }}
-body.blue-mode {{
-  --primary:#3b82f6; --primary-dim:rgba(59,130,246,0.20); --primary-glass:rgba(59,130,246,0.10);
-  --bg:#0f172a; --bg2:#1e293b; --bg3:#1e293b;
-  --surface:rgba(30,41,59,0.82); --surface2:rgba(30,41,59,0.94); --surface3:rgba(51,65,85,0.90);
-  --border:rgba(59,130,246,0.14); --border2:rgba(59,130,246,0.34);
-  --text:#e2e8f0; --text2:#94a3b8; --text3:#64748b;
-  --shadow:0 12px 40px rgba(0,0,0,0.5); --shadow-soft:0 6px 24px rgba(0,0,0,0.3); --shadow-glow:0 0 35px rgba(59,130,246,0.35);
-  --halo-color-1:rgba(59,130,246,0.22); --halo-color-2:rgba(59,130,246,0.10); --halo-color-3:rgba(59,130,246,0.05);
+body.blue-dark{{
+  --bg:#0f172a;
+  --surface:#1e293b;
+  --surface-2:#273449;
+  --surface-3:#334155;
+  --border:#2b3a4f;
+  --border-strong:#475569;
+  --text:#e2e8f0;
+  --text-2:#94a3b8;
+  --text-3:#64748b;
 }}
+.ic{{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}}
+.ic svg{{width:100%;height:100%;display:block}}
+.cc{{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}}
+.status{{display:inline-flex;align-items:center;gap:6px;font-size:13px}}
+.status-dot{{width:8px;height:8px;border-radius:9999px;flex:none}}
+.status-dot.ok{{background:var(--success)}}
+.status-dot.warn{{background:var(--warning)}}
+.status-dot.err{{background:var(--danger)}}
+.status-dot.off{{background:var(--text-3)}}
+.hidden{{display:none}}
+.ltr{{direction:ltr;unicode-bidi:isolate}}
+[dir="rtl"] .ic-flip{{transform:scaleX(-1)}}
+@media (prefers-reduced-motion: reduce){{*{{transition:none!important;animation:none!important}}}}
+*{{margin:0;padding:0;box-sizing:border-box}}
 body{{
-  font-family:'Inter','Vazirmatn',sans-serif; background:var(--bg); color:var(--text);
-  display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;
-  position:relative; overflow-x:hidden;
-  transition:background 0.5s,color 0.5s;
+  font-family:var(--font-sans); background:var(--bg); color:var(--text);
+  display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px;
+  position:relative;
+  transition:background-color 120ms ease-out,color 120ms ease-out;
 }}
-body[dir="rtl"]{{direction:rtl;text-align:right}}
-body::before{{
-  content:''; position:fixed; top:-40%; left:-30%; width:80%; height:90%;
-  background:radial-gradient(ellipse at 30% 50%,var(--halo-color-1) 0%,transparent 60%);
-  animation:haloFloat1 28s infinite alternate ease-in-out; z-index:0; pointer-events:none; filter:blur(60px);
-}}
-body::after{{
-  content:''; position:fixed; bottom:-40%; right:-30%; width:80%; height:90%;
-  background:radial-gradient(ellipse at 65% 55%,var(--halo-color-2) 0%,transparent 60%);
-  animation:haloFloat2 32s infinite alternate ease-in-out; z-index:0; pointer-events:none; filter:blur(70px);
-}}
-@keyframes haloFloat1{{0%{{transform:translate(0,0) scale(1)}} 100%{{transform:translate(8%,10%) scale(1.1)}}}}
-@keyframes haloFloat2{{0%{{transform:translate(0,0) scale(1)}} 100%{{transform:translate(-8%,-10%) scale(1.1)}}}}
+body[dir="rtl"]{{direction:rtl;text-align:start}}
+:focus-visible{{outline:2px solid var(--focus);outline-offset:2px}}
 .card{{
-  background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius-lg);
-  padding:32px 28px; max-width:800px; width:100%; box-shadow:var(--shadow),var(--shadow-glow);
-  backdrop-filter:blur(20px) saturate(110%); position:relative; z-index:1; text-align:center;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl);
+  padding:24px; max-width: 720px; width:100%; box-shadow:var(--shadow-sm);
+  position:relative; z-index:1; text-align:center;
 }}
-.card::before{{
-  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
-  background:conic-gradient(from var(--angle,0deg),transparent,var(--primary),transparent);
-  pointer-events:none;
-  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-  mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-  -webkit-mask-composite:xor;mask-composite:exclude;
-  animation:borderRotate 5s linear infinite paused;opacity:0;transition:opacity 0.4s;
-}}
-.card:hover::before{{opacity:1;animation-play-state:running}}
-@property --angle{{syntax:'<angle>';initial-value:0deg;inherits:false}}
-@keyframes borderRotate{{from{{--angle:0deg}}to{{--angle:360deg}}}}
 .header-row{{
-  display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;
+  display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:12px; flex-wrap:wrap;
 }}
-h1{{color:var(--primary); font-size:1.8rem; font-weight:800; letter-spacing:-0.5px;}}
-.lang-switch{{display:flex; gap:2px; background:var(--surface3); border-radius:var(--radius-sm); padding:3px;}}
-.lang-btn{{padding:6px 14px; border:none; background:transparent; color:var(--text3); font-size:0.8rem; font-weight:700; border-radius:8px; cursor:pointer; font-family:inherit; transition:all var(--transition);}}
-.lang-btn.active{{background:var(--primary); color:#000; box-shadow:0 0 16px var(--primary-dim);}}
+h1{{color:var(--text); font-size:20px; font-weight:600; letter-spacing:-0.02em;}}
+.lang-switch{{display:flex; gap:2px; background:var(--surface-2); border-radius:var(--radius-sm); padding:3px;}}
+.lang-btn{{padding:6px 14px; border:none; background:transparent; color:var(--text-3); font-size:13px; font-weight:600; border-radius:var(--radius-sm); cursor:pointer; font-family:inherit; transition:background-color 120ms ease-out,color 120ms ease-out;}}
+.lang-btn.active{{background:var(--accent); color:var(--on-accent);}}
 .info-box{{
-  background:var(--surface3); border-radius:var(--radius-md); padding:20px; margin-bottom:20px;
-  display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; text-align:left;
-  border:1px solid var(--border); backdrop-filter:blur(8px);
+  background:var(--surface-2); border-radius:var(--radius-md); padding:16px; margin-bottom:20px;
+  display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; text-align:start;
+  border:1px solid var(--border);
 }}
 .info-box .row{{display:flex; flex-direction:column; padding:8px 0; border-bottom:1px solid var(--border);}}
 .info-box .row:last-child{{border-bottom:none;}}
-.label{{color:var(--text3); font-weight:600; font-size:0.85rem;}}
-.value{{color:var(--text); font-weight:600; font-size:1rem;}}
-.progress-bar-bg{{height:8px; background:var(--border); border-radius:4px; margin-top:12px; overflow:hidden; grid-column:span 2;}}
-.progress-bar-fill{{height:100%; width:{usage_percent}%; background:{usage_bar_color}; border-radius:4px; transition:width 0.3s;}}
-.progress-text{{font-size:0.8rem; color:var(--text2); margin-top:4px; text-align:right; grid-column:span 2;}}
+.info-box .row-wide{{grid-column:span 2;}}
+.label{{color:var(--text-3); font-weight:500; font-size:12px;}}
+.value{{color:var(--text); font-weight:600; font-size:14px;}}
+.progress-bar-bg{{height:6px; background:var(--surface-3); border-radius:var(--radius-full); margin-top:12px; overflow:hidden; grid-column:span 2;}}
+.progress-bar-fill{{height:100%; width:{usage_percent}%; background:var(--success); border-radius:var(--radius-full); transition:width 120ms ease-out;}}
+.progress-bar-fill.warn{{background:var(--warning);}}
+.progress-bar-fill.err{{background:var(--danger);}}
+.progress-text{{font-size:12px; color:var(--text-2); margin-top:4px; text-align:end; grid-column:span 2;}}
 .qr{{background:#fff; padding:12px; border-radius:16px; display:inline-block; margin-bottom:20px;}}
-.qr img{{display:block; border-radius:8px;}}
-.actions-grid{{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;}}
+.qr canvas{{display:block; border-radius:8px;}}
+.actions-grid{{display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); gap:10px; margin-bottom:10px;}}
 .btn{{
-  display:flex; align-items:center; justify-content:center; padding:12px;
-  background:linear-gradient(135deg,var(--primary),color-mix(in srgb,var(--primary) 80%,black));
-  color:#000; font-weight:800; border-radius:var(--radius-sm); text-decoration:none;
-  transition:all var(--transition); border:1px solid transparent; cursor:pointer; font-family:inherit; font-size:0.95rem;
-  box-shadow:0 6px 28px var(--primary-dim); position:relative; overflow:hidden;
+  display:flex; align-items:center; justify-content:center; gap:8px; padding:8px 14px;
+  background:var(--accent);
+  color:var(--on-accent); font-weight:500; border-radius:var(--radius-sm); text-decoration:none;
+  transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out; border:1px solid transparent; cursor:pointer; font-family:inherit; font-size:14px;
 }}
-.btn::after{{
-  content:'';position:absolute;top:0;left:0;width:100%;height:100%;
-  background:linear-gradient(45deg,transparent,rgba(255,255,255,0.2),transparent);
-  transform:translateX(-100%);transition:transform 0.8s;
-}}
-.btn:hover::after{{transform:translateX(100%)}}
-.btn:hover{{filter:brightness(1.2); box-shadow:0 10px 40px var(--primary-dim); transform:translateY(-2px);}}
-.btn-outline{{background:var(--surface3); color:var(--text); border:1px solid var(--border);}}
-.btn-outline:hover{{background:var(--primary-glass); border-color:var(--primary); color:var(--primary); box-shadow:0 0 28px var(--primary-dim);}}
-#toast{{position:fixed; bottom:40px; left:50%; transform:translateX(-50%); background:var(--surface); color:var(--text); border:1px solid var(--border2); border-radius:var(--radius-md); padding:14px 30px; font-weight:600; opacity:0; transition:all 0.45s ease; z-index:999; backdrop-filter:blur(30px); box-shadow:var(--shadow-soft); pointer-events:none;}}
+.btn:hover{{background:var(--accent-hover);}}
+.btn-outline{{background:var(--surface); color:var(--text); border:1px solid var(--border-strong);}}
+.btn-outline:hover{{background:var(--surface-2); border-color:var(--border-strong);}}
+#toast{{position:fixed; bottom:40px; left:50%; transform:translateX(-50%); background:var(--surface-3); color:var(--text); border:1px solid var(--border-strong); border-radius:8px; padding:12px 16px; font-weight:500; font-size:14px; opacity:0; transition:opacity 150ms ease-out,transform 150ms ease-out; z-index:999; box-shadow:var(--shadow-md); pointer-events:none; display:flex; align-items:center; gap:8px;}}
 #toast.show{{opacity:1; transform:translateX(-50%) translateY(0); pointer-events:auto;}}
+#toast .ic.ok{{color:var(--success);}}
+#toast .ic.err{{color:var(--danger);}}
 .daily-chart{{
   margin-top:16px;
   grid-column:span 2;
@@ -8376,11 +9084,11 @@ h1{{color:var(--primary); font-size:1.8rem; font-weight:800; letter-spacing:-0.5
   height: 200px !important;
   width: 100% !important;
 }}
-@media(max-width:600px){{
-  .card{{padding:24px 16px;}}
-  .actions-grid{{grid-template-columns:1fr;}}
+@media (max-width: 480px){{
+  .card{{padding:20px 16px;}}
+  .info-box{{grid-template-columns:1fr;}}
+  .info-box .row-wide, .progress-bar-bg, .progress-text, .daily-chart{{grid-column:span 1;}}
   .header-row{{flex-direction:column; gap:8px;}}
-  h1{{font-size:1.5rem;}}
 }}
 </style>
 </head>
@@ -8394,23 +9102,23 @@ h1{{color:var(--primary); font-size:1.8rem; font-weight:800; letter-spacing:-0.5
     </div>
   </div>
   <div class="info-box">
-    <div class="row"><span class="label" data-en="Status" data-fa="وضعیت">Status</span><span class="value">{status_esc}</span></div>
+    <div class="row"><span class="label" data-en="Status" data-fa="وضعیت">Status</span><span class="value">{status_html}</span></div>
     <div class="row"><span class="label" data-en="Expiration" data-fa="انقضا">Expiration</span><span class="value">{expiry_str_esc}</span></div>
-    <div class="row" style="grid-column:span 2;"><span class="label" data-en="Data Usage" data-fa="مصرف داده">Data Usage</span><span class="value">{_fmt_bytes(used)} / {'∞' if limit == 0 else _fmt_bytes(limit)}</span></div>
+    <div class="row row-wide"><span class="label" data-en="Data Usage" data-fa="مصرف داده">Data Usage</span><span class="value">{_fmt_bytes(used)} / {'∞' if limit == 0 else _fmt_bytes(limit)}</span></div>
     <div class="row"><span class="label" data-en="Remaining" data-fa="باقی‌مانده">Remaining</span><span class="value">{remaining_str}</span></div>
-    <div class="progress-bar-bg"><div class="progress-bar-fill"></div></div>
+    <div class="progress-bar-bg"><div class="progress-bar-fill {{usage_bar_class}}"></div></div>
     <div class="progress-text" data-en="{usage_percent}% used" data-fa="{usage_percent}% مصرف">{usage_percent}% used</div>
     <div class="daily-chart" id="daily-chart"><canvas id="dailyCanvas"></canvas></div>
   </div>
-  <div class="qr">
-    <img src="{qr_url_esc}" alt="Scan to Import" width="200" height="200">
+  <div class="qr" id="qr-box">
+    <canvas id="qr-canvas" width="220" height="220" role="img" aria-label="QR code"></canvas>
   </div>
   <div class="actions-grid">
 {actions_html}
 </div>
-  <div id="link-text-box" style="display:none;margin-top:12px;"><input id="link-text-input" readonly value="{vless_link_esc}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline" style="margin-top:8px;" onclick="copyToClip(document.getElementById('link-text-input').value, t('link_copied'))">Copy link text</button></div>
+  <div id="link-text-box" style="display:none;margin-top:12px;"><input id="link-text-input" readonly value="{vless_link_esc}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:13px;direction:ltr;text-align:start;"><button class="btn btn-outline" style="margin-top:8px;" onclick="copyToClip(document.getElementById('link-text-input').value, t('link_copied'))">Copy link text</button></div>
 </div>
-<div id="toast">Copied!</div>
+<div id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg">Copied!</span></div>
 <script>
 var lang = localStorage.getItem('ll') || 'en';
 var i18n = {{
@@ -8448,7 +9156,7 @@ function copyToClipboard(text) {{
 function fallbackCopy(text) {{
     var textArea = document.createElement("textarea");
     textArea.value = text;
-    textArea.style.top = "0"; textArea.style.left = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
+    textArea.style.top = "0"; textArea.style.insetInlineStart = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
     document.body.appendChild(textArea);
     textArea.focus(); textArea.select();
     try {{
@@ -8463,10 +9171,7 @@ function fallbackCopy(text) {{
 function copyToClip(text, msg) {{
     if (navigator.clipboard && navigator.clipboard.writeText) {{
         navigator.clipboard.writeText(text).then(function() {{
-            var t = document.getElementById('toast');
-            t.innerText = msg;
-            t.classList.add('show');
-            setTimeout(function() {{ t.classList.remove('show'); }}, 2500);
+            toast(msg);
         }}, function() {{
             fallbackCopyDashboard(text, msg);
         }});
@@ -8478,20 +9183,14 @@ function copyToClip(text, msg) {{
 function fallbackCopyDashboard(text, msg) {{
     var textArea = document.createElement("textarea");
     textArea.value = text;
-    textArea.style.top = "0"; textArea.style.left = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
+    textArea.style.top = "0"; textArea.style.insetInlineStart = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
     document.body.appendChild(textArea);
     textArea.focus(); textArea.select();
     try {{
         var ok = document.execCommand('copy');
-        var t = document.getElementById('toast');
-        t.innerText = ok ? msg : 'Copy failed';
-        t.classList.add('show');
-        setTimeout(function() {{ t.classList.remove('show'); }}, 2500);
+        toast(ok ? msg : 'Copy failed', !ok);
     }} catch (e) {{
-        var t = document.getElementById('toast');
-        t.innerText = 'Copy failed';
-        t.classList.add('show');
-        setTimeout(function() {{ t.classList.remove('show'); }}, 2500);
+        toast('Copy failed', true);
     }}
     document.body.removeChild(textArea);
 }}
@@ -8507,16 +9206,333 @@ function copyXrayConfig(uid, type) {{
     copyToClip(url, t('xray_copied'));
 }}
 
+var USER_ICONS={{ok:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',err:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>'}};
 function toast(msg, err) {{
     var t = document.getElementById('toast');
-    t.innerText = msg;
+    var m = document.getElementById('toast-msg');
+    var ic = document.getElementById('toast-ic');
+    if (m) m.textContent = msg;
+    if (ic) {{ ic.innerHTML = err ? USER_ICONS.err : USER_ICONS.ok; ic.className = 'ic ' + (err ? 'err' : 'ok'); }}
     t.classList.add('show');
-    if (err) t.style.background = '#f87171';
-    else t.style.background = 'var(--primary)';
     clearTimeout(t._hide);
     t._hide = setTimeout(function() {{ t.classList.remove('show'); }}, 2500);
 }}
 
+var storedTheme = localStorage.getItem('theme') || 'dark';
+document.body.classList.toggle('light-mode', storedTheme==='light');
+document.body.classList.toggle('blue-dark', storedTheme==='blue-dark');
+var QR_TABLE = [[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[2,35,17],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9],[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],[2,86,68],[4,43,27],[4,43,19],[4,43,15],[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]];
+var QR_ALIGN = [[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]];
+var QR_ECL = 1;
+function qrUtf8(s) {{
+  var b = [];
+  for (var i = 0; i < s.length; i++) {{
+    var c = s.charCodeAt(i);
+    if (c < 128) b.push(c);
+    else if (c < 2048) {{ b.push(192 | (c >> 6)); b.push(128 | (c & 63)); }}
+    else if (c >= 55296 && c < 57344) {{
+      var c2 = s.charCodeAt(i + 1);
+      var cp = 65536 + ((c - 55296) << 10) + (c2 - 56320);
+      b.push(240 | (cp >> 18)); b.push(128 | ((cp >> 12) & 63)); b.push(128 | ((cp >> 6) & 63)); b.push(128 | (cp & 63));
+      i++;
+    }} else {{ b.push(224 | (c >> 12)); b.push(128 | ((c >> 6) & 63)); b.push(128 | (c & 63)); }}
+  }}
+  return b;
+}}
+function qrRsMul(x, y) {{
+  var z = 0;
+  for (var i = 7; i >= 0; i--) {{ z = (z << 1) ^ ((z >>> 7) * 0x11D); z ^= ((y >>> i) & 1) * x; }}
+  return z;
+}}
+function qrRsDivisor(deg) {{
+  var result = [];
+  for (var i = 0; i < deg - 1; i++) result.push(0);
+  result.push(1);
+  var root = 1;
+  for (var i = 0; i < deg; i++) {{
+    for (var j = 0; j < result.length; j++) {{
+      result[j] = qrRsMul(result[j], root);
+      if (j + 1 < result.length) result[j] ^= result[j + 1];
+    }}
+    root = qrRsMul(root, 2);
+  }}
+  return result;
+}}
+function qrRsRemainder(data, divisor) {{
+  var result = [];
+  for (var i = 0; i < divisor.length; i++) result.push(0);
+  for (var i = 0; i < data.length; i++) {{
+    var factor = data[i] ^ result.shift();
+    result.push(0);
+    for (var j = 0; j < divisor.length; j++) result[j] ^= qrRsMul(divisor[j], factor);
+  }}
+  return result;
+}}
+function qrRawModules(ver) {{
+  var result = (16 * ver + 128) * ver + 64;
+  if (ver >= 2) {{
+    var numAlign = Math.floor(ver / 7) + 2;
+    result -= (25 * numAlign - 10) * numAlign - 55;
+    if (ver >= 7) result -= 36;
+  }}
+  return result;
+}}
+function qrNumDataCodewords(ver) {{
+  var entry = QR_TABLE[(ver - 1) * 4 + QR_ECL];
+  var ecc = 0;
+  var blocks = 0;
+  for (var i = 0; i < entry.length; i += 3) {{ ecc = entry[i + 1] - entry[i + 2]; blocks += entry[i]; }}
+  return Math.floor(qrRawModules(ver) / 8) - ecc * blocks;
+}}
+function qrBitLen(n, len) {{
+  var b = [];
+  for (var i = len - 1; i >= 0; i--) b.push((n >>> i) & 1);
+  return b;
+}}
+function qrMakeData(text) {{
+  var data = qrUtf8(text);
+  for (var ver = 1; ver <= 40; ver++) {{
+    var ccbits = ver <= 9 ? 8 : 16;
+    var cap = qrNumDataCodewords(ver) * 8;
+    if (4 + ccbits + data.length * 8 <= cap) {{
+      var bb = qrBitLen(4, 4).concat(qrBitLen(data.length, ccbits));
+      for (var i = 0; i < data.length; i++) bb = bb.concat(qrBitLen(data[i], 8));
+      var capBits = qrNumDataCodewords(ver) * 8;
+      var term = Math.min(4, capBits - bb.length);
+      for (var i = 0; i < term; i++) bb.push(0);
+      while (bb.length % 8 !== 0) bb.push(0);
+      var pad = 236;
+      while (bb.length < capBits) {{ bb = bb.concat(qrBitLen(pad, 8)); pad = pad === 236 ? 17 : 236; }}
+      var cw = [];
+      for (var i = 0; i < bb.length; i += 8) {{
+        var v = 0;
+        for (var j = 0; j < 8; j++) v = (v << 1) | bb[i + j];
+        cw.push(v);
+      }}
+      return {{ ver: ver, cw: cw }};
+    }}
+  }}
+  return null;
+}}
+function qrGetBit(x, i) {{ return ((x >>> i) & 1) !== 0; }}
+function qrFormatBits(mask) {{
+  var fb = [1, 0, 3, 2][QR_ECL];
+  var data = fb * 8 + mask;
+  var rem = data;
+  for (var i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+  return ((data << 10) | rem) ^ 0x5412;
+}}
+function qrVersionBits(ver) {{
+  var rem = ver;
+  for (var i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >> 11) * 0x1F25);
+  return (ver << 12) | rem;
+}}
+function qrEncode(text) {{
+  var made = qrMakeData(text);
+  if (!made) return null;
+  var ver = made.ver;
+  var size = ver * 4 + 17;
+  var entry = QR_TABLE[(ver - 1) * 4 + QR_ECL];
+  var blocks = [];
+  var eccLen = 0;
+  var off = 0;
+  for (var i = 0; i < entry.length; i += 3) {{
+    for (var k = 0; k < entry[i]; k++) {{
+      var dc = entry[i + 2];
+      var total = entry[i + 1];
+      eccLen = total - dc;
+      blocks.push({{ data: made.cw.slice(off, off + dc), ecc: null }});
+      off += dc;
+    }}
+  }}
+  var divisor = qrRsDivisor(eccLen);
+  for (var i = 0; i < blocks.length; i++) blocks[i].ecc = qrRsRemainder(blocks[i].data, divisor);
+  var all = [];
+  var maxData = 0;
+  for (var i = 0; i < blocks.length; i++) maxData = Math.max(maxData, blocks[i].data.length);
+  for (var i = 0; i < maxData; i++) {{
+    for (var j = 0; j < blocks.length; j++) {{
+      if (i < blocks[j].data.length) all.push(blocks[j].data[i]);
+    }}
+  }}
+  for (var i = 0; i < eccLen; i++) {{
+    for (var j = 0; j < blocks.length; j++) all.push(blocks[j].ecc[i]);
+  }}
+  var bits = [];
+  for (var i = 0; i < all.length; i++) bits = bits.concat(qrBitLen(all[i], 8));
+  bits = bits.concat(qrBitLen(0, qrRawModules(ver) - bits.length));
+  var best = null;
+  for (var mask = 0; mask < 8; mask++) {{
+    var q = qrBuild(ver, size, bits, mask);
+    var pen = qrPenalty(q.modules, size);
+    if (!best || pen < best.pen) best = {{ pen: pen, modules: q.modules, ver: ver, size: size, mask: mask }};
+  }}
+  return best;
+}}
+function qrBuild(ver, size, bits, mask) {{
+  var modules = [];
+  var isFunc = [];
+  for (var y = 0; y < size; y++) {{ modules.push([]); isFunc.push([]); for (var x = 0; x < size; x++) {{ modules[y].push(false); isFunc[y].push(false); }} }}
+  function setFn(x, y, v) {{ modules[y][x] = v; isFunc[y][x] = true; }}
+  function finder(cx, cy) {{
+    for (var dy = -4; dy <= 4; dy++) {{
+      for (var dx = -4; dx <= 4; dx++) {{
+        var xx = cx + dx;
+        var yy = cy + dy;
+        if (xx < 0 || xx >= size || yy < 0 || yy >= size) continue;
+        var d = Math.max(Math.abs(dx), Math.abs(dy));
+        var on = d !== 2 && d !== 4;
+        setFn(xx, yy, on);
+      }}
+    }}
+  }}
+  for (var i = 0; i < size; i++) {{
+    setFn(6, i, i % 2 === 0);
+    setFn(i, 6, i % 2 === 0);
+  }}
+  finder(3, 3);
+  finder(size - 4, 3);
+  finder(3, size - 4);
+  var align = QR_ALIGN[ver - 1];
+  var nAlign = align.length;
+  for (var i = 0; i < nAlign; i++) {{
+    for (var j = 0; j < nAlign; j++) {{
+      if (!((i === 0 && j === 0) || (i === 0 && j === nAlign - 1) || (i === nAlign - 1 && j === 0))) {{
+        for (var dy = -2; dy <= 2; dy++) {{
+          for (var dx = -2; dx <= 2; dx++) {{
+            setFn(align[i] + dx, align[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+          }}
+        }}
+      }}
+    }}
+  }}
+  var fb = qrFormatBits(mask);
+  for (var i = 0; i <= 5; i++) setFn(8, i, qrGetBit(fb, i));
+  setFn(8, 7, qrGetBit(fb, 6));
+  setFn(8, 8, qrGetBit(fb, 7));
+  setFn(7, 8, qrGetBit(fb, 8));
+  for (var i = 9; i < 15; i++) setFn(14 - i, 8, qrGetBit(fb, i));
+  for (var i = 0; i < 8; i++) setFn(size - 1 - i, 8, qrGetBit(fb, i));
+  for (var i = 8; i < 15; i++) setFn(8, size - 15 + i, qrGetBit(fb, i));
+  setFn(8, size - 8, true);
+  if (ver >= 7) {{
+    var vb = qrVersionBits(ver);
+    for (var i = 0; i < 18; i++) {{
+      var bit = qrGetBit(vb, i);
+      var a = size - 11 + (i % 3);
+      var b = Math.floor(i / 3);
+      setFn(a, b, bit);
+      setFn(b, a, bit);
+    }}
+  }}
+  var i = 0;
+  for (var right = size - 1; right >= 1; right -= 2) {{
+    if (right === 6) right = 5;
+    for (var vert = 0; vert < size; vert++) {{
+      for (var j = 0; j < 2; j++) {{
+        var x = right - j;
+        var upward = ((right + 1) & 2) === 0;
+        var y = upward ? size - 1 - vert : vert;
+        if (!isFunc[y][x] && i < bits.length) {{ modules[y][x] = bits[i] === 1; i++; }}
+      }}
+    }}
+  }}
+  for (var y = 0; y < size; y++) {{
+    for (var x = 0; x < size; x++) {{
+      if (isFunc[y][x]) continue;
+      var m = false;
+      if (mask === 0) m = (y + x) % 2 === 0;
+      else if (mask === 1) m = y % 2 === 0;
+      else if (mask === 2) m = x % 3 === 0;
+      else if (mask === 3) m = (y + x) % 3 === 0;
+      else if (mask === 4) m = (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0;
+      else if (mask === 5) m = ((y * x) % 2 + (y * x) % 3) === 0;
+      else if (mask === 6) m = (((y * x) % 2 + (y * x) % 3) % 2) === 0;
+      else m = (((y + x) % 2 + (y * x) % 3) % 2) === 0;
+      if (m) modules[y][x] = !modules[y][x];
+    }}
+  }}
+  return {{ modules: modules }};
+}}
+function qrPenalty(m, size) {{
+  var pen = 0;
+  for (var y = 0; y < size; y++) {{
+    var runColor = false;
+    var runLen = 0;
+    for (var x = 0; x < size; x++) {{
+      if (m[y][x] === runColor) runLen++;
+      else {{ if (runLen >= 5) pen += 3 + (runLen - 5); runColor = m[y][x]; runLen = 1; }}
+    }}
+    if (runLen >= 5) pen += 3 + (runLen - 5);
+  }}
+  for (var x = 0; x < size; x++) {{
+    var runColor = false;
+    var runLen = 0;
+    for (var y = 0; y < size; y++) {{
+      if (m[y][x] === runColor) runLen++;
+      else {{ if (runLen >= 5) pen += 3 + (runLen - 5); runColor = m[y][x]; runLen = 1; }}
+    }}
+    if (runLen >= 5) pen += 3 + (runLen - 5);
+  }}
+  for (var y = 0; y < size - 1; y++) {{
+    for (var x = 0; x < size - 1; x++) {{
+      var c = m[y][x];
+      if (c === m[y][x + 1] && c === m[y + 1][x] && c === m[y + 1][x + 1]) pen += 3;
+    }}
+  }}
+  function patScore(line) {{
+    var s = 0;
+    for (var i = 0; i + 10 < line.length; i++) {{
+      var seg = line.slice(i, i + 11).join('');
+      if (seg === '10111010000' || seg === '00001011101') s += 40;
+    }}
+    return s;
+  }}
+  for (var y = 0; y < size; y++) {{
+    var row = [];
+    for (var x = 0; x < size; x++) row.push(m[y][x] ? '1' : '0');
+    pen += patScore(row);
+  }}
+  for (var x = 0; x < size; x++) {{
+    var col = [];
+    for (var y = 0; y < size; y++) col.push(m[y][x] ? '1' : '0');
+    pen += patScore(col);
+  }}
+  var dark = 0;
+  for (var y = 0; y < size; y++) {{
+    for (var x = 0; x < size; x++) if (m[y][x]) dark++;
+  }}
+  var total = size * size;
+  var k = Math.floor(Math.abs(dark * 100 / total - 50) / 5);
+  pen += k * 10;
+  return pen;
+}}
+function drawQr(canvas, text) {{
+  if (!canvas) return false;
+  var q = qrEncode(text);
+  if (!q) return false;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width;
+  var h = canvas.height;
+  var border = 4;
+  var scale = Math.max(1, Math.floor(Math.min(w, h) / (q.size + border * 2)));
+  var px = (q.size + border * 2) * scale;
+  var ox = Math.floor((w - px) / 2);
+  var oy = Math.floor((h - px) / 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#000000';
+  for (var y = 0; y < q.size; y++) {{
+    for (var x = 0; x < q.size; x++) {{
+      if (q.modules[y][x]) ctx.fillRect(ox + (x + border) * scale, oy + (y + border) * scale, scale, scale);
+    }}
+  }}
+  return true;
+}}
+var qrText = {qr_text_js};
+var qrBox = document.getElementById('qr-box');
+if (!qrText && qrBox) qrBox.style.display = 'none';
+if (qrText) drawQr(document.getElementById('qr-canvas'), qrText);
 var dailyData = {json.dumps(daily_data)};
 if (dailyData.length > 0) {{
     var ctx = document.getElementById('dailyCanvas').getContext('2d');
@@ -8527,7 +9543,7 @@ if (dailyData.length > 0) {{
             datasets: [{{
                 label: 'MB',
                 data: dailyData.map(d => d.mb),
-                backgroundColor: '#39ff14'
+                backgroundColor: (getComputedStyle(document.documentElement).getPropertyValue('--accent') || '#3b82f6').trim()
             }}]
         }},
         options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ display: false }} }} }}
@@ -8606,6 +9622,9 @@ async def user_subscription(uid: str, request: Request):
         "udp_enabled": udp_enabled,
         "mtproto_variant": link.get("mtproto_variant", "dd") or "dd",
         "mtproto_domain": link.get("mtproto_domain", "www.google.com") or "www.google.com",
+        "webproxy_token": link.get("webproxy_token", "") or "",
+        "proxy_username": link.get("proxy_username", "") or "",
+        "proxy_password": link.get("proxy_password", "") or "",
         "ss_method": link.get("ss_method", "2022-blake3-aes-256-gcm"),
         "ss_psk": link.get("ss_psk", ""),
         "uid": uid
@@ -8647,10 +9666,10 @@ async def subscription_endpoint(uid: str, request: Request):
 
 def _proxy_clash_response(link, domain):
     proto = link.get("protocol", "")
-    uid = link.get("uid", "")
     name = link.get("label", "SulgX")
     if proto in ("socks5", "http-proxy"):
-        node = {"name": name, "type": "socks5" if proto == "socks5" else "http", "server": domain, "port": _proxy_effective_port(proto), "username": uid, "password": uid}
+        user, pw = _proxy_creds_for_link(link)
+        node = {"name": name, "type": "socks5" if proto == "socks5" else "http", "server": domain, "port": _proxy_effective_port(proto), "username": user, "password": pw}
         cfg = {"proxies": [node], "proxy-groups": [{"name": "PROXY", "type": "select", "proxies": [name]}], "rules": ["MATCH,PROXY"]}
         return Response(content=yaml.dump(cfg, allow_unicode=True, default_flow_style=False), media_type="text/plain")
     raise HTTPException(status_code=422, detail="Clash has no native MTProto or WEB proxy type, use the tg:// link from the panel or subscription")
@@ -8658,10 +9677,10 @@ def _proxy_clash_response(link, domain):
 
 def _proxy_singbox_response(link, domain):
     proto = link.get("protocol", "")
-    uid = link.get("uid", "")
     name = link.get("label", "SulgX")
     if proto in ("socks5", "http-proxy"):
-        outbound = {"type": "socks" if proto == "socks5" else "http", "tag": name, "server": domain, "server_port": _proxy_effective_port(proto), "username": uid, "password": uid}
+        user, pw = _proxy_creds_for_link(link)
+        outbound = {"type": "socks" if proto == "socks5" else "http", "tag": name, "server": domain, "server_port": _proxy_effective_port(proto), "username": user, "password": pw}
         cfg = {"outbounds": [outbound, {"type": "direct", "tag": "direct"}], "route": {"rules": [{"outbound": "direct", "ip_is_private": True}], "final": name}}
         return JSONResponse(content=cfg)
     raise HTTPException(status_code=422, detail="Sing-box has no native MTProto or WEB proxy type, use the tg:// link from the panel or subscription")
@@ -9763,7 +10782,8 @@ async def _test_socks5_handshake(host, port, uid, timeout=5):
         resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
         if resp != b"\x05\x02":
             return False, "SOCKS5 greeting rejected: " + resp.hex()
-        auth = b"\x01" + bytes([len(uid)]) + uid.encode() + bytes([len(uid)]) + uid.encode()
+        user, pw = _proxy_creds_for_link(LINKS.get(uid) or {"uid": uid})
+        auth = b"\x01" + bytes([len(user)]) + user.encode() + bytes([len(pw)]) + pw.encode()
         writer.write(auth)
         await writer.drain()
         resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
@@ -9782,7 +10802,8 @@ async def _test_socks5_handshake(host, port, uid, timeout=5):
 async def _test_http_proxy_handshake(host, port, uid, timeout=5):
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
     try:
-        creds = base64.b64encode((uid + ":" + uid).encode()).decode()
+        user, pw = _proxy_creds_for_link(LINKS.get(uid) or {"uid": uid})
+        creds = base64.b64encode((user + ":" + pw).encode()).decode()
         req = "CONNECT 149.154.175.50:443 HTTP/1.1\r\nHost: 149.154.175.50:443\r\nProxy-Authorization: Basic " + creds + "\r\n\r\n"
         writer.write(req.encode())
         await writer.drain()
@@ -9801,8 +10822,8 @@ async def _test_mtproto_plain(host, port, uid, tag, timeout=5):
         init[0] = os.urandom(1)[0]
     init[56:60] = tag
     init[60:62] = struct.pack("<h", 1)
-    enc_key, enc_iv, _dk, _di = tgproxy._derive_obfs_keys(bytes(init), secret)
-    cipher = tgproxy._aes_ctr(enc_key, enc_iv).encryptor()
+    enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
+    cipher = _mtproto_aes_ctr(enc_key, enc_iv)
     encrypted = cipher.update(bytes(init))
     sent = bytes(init[:56]) + encrypted[56:64]
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -9822,14 +10843,29 @@ async def _test_mtproto_plain(host, port, uid, tag, timeout=5):
 
 async def _test_mtproto_faketls(host, port, uid, timeout=5):
     secret = tgproxy.mtproxy_secret_for_uid(uid)
-    hello = bytearray(517)
-    hello[0:11] = tgproxy.TLS_START_BYTES
+    body = bytearray()
+    body += b"\x03\x03"
+    body += b"\x00" * 32
+    body.append(32)
+    body += os.urandom(32)
+    body += struct.pack(">H", 2)
+    body += b"\x13\x01"
+    body.append(1)
+    body.append(0)
+    ext = bytearray()
+    sni_host = b"www.google.com"
+    sni_payload = struct.pack(">H", len(sni_host) + 3) + b"\x00" + struct.pack(">H", len(sni_host)) + sni_host
+    ext += struct.pack(">H", 0x0000) + struct.pack(">H", len(sni_payload)) + sni_payload
+    key_share = struct.pack(">H", 0x001d) + struct.pack(">H", 32) + os.urandom(32)
+    ext += struct.pack(">H", 0x0033) + struct.pack(">H", len(key_share) + 2) + struct.pack(">H", len(key_share)) + key_share
+    body += struct.pack(">H", len(ext)) + ext
+    hs = b"\x01" + len(body).to_bytes(3, "big") + bytes(body)
+    hello = bytearray(b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs)
     zeroed = bytes(hello[:11]) + b"\x00" * 32 + bytes(hello[43:])
     digest = hmac_mod.new(secret, zeroed, hashlib.sha256).digest()
     stamp = struct.pack("<I", int(time.time()))
     rand = bytearray(digest[:28]) + bytearray(a ^ b for a, b in zip(stamp, digest[28:32]))
     hello[11:43] = rand
-    hello[43] = 0
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
     try:
         writer.write(bytes(hello))
@@ -9854,8 +10890,8 @@ async def _test_mtproto_faketls(host, port, uid, timeout=5):
             init[0] = os.urandom(1)[0]
         init[56:60] = b"\xee\xee\xee\xee"
         init[60:62] = struct.pack("<h", 1)
-        enc_key, enc_iv, _dk, _di = tgproxy._derive_obfs_keys(bytes(init), secret)
-        cipher = tgproxy._aes_ctr(enc_key, enc_iv).encryptor()
+        enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
+        cipher = _mtproto_aes_ctr(enc_key, enc_iv)
         encrypted = cipher.update(bytes(init))
         sent = bytes(init[:56]) + encrypted[56:64]
         writer.write(b"\x17\x03\x03" + struct.pack(">H", len(sent)) + sent)
@@ -9869,6 +10905,50 @@ async def _test_mtproto_faketls(host, port, uid, timeout=5):
             return True, "MTProto fake-TLS handshake accepted, connection held open waiting for DC"
     finally:
         writer.close()
+
+
+WEBPROXY_HANDSHAKE = bytes([0x10, 0, 0, 0, 0, 0, 0, 1, 1])
+
+
+def _mtproto_obfs_keys(init, secret):
+    init = bytes(init)
+    enc_key = hashlib.sha256(init[8:40] + bytes(secret)).digest()
+    enc_iv = init[40:56]
+    rev = init[::-1]
+    dec_key = hashlib.sha256(rev[8:40] + bytes(secret)).digest()
+    dec_iv = rev[40:56]
+    return enc_key, enc_iv, dec_key, dec_iv
+
+
+def _mtproto_aes_ctr(key, iv):
+    return Cipher(AES(bytes(key)), CTR(bytes(iv))).encryptor()
+
+
+def _webproxy_aes_ctr_at(key, iv, position, data):
+    block = int(position) // 16
+    skip = int(position) % 16
+    iv_int = int.from_bytes(bytes(iv), "big") + block
+    new_iv = iv_int.to_bytes(16, "big")
+    cipher = Cipher(AES(bytes(key)), CTR(new_iv)).encryptor()
+    out = cipher.update(bytes(data))
+    return out[skip:] if skip else out
+
+
+def _webproxy_build_client_obfs_header(secret, dc=1):
+    init = bytearray(os.urandom(64))
+    while init[0] == 0xEF:
+        init[0] = os.urandom(1)[0]
+    init[56:60] = b"\xef\xef\xef\xef"
+    init[60:62] = struct.pack("<h", int(dc))
+    enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
+    cipher = _mtproto_aes_ctr(enc_key, enc_iv)
+    encrypted = cipher.update(bytes(init))
+    return bytes(init[:56]) + encrypted[56:64]
+
+
+def _webproxy_parse_obfs_header(header, secret):
+    enc_key, enc_iv, dec_key, dec_iv = _mtproto_obfs_keys(bytes(header), secret)
+    return {"read_key": enc_key, "read_iv": enc_iv, "write_key": dec_key, "write_iv": dec_iv}
 
 
 def _webproxy_test_frame(frame_type, stream_id, payload):
@@ -9913,47 +10993,11 @@ def _webproxy_check_respq(dc_buf):
     return False
 
 
-async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
-    if tgproxy is None:
-        return False, "not_available", "telegram proxy module is not loaded"
-    panel_port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
-    loopback = "http://127.0.0.1:" + str(panel_port)
-    ws_url = "ws://127.0.0.1:" + str(panel_port) + "/api/v1/ws"
-    headers = {"Host": domain}
-    token = str(link.get("webproxy_token") or "").strip().lower()
-    try:
-        capability = tgproxy.webproxy_capability_for(domain, port, token or None)
-    except Exception as exc:
-        return False, "fail", "WEB proxy capability could not be built for port " + str(port) + ": " + str(exc)
-    bootstrap = ""
-    session_token = ""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
-            bridge_path = "/" + token + "?bridge=" + capability if token else "/?bridge=" + capability
-            resp = await client.get(loopback + bridge_path, headers=headers)
-            if resp.status_code != 200 or "tproxy-init" not in resp.text:
-                return False, "fail", "WEB proxy bridge did not serve a session page for a valid capability (HTTP " + str(resp.status_code) + "); the bridge is not configured for this host and port"
-            found = re.search(r"bootstrap=\"([^\"]+)\"", resp.text)
-            if not found:
-                return False, "fail", "WEB proxy bridge page has no session bootstrap token"
-            bootstrap = found.group(1)
-            session_resp = await client.post(loopback + "/api/v1/session", content=tgproxy.WEBPROXY_HANDSHAKE, headers={"Host": domain, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream"})
-            if session_resp.status_code != 200:
-                return False, "fail", "WEB proxy session creation rejected (HTTP " + str(session_resp.status_code) + ")"
-            session_token = session_resp.headers.get("X-Session-Token", "")
-            if not session_token:
-                return False, "fail", "WEB proxy session creation returned no session token"
-            if session_resp.headers.get("X-Carrier-Mode", "") != tgproxy.WEBPROXY_CARRIER:
-                return False, "fail", "WEB proxy session carrier mismatch"
-    except Exception as exc:
-        return False, "fail", "WEB proxy bridge/session step failed: " + str(exc)
+async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeout, port, token):
     lane_id = 1
     ws = None
     try:
         ws = await websockets.connect(ws_url, subprotocols=["tproxy-v1." + session_token], open_timeout=10, close_timeout=2, max_size=1024 * 1024)
-        secret = tgproxy.webproxy_token_secret_bytes(token) if token else tgproxy.webproxy_per_port_secret_bytes(port)
-        header = tgproxy.webproxy_build_client_obfs_header(secret, dc=1)
-        parsed = tgproxy.webproxy_parse_obfs_header(header, secret)
         await ws.send(_webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
         deadline = time.time() + 10.0
         window_ok = False
@@ -9980,7 +11024,7 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
         req_total = 1 + len(req_msg)
         req_pad = (-req_total) % 4
         req_packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
-        req_cipher = tgproxy._webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
+        req_cipher = _webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
         await ws.send(_webproxy_test_frame(2, lane_id, req_cipher))
         dc_buf = bytearray()
         dc_pos = 0
@@ -9999,7 +11043,7 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
                     return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
                 if frame_type != 2 or not payload:
                     continue
-                plain = tgproxy._webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
+                plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
                 dc_pos += len(payload)
                 dc_buf += plain
                 checked = _webproxy_check_respq(dc_buf)
@@ -10018,10 +11062,151 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
                 await ws.close()
             except Exception:
                 pass
+
+
+async def _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port):
+    lane_id = 1
+    up_seq = 1
+    down_cursor = 0
+    auth_headers = {"Host": domain, "Authorization": "Bearer " + session_token}
+    nonce = os.urandom(16)
+    msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFC)
+    req_body = struct.pack("<i", 0x60469778) + nonce
+    req_msg = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(req_body)) + req_body
+    req_total = 1 + len(req_msg)
+    req_pad = (-req_total) % 4
+    req_packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
+    req_cipher = _webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
+
+    async def _up(client, frames):
+        nonlocal up_seq
+        resp = await client.post(loopback + "/" + token + "/api/v1/up", content=frames, headers=dict(auth_headers, **{"Content-Type": "application/octet-stream", "X-Up-Seq": str(up_seq)}))
+        if resp.status_code == 204:
+            up_seq += 1
+            return
+        if resp.status_code == 409:
+            raise ValueError("uplink sequence rejected (HTTP 409)")
+        raise ValueError("uplink failed (HTTP " + str(resp.status_code) + ")")
+
+    async def _down(client, deadline, per_poll_timeout):
+        nonlocal down_cursor
+        while time.time() < deadline:
+            remaining = max(0.5, deadline - time.time())
+            resp = await client.post(loopback + "/" + token + "/api/v1/down", content=b"", headers=dict(auth_headers, **{"X-Down-Cursor": str(down_cursor)}), timeout=min(per_poll_timeout, remaining))
+            cursor_header = resp.headers.get("X-Down-Cursor", "")
+            if cursor_header:
+                try:
+                    down_cursor = int(cursor_header)
+                except ValueError:
+                    pass
+            closed = resp.headers.get("X-Lane-Closed", "") == "1"
+            if resp.status_code == 204:
+                if closed:
+                    return None, True
+                continue
+            if resp.status_code != 200:
+                raise ValueError("downlink failed (HTTP " + str(resp.status_code) + ")")
+            return resp.content, closed
+        return b"", False
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0, trust_env=False) as client:
+            await _up(client, _webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
+            window_deadline = time.time() + 10.0
+            window_ok = False
+            while time.time() < window_deadline and not window_ok:
+                frames, closed = await _down(client, window_deadline, 10.0)
+                if closed:
+                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server (DC unreachable or header rejected)"
+                if frames:
+                    for frame_type, stream_id, _payload in _webproxy_test_split_frames(bytes(frames)):
+                        if stream_id != lane_id:
+                            continue
+                        if frame_type == 4:
+                            window_ok = True
+                        if frame_type == 3:
+                            return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server (DC unreachable or header rejected)"
+            if not window_ok:
+                return False, "fail", "WEB proxy lane to Telegram DC1 got no answer within 10s"
+            await _up(client, _webproxy_test_frame(2, lane_id, req_cipher))
+            dc_buf = bytearray()
+            dc_pos = 0
+            dc_deadline = time.time() + dc_timeout
+            while time.time() < dc_deadline:
+                frames, closed = await _down(client, dc_deadline, 35.0)
+                if frames:
+                    for frame_type, stream_id, payload in _webproxy_test_split_frames(bytes(frames)):
+                        if stream_id != lane_id:
+                            continue
+                        if frame_type == 3:
+                            return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                        if frame_type != 2 or not payload:
+                            continue
+                        plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
+                        dc_pos += len(payload)
+                        dc_buf += plain
+                        checked = _webproxy_check_respq(dc_buf)
+                        if checked is True:
+                            return True, "pass", "WEB proxy real session: capability verified for port " + str(port) + (" token " + token if token else "") + ", session issued, lane 1 opened to Telegram DC1 and the DC answered the auth handshake (resPQ) — traffic flows"
+                        if checked is False:
+                            return False, "fail", "Telegram DC1 reply was not a valid MTProto response (bridge and session work, but the DC leg carries no real traffic)"
+                if closed:
+                    return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+            return False, "fail", "Telegram DC1 gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)"
+    except ValueError as exc:
+        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc)
+    except Exception as exc:
+        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc)
+
+
+async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
+    panel_port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
+    loopback = "http://127.0.0.1:" + str(panel_port)
+    ws_base = "ws://127.0.0.1:" + str(panel_port)
+    headers = {"Host": domain}
+    token = str(link.get("webproxy_token") or "").strip().lower()
+    if not token:
+        return False, "not_available", "WEB proxy inbound has no token"
+    try:
+        capability = _web_capability(domain, token)
+    except ValueError as exc:
+        return False, "fail", "WEB proxy capability could not be built: " + str(exc)
+    bootstrap = ""
+    session_token = ""
+    carrier = ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+            bridge_path = "/" + token + "/?bridge=" + capability
+            resp = await client.get(loopback + bridge_path, headers=headers)
+            if resp.status_code != 200 or "tproxy-init" not in resp.text:
+                return False, "fail", "WEB proxy bridge did not serve a session page for a valid capability (HTTP " + str(resp.status_code) + "); the bridge is not configured for this host and port"
+            found = re.search(r"bootstrap=\"([^\"]+)\"", resp.text)
+            if not found:
+                return False, "fail", "WEB proxy bridge page has no session bootstrap token"
+            bootstrap = found.group(1)
+            session_resp = await client.post(loopback + "/" + token + "/api/v1/session", content=WEBPROXY_HANDSHAKE, headers={"Host": domain, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream"})
+            if session_resp.status_code != 200:
+                return False, "fail", "WEB proxy session creation rejected (HTTP " + str(session_resp.status_code) + ")"
+            session_token = session_resp.headers.get("X-Session-Token", "")
+            if not session_token:
+                return False, "fail", "WEB proxy session creation returned no session token"
+            carrier = (session_resp.headers.get("X-Carrier-Mode", "") or "").strip().lower()
+    except Exception as exc:
+        return False, "fail", "WEB proxy bridge/session step failed: " + str(exc)
+    try:
+        secret = _web_token_secret_bytes(token)
+        header = _webproxy_build_client_obfs_header(secret, dc=1)
+        parsed = _webproxy_parse_obfs_header(header, secret)
+        if carrier.startswith("websocket"):
+            return await _test_webproxy_lane_ws(ws_base + "/" + token + "/api/v1/ws", session_token, header, parsed, dc_timeout, port, token)
+        if carrier.startswith("https"):
+            return await _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port)
+        return False, "fail", "WEB proxy session carrier is not recognized: " + (carrier or "(empty)") + " (bridge and session work, but the lane test cannot run)"
+    finally:
         if session_token:
             try:
                 async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-                    await client.request("DELETE", loopback + "/api/v1/session", headers={"Host": domain, "Authorization": "Bearer " + session_token})
+                    await client.request("DELETE", loopback + "/" + token + "/api/v1/session", headers={"Host": domain, "Authorization": "Bearer " + session_token})
             except Exception:
                 pass
 
@@ -10052,7 +11237,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                 target = target_host
             elif proto == "webproxy":
                 _test_token = str(link.get("webproxy_token") or "").strip().lower()
-                target = base + "/" + _test_token + "/tgweb" if _test_token else base + "/tgweb"
+                target = base + "/" + _test_token + "/" if _test_token else base + "/"
                 port = int(link.get("port") or 443)
                 await refresh_proxy_listener_status()
                 if not _proxy_listener_enabled("webproxy"):
@@ -11066,6 +12251,14 @@ async def websocket_tunnel_random(websocket: WebSocket, rand: str, uuid: str):
 async def websocket_tunnel_custom_path(websocket: WebSocket, full_path: str):
     parts = [p for p in full_path.strip("/").split("/") if p]
     if not parts:
+        await websocket.close(code=1008)
+        return
+    _first = parts[0].strip().lower()
+    if _webproxy_valid_token(_first):
+        _wlink = _web_link_for_token(_first)
+        if _wlink is not None:
+            await _forward_ws_to_telemt(websocket, str(_wlink.get("uid", "")), "/" + "/".join(parts))
+            return
         await websocket.close(code=1008)
         return
     uuid = parts[-1]
@@ -14203,1400 +15396,503 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>SulgX Panel</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="/static/chart.umd.js"></script>
 <style>
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
+*{margin: 0; padding: 0; box-sizing: border-box;}
+:root{
 
-:root {
-    --primary: #39ff14;
-    --primary-dim: rgba(57, 255, 20, .18);
-    --primary-glass: rgba(57, 255, 20, .08);
-    --bg: #09090b;
-    --bg2: #111113;
-    --bg3: #18181b;
-    --surface: rgba(18, 18, 20, .75);
-    --surface2: rgba(24, 24, 27, .9);
-    --surface3: rgba(30, 30, 35, .85);
-    --border: rgba(57, 255, 20, .1);
-    --border2: rgba(57, 255, 20, .25);
-    --text: #f0f0f4;
-    --text2: #a1a1aa;
-    --text3: #71717a;
-    --green: #4ade80;
-    --red: #f87171;
-    --yellow: #fbbf24;
-    --header-h: 68px;
-    --footer-h: 52px;
-    --radius-sm: 12px;
-    --radius-md: 18px;
-    --radius-lg: 26px;
-    --shadow: 0 12px 40px rgba(0, 0, 0, .6);
-    --shadow-soft: 0 6px 24px rgba(0, 0, 0, .35);
-    --shadow-glow: 0 0 35px var(--primary-dim);
-    --transition: .3s cubic-bezier(.2, .9, .4, 1);
-    --halo-color-1: rgba(57, 255, 20, .2);
-    --halo-color-2: rgba(57, 255, 20, .1);
-    --halo-color-3: rgba(57, 255, 20, .05);
-}
+  --bg:#0b0c0f;
+  --surface:#131519;
+  --surface-2:#1a1d23;
+  --surface-3:#22262e;
+  --border:#262b33;
+  --border-strong:#3a414c;
+  --text:#f2f3f5;
+  --text-2:#a7adb8;
+  --text-3:#6e7681;
+  --accent:#3b82f6;
+  --accent-hover:#2563eb;
+  --accent-soft:rgba(59,130,246,0.12);
+  --accent-border:rgba(59,130,246,0.35);
+  --on-accent:#ffffff;
+  --success:#4ade80;
+  --success-soft:rgba(74,222,128,0.12);
+  --success-border:rgba(74,222,128,0.35);
+  --success-ink:#166534;
+  --warning:#fbbf24;
+  --warning-soft:rgba(251,191,36,0.12);
+  --warning-border:rgba(251,191,36,0.35);
+  --warning-ink:#92400e;
+  --danger:#f87171;
+  --danger-soft:rgba(248,113,113,0.12);
+  --danger-border:rgba(248,113,113,0.35);
+  --danger-ink:#991b1b;
+  --info:var(--accent);
+  --info-soft:var(--accent-soft);
+  --info-border:var(--accent-border);
+  --focus:rgba(59,130,246,0.55);
+  --radius-xs:4px;
+  --radius-sm:6px;
+  --radius-md:8px;
+  --radius-lg:12px;
+  --radius-xl:16px;
+  --radius-full:9999px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
+  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
+  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
+  --transition:120ms ease-out;
 
-body.light-mode {
-  --primary: #2e7d32;
-  --primary-dim: rgba(46, 125, 50, 0.18);
-  --primary-glass: rgba(46, 125, 50, 0.08);
-  --bg: #f5f9f5;
-  --bg2: #ffffff;
-  --bg3: #eaf1ea;
-  --surface: rgba(255, 255, 255, 0.8);
-  --surface2: rgba(255, 255, 255, 0.94);
-  --surface3: rgba(245, 250, 245, 0.9);
-  --border: rgba(0, 0, 0, 0.1);
-  --border2: rgba(0, 0, 0, 0.18);
-  --text: #1a1a1a;
-  --text2: #4a4a4a;
-  --text3: #5b6b5e;
-  --shadow: 0 12px 36px rgba(0, 0, 0, 0.08);
-  --shadow-soft: 0 6px 20px rgba(0, 0, 0, 0.04);
-  --shadow-glow: 0 0 30px rgba(46, 125, 50, 0.25);
-  --halo-color-1: rgba(46, 125, 50, 0.18);
-  --halo-color-2: rgba(46, 125, 50, 0.1);
-  --halo-color-3: rgba(46, 125, 50, 0.05);
 }
+body.light-mode{
 
-body.blue-mode {
-  --primary: #3b82f6;
-  --primary-dim: rgba(59, 130, 246, 0.18);
-  --primary-glass: rgba(59, 130, 246, 0.08);
-  --bg: #0f172a;
-  --bg2: #1e293b;
-  --bg3: #1e293b;
-  --surface: rgba(30, 41, 59, 0.8);
-  --surface2: rgba(30, 41, 59, 0.94);
-  --surface3: rgba(51, 65, 85, 0.9);
-  --border: rgba(59, 130, 246, 0.12);
-  --border2: rgba(59, 130, 246, 0.3);
-  --text: #e2e8f0;
-  --text2: #94a3b8;
-  --text3: #64748b;
-  --shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  --shadow-soft: 0 6px 24px rgba(0, 0, 0, 0.3);
-  --shadow-glow: 0 0 35px rgba(59, 130, 246, 0.35);
-  --halo-color-1: rgba(59, 130, 246, 0.2);
-  --halo-color-2: rgba(59, 130, 246, 0.1);
-  --halo-color-3: rgba(59, 130, 246, 0.05);
-}
+  --bg:#fafafa;
+  --surface:#ffffff;
+  --surface-2:#f4f4f5;
+  --surface-3:#e4e4e7;
+  --border:#e4e4e7;
+  --border-strong:#d4d4d8;
+  --text:#171717;
+  --text-2:#52525b;
+  --text-3:#71717a;
+  --accent:#1d4ed8;
+  --accent-hover:#1e40af;
+  --accent-soft:rgba(29,78,216,0.08);
+  --accent-border:rgba(29,78,216,0.30);
+  --on-accent:#ffffff;
+  --success:#15803d;
+  --success-soft:#dcfce7;
+  --success-border:#86efac;
+  --warning:#b45309;
+  --warning-soft:#fef3c7;
+  --warning-border:#fcd34d;
+  --danger:#dc2626;
+  --danger-soft:#fee2e2;
+  --danger-border:#fca5a5;
+  --focus:rgba(29,78,216,0.45);
+  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
+  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
+  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
 
-body.light-mode::before,
-body.light-mode::after {
-  display: none;
 }
-html.light-mode::before {
-  display: none;
-}
-body.light-mode {
-  background: #f5f9f5;
-}
-body.light-mode .header {
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 2px 20px rgba(0, 0, 0, 0.08);
-}
-body.light-mode .page-sub {
-  color: #5b6b5e;
-}
-body.light-mode .glass-btn:hover:not(.active) {
-  background: rgba(0, 0, 0, 0.06);
-}
-body.light-mode ::selection {
-  background: #2e7d32;
-  color: #fff;
-}
-body.light-mode .chart-empty-note {
-  color: #5b6b5e;
-}
+body.blue-dark{
 
+  --bg:#0f172a;
+  --surface:#1e293b;
+  --surface-2:#273449;
+  --surface-3:#334155;
+  --border:#2b3a4f;
+  --border-strong:#475569;
+  --text:#e2e8f0;
+  --text-2:#94a3b8;
+  --text-3:#64748b;
 
-.icon {
-  display: inline-block;
-  width: 1.2em; height: 1.2em;
-  background-color: currentColor;
-  mask-size: contain; mask-repeat: no-repeat; mask-position: center;
-  -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center;
-  vertical-align: middle;
 }
-
-.nav-link .nav-icon,
-.btn-icon .icon,
-.stat-card .stat-icon,
-.status-glass-card .status-icon,
-.header-right .btn-icon .icon {
-  display: inline-block;
-  width: 1.2em; height: 1.2em;
-  background-color: currentColor;
-  mask-size: contain; mask-repeat: no-repeat; mask-position: center;
-  -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center;
-  vertical-align: middle;
-}
-
-.icon-dashboard { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E"); }
-.icon-inbounds { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cline x1='12' y1='8' x2='12' y2='16'/%3E%3C/svg%3E"); }
-.icon-cleanip { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71'/%3E%3C/svg%3E"); }
-.icon-scanner { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E"); }
-.icon-logs { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3Cline x1='16' y1='13' x2='8' y2='13'/%3E%3Cline x1='16' y1='17' x2='8' y2='17'/%3E%3C/svg%3E"); }
-.icon-telegram { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E"); }
-.icon-settings { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z'/%3E%3C/svg%3E"); }
-.icon-quick-add { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cline x1='12' y1='5' x2='12' y2='19'/%3E%3Cline x1='5' y1='12' x2='19' y2='12'/%3E%3C/svg%3E"); }
-.icon-theme-dark { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z'/%3E%3C/svg%3E"); }
-.icon-theme-light { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='5'/%3E%3Cline x1='12' y1='1' x2='12' y2='3'/%3E%3Cline x1='12' y1='21' x2='12' y2='23'/%3E%3Cline x1='4.22' y1='4.22' x2='5.64' y2='5.64'/%3E%3Cline x1='18.36' y1='18.36' x2='19.78' y2='19.78'/%3E%3Cline x1='1' y1='12' x2='3' y2='12'/%3E%3Cline x1='21' y1='12' x2='23' y2='12'/%3E%3Cline x1='4.22' y1='19.78' x2='5.64' y2='18.36'/%3E%3Cline x1='18.36' y1='5.64' x2='19.78' y2='4.22'/%3E%3C/svg%3E"); }
-.icon-logout { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4'/%3E%3Cpolyline points='16 17 21 12 16 7'/%3E%3Cline x1='21' y1='12' x2='9' y2='12'/%3E%3C/svg%3E"); }
-.icon-traffic { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.971M15 13l-3 3m0 0l-3-3m3 3V8'/%3E%3C/svg%3E"); }
-.icon-requests { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E"); }
-.icon-uptime { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpolyline points='12 6 12 12 16 14'/%3E%3C/svg%3E"); }
-.icon-disk { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M4 7v10c0 2 2 3.5 8 3.5s8-1.5 8-3.5V7M4 7c0 2 2 3.5 8 3.5s8-1.5 8-3.5M4 7c0-2 2-3.5 8-3.5s8 1.5 8 3.5'/%3E%3C/svg%3E"); }
-.icon-download { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'/%3E%3Cpolyline points='7 10 12 15 17 10'/%3E%3Cline x1='12' y1='15' x2='12' y2='3'/%3E%3C/svg%3E"); }
-.icon-upload { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'/%3E%3Cpolyline points='17 8 12 3 7 8'/%3E%3Cline x1='12' y1='3' x2='12' y2='15'/%3E%3C/svg%3E"); }
-.icon-monthly { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='4' width='18' height='18' rx='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E"); }
-.icon-logging { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3C/svg%3E"); }
-.icon-auto-disable { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='4.93' y1='4.93' x2='19.07' y2='19.07'/%3E%3C/svg%3E"); }
-.icon-tg-reports { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z'/%3E%3C/svg%3E"); }
-.icon-tg-notify { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9'/%3E%3Cpath d='M13.73 21a2 2 0 01-3.46 0'/%3E%3C/svg%3E"); }
-.icon-bot { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='4' width='18' height='14' rx='2'/%3E%3Cline x1='12' y1='18' x2='12' y2='20'/%3E%3Cline x1='8' y1='20' x2='16' y2='20'/%3E%3C/svg%3E"); }
-.icon-stealth { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z'/%3E%3C/svg%3E"); }
-.icon-github { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z'/%3E%3C/svg%3E"); }
-.icon-telegram-link { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E"); }
-
-
-html, body {
-  height: 100%;
-  overflow-x: hidden;
-}
-
-body {
-  font-family: 'Inter', 'Vazirmatn', sans-serif;
-  color: var(--text);
-  display: flex;
-  flex-direction: column;
-  background: var(--bg);
-  transition: background 0.5s, color 0.5s;
-  position: relative;
-  line-height: 1.65;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-tap-highlight-color: transparent;
-}
-
-body::before {
-  content: '';
-  position: fixed;
-  top: -45%;
-  left: -25%;
-  width: 85%;
-  height: 100%;
-  background: radial-gradient(ellipse at 35% 45%, var(--halo-color-1) 0%, transparent 65%);
-  animation: haloFloat1 28s infinite alternate ease-in-out;
-  z-index: 0;
-  pointer-events: none;
-  filter: blur(65px);
-  mix-blend-mode: screen;
-}
-
-body::after {
-  content: '';
-  position: fixed;
-  bottom: -50%;
-  right: -25%;
-  width: 85%;
-  height: 100%;
-  background: radial-gradient(ellipse at 65% 55%, var(--halo-color-2) 0%, transparent 65%);
-  animation: haloFloat2 32s infinite alternate ease-in-out;
-  z-index: 0;
-  pointer-events: none;
-  filter: blur(85px);
-  mix-blend-mode: screen;
-}
-
-html::before {
-  content: '';
-  position: fixed;
-  top: 20%;
-  left: 20%;
-  width: 60%;
-  height: 60%;
-  background: radial-gradient(circle at 50% 50%, var(--halo-color-3) 0%, transparent 70%);
-  animation: haloSpin 45s infinite linear;
-  z-index: 0;
-  pointer-events: none;
-  filter: blur(110px);
-  mix-blend-mode: screen;
-}
-
-@keyframes haloFloat1 {
-  0% { transform: translate(0, 0) scale(1); }
-  100% { transform: translate(8%, 10%) scale(1.15); }
-}
-@keyframes haloFloat2 {
-  0% { transform: translate(0, 0) scale(1); }
-  100% { transform: translate(-8%, -10%) scale(1.15); }
-}
-@keyframes haloSpin {
-  from { transform: rotate(0deg) scale(1); }
-  to { transform: rotate(360deg) scale(1.3); }
-}
-
-.header, .main, .footer, .mo, .toast, #login-page, #dashboard-page {
-  position: relative;
-  z-index: 1;
-}
-
-body[dir="rtl"] {
-  direction: rtl;
-  text-align: right;
-}
+body.light-mode ::selection{ background:var(--accent); color:var(--on-accent); }
+.icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
+.nav-link .nav-icon, .btn-icon .icon, .stat-card .stat-icon, .status-card .status-icon, .header-right .btn-icon .icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
+.icon-dashboard{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E");}
+.icon-inbounds{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cline x1='12' y1='8' x2='12' y2='16'/%3E%3C/svg%3E");}
+.icon-cleanip{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71'/%3E%3C/svg%3E");}
+.icon-scanner{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");}
+.icon-logs{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3Cline x1='16' y1='13' x2='8' y2='13'/%3E%3Cline x1='16' y1='17' x2='8' y2='17'/%3E%3C/svg%3E");}
+.icon-telegram{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E");}
+.icon-settings{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z'/%3E%3C/svg%3E");}
+.icon-quick-add{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cline x1='12' y1='5' x2='12' y2='19'/%3E%3Cline x1='5' y1='12' x2='19' y2='12'/%3E%3C/svg%3E");}
+.icon-theme-dark{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z'/%3E%3C/svg%3E");}
+.icon-theme-light{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='5'/%3E%3Cline x1='12' y1='1' x2='12' y2='3'/%3E%3Cline x1='12' y1='21' x2='12' y2='23'/%3E%3Cline x1='4.22' y1='4.22' x2='5.64' y2='5.64'/%3E%3Cline x1='18.36' y1='18.36' x2='19.78' y2='19.78'/%3E%3Cline x1='1' y1='12' x2='3' y2='12'/%3E%3Cline x1='21' y1='12' x2='23' y2='12'/%3E%3Cline x1='4.22' y1='19.78' x2='5.64' y2='18.36'/%3E%3Cline x1='18.36' y1='5.64' x2='19.78' y2='4.22'/%3E%3C/svg%3E");}
+.icon-logout{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4'/%3E%3Cpolyline points='16 17 21 12 16 7'/%3E%3Cline x1='21' y1='12' x2='9' y2='12'/%3E%3C/svg%3E");}
+.icon-traffic{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.971M15 13l-3 3m0 0l-3-3m3 3V8'/%3E%3C/svg%3E");}
+.icon-requests{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E");}
+.icon-uptime{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpolyline points='12 6 12 12 16 14'/%3E%3C/svg%3E");}
+.icon-disk{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M4 7v10c0 2 2 3.5 8 3.5s8-1.5 8-3.5V7M4 7c0 2 2 3.5 8 3.5s8-1.5 8-3.5M4 7c0-2 2-3.5 8-3.5s8 1.5 8 3.5'/%3E%3C/svg%3E");}
+.icon-download{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'/%3E%3Cpolyline points='7 10 12 15 17 10'/%3E%3Cline x1='12' y1='15' x2='12' y2='3'/%3E%3C/svg%3E");}
+.icon-upload{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'/%3E%3Cpolyline points='17 8 12 3 7 8'/%3E%3Cline x1='12' y1='3' x2='12' y2='15'/%3E%3C/svg%3E");}
+.icon-monthly{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='4' width='18' height='18' rx='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E");}
+.icon-logging{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z'/%3E%3Cpolyline points='14 2 14 8 20 8'/%3E%3C/svg%3E");}
+.icon-auto-disable{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='4.93' y1='4.93' x2='19.07' y2='19.07'/%3E%3C/svg%3E");}
+.icon-tg-reports{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z'/%3E%3C/svg%3E");}
+.icon-tg-notify{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9'/%3E%3Cpath d='M13.73 21a2 2 0 01-3.46 0'/%3E%3C/svg%3E");}
+.icon-bot{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='4' width='18' height='14' rx='2'/%3E%3Cline x1='12' y1='18' x2='12' y2='20'/%3E%3Cline x1='8' y1='20' x2='16' y2='20'/%3E%3C/svg%3E");}
+.icon-stealth{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z'/%3E%3C/svg%3E");}
+.icon-github{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z'/%3E%3C/svg%3E");}
+.icon-telegram-link{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E");}
+html, body{height: 100%; }
+body{font-family:var(--font-sans); color: var(--text); display: flex; flex-direction: column; background: var(--bg); transition:background-color 120ms ease-out,color 120ms ease-out; position: relative; line-height:1.55; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; -webkit-tap-highlight-color: transparent;}
+.header, .main, .footer, .mo, .toast, #login-page, #dashboard-page{position: relative; z-index: 1;}
+body[dir="rtl"]{direction: rtl; text-align: right;}
 body[dir="rtl"] .fl,
-body[dir="rtl"] label {
-  float: right !important;
-  text-align: right !important;
-  margin-bottom: 6px;
-}
+body[dir="rtl"] label{float: right !important; text-align: right !important; margin-bottom: 6px;}
 body[dir="rtl"] .fi,
 body[dir="rtl"] select,
-body[dir="rtl"] input {
-  direction: ltr !important;
-  text-align: left !important;
-}
-body[dir="rtl"] .glass-btn-group {
-  direction: rtl !important;
-}
-
-a { text-decoration: none; color: inherit; }
-
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--surface); border-radius: 10px; }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 10px; transition: background 0.3s; }
-::-webkit-scrollbar-thumb:hover { background: var(--primary-glass); }
-* { scrollbar-width: thin; scrollbar-color: var(--border2) var(--surface); }
-
-::selection {
-  background: var(--primary);
-  color: #000;
-}
-
-
-.header {
-  min-height: var(--header-h);
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 28px;
-  backdrop-filter: blur(30px) saturate(150%);
-  position: sticky;
-  top: 0;
-  z-index: 101;
-  box-shadow: 0 2px 20px rgba(0,0,0,0.2);
-}
-.header-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  max-width: 1440px;
-  flex-wrap: nowrap;
-  gap: 16px;
-}
-.logo {
-  font-family: 'Orbitron', sans-serif;
-  font-size: 1.9rem;
-  font-weight: 900;
-  color: var(--primary);
-  letter-spacing: 2px;
-  text-shadow: 0 0 20px var(--primary-dim);
-  transition: text-shadow 0.3s, transform 0.3s;
-  flex-shrink: 0;
-}
-.logo:hover {
-  text-shadow: 0 0 38px var(--primary-dim);
-  transform: scale(1.04);
-}
-.version-tag {
-  font-size: 0.7rem;
-  color: var(--primary);
-  margin-inline-start: 10px;
-  font-weight: 500;
-  opacity: 0.95;
-  background: var(--primary-glass);
-  padding: 3px 12px;
-  border-radius: 20px;
-  flex-shrink: 0;
-}
-.header-nav { display: flex; align-items: center; gap: 8px; }
-.nav-link {
-  display: flex;                
-  flex-direction: column;       
-  align-items: center;
-  gap: 4px;
-  padding: 10px 20px;
-  border-radius: var(--radius-sm);
-  color: var(--text3);
-  font-size: 0.88rem;
-  font-weight: 600;
-  transition: all var(--transition);
-  border: 1px solid transparent;
-  background: none;
-  cursor: pointer;
-  font-family: inherit;
-  position: relative;
-  overflow: hidden;
-}
-.nav-link::after {
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: 50%;
-  width: 0;
-  height: 2px;
-  background: var(--primary);
-  transition: all var(--transition);
-  transform: translateX(-50%);
-}
-.nav-link:hover {
-  color: var(--primary);
-  background: var(--primary-glass);
-  border-color: transparent;
-}
-.nav-link:hover::after { width: 75%; }
-.nav-link.active {
-  color: var(--primary);
-  background: var(--primary-glass);
-  border-color: var(--primary-dim);
-  backdrop-filter: blur(10px);
-  box-shadow: 0 0 20px var(--primary-dim);
-}
-.nav-link.active::after { width: 95%; }
-.header-right { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; }
-.btn-icon {
-  background: var(--surface3);
-  border: 1px solid var(--border);
-  color: var(--text3);
-  border-radius: var(--radius-sm);
-  padding: 10px;
-  cursor: pointer;
-  transition: all var(--transition);
-  font-size: 1.1rem;
-  backdrop-filter: blur(8px);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.btn-icon:hover {
-  color: var(--primary);
-  border-color: var(--primary);
-  background: var(--primary-glass);
-  box-shadow: 0 0 18px var(--primary-dim);
-  transform: translateY(-2px);
-}
-.lang-switch {
-  display: flex;
-  gap: 2px;
-  background: var(--surface3);
-  border-radius: var(--radius-sm);
-  padding: 3px;
-  backdrop-filter: blur(8px);
-}
-.lang-btn {
-  padding: 6px 14px;
-  border: none;
-  background: transparent;
-  color: var(--text3);
-  font-size: 0.8rem;
-  font-weight: 700;
-  border-radius: 8px;
-  cursor: pointer;
-  font-family: inherit;
-  transition: all var(--transition);
-}
-.lang-btn.active {
-  background: var(--primary);
-  color: #000;
-  box-shadow: 0 0 16px var(--primary-dim);
-}
-.hamburger {
-  display: none;
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text3);
-  font-size: 1.9rem;
-  cursor: pointer;
-  padding: 4px 12px;
-  border-radius: var(--radius-sm);
-}
-
-
-.main {
-  flex: 1;
-  min-height: calc(100vh - var(--header-h) - var(--footer-h));
-  padding: 36px 48px;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
-.page { display: none; animation: pgIn 0.45s ease; }
-.page.active { display: block; }
-@keyframes pgIn {
-  from { opacity: 0; transform: translateY(18px); }
-  to { opacity: 1; transform: none; }
-}
-.page-header {
-  margin-bottom: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 16px;
-}
-.page-title {
-  font-size: 2rem;
-  font-weight: 800;
-  color: var(--primary);
-  letter-spacing: -0.03em;
-  text-shadow: 0 0 18px var(--primary-dim);
-}
-.page-title[data-fa] { font-family: 'Vazirmatn'; }
-.page-sub { font-size: 1rem; color: var(--text3); margin-top: 6px; }
-
-
-.stats-row {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 24px;
-  margin-bottom: 34px;
-}
-.stat-card {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 28px;
-  position: relative;
-  overflow: hidden;
-  transition: all var(--transition);
-  backdrop-filter: blur(18px);
-  cursor: default;
-  container-type: inline-size;
-}
-.stat-card::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  inset-inline-start: 0;
-  width: 5px;
-  height: 100%;
-  background: linear-gradient(180deg, var(--primary), transparent);
-  opacity: 0;
-  transition: opacity var(--transition);
-}
-.stat-card:hover {
-  border-color: var(--border2);
-  transform: translateY(-4px);
-  box-shadow: var(--shadow-soft), 0 0 50px var(--primary-dim);
-}
-.stat-card:hover::before { opacity: 1; }
-.stat-label {
-  font-size: 0.75rem;
-  color: var(--text3);
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  margin-bottom: 14px;
-}
-.stat-val {
-  font-size: 2.2rem;
-  font-weight: 800;
-  color: var(--text);
-  transition: color 0.3s;
-}
-.stat-card:hover .stat-val { color: var(--primary); }
-.stat-unit { font-size: 1rem; font-weight: 400; color: var(--text3); }
-
+body[dir="rtl"] input{direction: ltr !important; text-align: left !important;}
+body[dir="rtl"] .seg-group{direction: rtl !important;}
+a{text-decoration: none; color: inherit;}
+::-webkit-scrollbar{width: 6px; height: 6px;}
+::-webkit-scrollbar-track{background: var(--surface); border-radius: 10px;}
+::-webkit-scrollbar-thumb{background: var(--border-strong); border-radius: 10px; transition:background-color 120ms ease-out;}
+::-webkit-scrollbar-thumb:hover{background: var(--accent-soft);}
+*{scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--surface);}
+::selection{background: var(--accent); color:var(--on-accent);}
+.header{min-height:56px; background:var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: center; padding:0 16px; position: sticky; top: 0; z-index: 101; }
+.header-inner{display: flex; align-items: center; justify-content: space-between; width: 100%; max-width: 1200px; flex-wrap:wrap; gap: 16px;}
+.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
+.logo::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none;}
+.version-tag{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-full);padding:2px 8px;}
+.header-nav{display:flex;flex-wrap:wrap;gap:8px; align-items: center; gap: 8px;}
+.nav-link{display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 20px; border-radius: var(--radius-sm); color: var(--text-3); font-size: 0.88rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border: 1px solid transparent; background: none; cursor: pointer; font-family: inherit; position: relative; overflow: hidden;}
+.nav-link::after{content: ''; position: absolute; bottom: 0; left: 50%; width: 0; height: 2px; background: var(--accent); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; transform: translateX(-50%);}
+.nav-link:hover{color: var(--accent); background: var(--accent-soft); border-color: transparent;}
+.nav-link:hover::after{width: 75%;}
+.nav-link.active{color:var(--accent); background:var(--accent-soft); border-color:var(--accent);}
+.nav-link.active::after{width: 95%;}
+.header-right{display: flex; align-items: center; gap: 10px; flex-wrap: nowrap;}
+.btn-icon{background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); border-radius: var(--radius-sm); padding: 10px; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; font-size: 1.1rem; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;}
+.btn-icon:hover{color: var(--accent); border-color: var(--accent); background: var(--accent-soft); transform: translateY(-2px);}
+.lang-switch{display: flex; gap: 2px; background: var(--surface-3); border-radius: var(--radius-sm); padding: 3px;}
+.lang-btn{padding: 6px 14px; border: none; background: transparent; color: var(--text-3); font-size: 0.8rem; font-weight: 700; border-radius: 8px; cursor: pointer; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.lang-btn.active{background: var(--accent); color:var(--on-accent);}
+.hamburger{display: none; background: transparent; border: 1px solid var(--border); color: var(--text-3); font-size: 1.9rem; cursor: pointer; padding: 4px 12px; border-radius: var(--radius-sm);}
+.main{flex: 1; min-height: calc(100vh - 56px - 52px); padding:24px 16px; overflow-y: auto; overflow-x: hidden;}
+.page{display: none;}
+.page.active{display: block;}
+.page-header{margin-bottom: 32px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;}
+.page-title{font-size:20px; font-weight:600; color:var(--text); letter-spacing:-0.02em;}
+.page-title[data-fa]{font-family: 'Vazirmatn';}
+.page-sub{font-size: 1rem; color: var(--text-3); margin-top: 6px;}
+.stats-row{display: grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px; margin-bottom: 34px;}
+.stat-card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding:16px; position: relative; overflow: hidden; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; cursor: default; container-type: inline-size;}
+.stat-card:hover{border-color: var(--border-strong); }
+.stat-label{font-size: 0.75rem; color: var(--text-3); font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 14px;}
+.stat-val{font-size: 2.2rem; font-weight: 800; color: var(--text); transition:color 120ms ease-out;}
+.stat-card:hover .stat-val{color: var(--accent);}
+.stat-unit{font-size: 1rem; font-weight: 400; color: var(--text-3);}
 @container (max-width: 200px) {
-  .stat-val { font-size: 1.4rem; }
+.stat-val{font-size: 1.4rem;}
 }
-
-
-.speed-card {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  transition: all var(--transition);
-  backdrop-filter: blur(18px);
-}
-.speed-card:hover { border-color: var(--border2); box-shadow: var(--shadow-soft), var(--shadow-glow); }
-.speed-row { display: flex; flex-direction: column; gap: 14px; }
-.speed-item { display: flex; justify-content: space-between; align-items: center; }
-.speed-item .stat-label { margin-bottom: 0; font-size: 0.8rem; }
-.speed-item .stat-val { font-size: 1.4rem; }
-
-
-.card {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 30px;
-  margin-bottom: 22px;
-  transition: all var(--transition);
-  backdrop-filter: blur(20px) saturate(110%);
-}
-.card:hover {
-  border-color: var(--border2);
-  box-shadow: var(--shadow-soft), 0 0 45px var(--primary-dim);
-}
-.card-hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
-.card-title { font-size: 1.15rem; font-weight: 600; color: var(--text); }
-.chart-container { height: 280px; width: 100%; }
-
-
-.btn {
-  font-family: inherit;
-  font-size: 0.88rem;
-  font-weight: 700;
-  border-radius: var(--radius-sm);
-  padding: 12px 26px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  border: none;
-  transition: all var(--transition);
-  backdrop-filter: blur(10px);
-  position: relative;
-  overflow: hidden;
-  letter-spacing: 0.3px;
-}
-.btn::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(45deg, transparent, rgba(255,255,255,0.2), transparent);
-  transform: translateX(-100%);
-  transition: transform 0.8s;
-}
-.btn:hover::after { transform: translateX(100%); }
-.btn:active { transform: scale(0.97); }
-.btn-primary {
-  background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 80%, black));
-  color: #000;
-  box-shadow: 0 6px 28px var(--primary-dim);
-}
-.btn-primary:hover {
-  filter: brightness(1.2);
-  box-shadow: 0 10px 40px var(--primary-dim);
-  transform: translateY(-3px);
-}
-.btn-primary:active { transform: translateY(0) scale(0.97); }
-.btn-outline {
-  background: var(--surface3);
-  color: var(--text);
-  border: 1px solid var(--border);
-}
-.btn-outline:hover {
-  background: var(--primary-glass);
-  border-color: var(--primary);
-  color: var(--primary);
-  box-shadow: 0 0 28px var(--primary-dim);
-}
-.btn-danger {
-  background: rgba(248,113,113,0.12);
-  color: var(--red);
-  border: 1px solid rgba(248,113,113,0.3);
-}
-.btn-danger:hover {
-  background: rgba(248,113,113,0.25);
-  box-shadow: 0 0 28px rgba(248,113,113,0.35);
-}
-.btn-sm { padding: 8px 18px; font-size: 0.78rem; }
-
-
-.tbl-wrap { overflow-x: auto; border-radius: var(--radius-sm); }
-.tbl {
-  width: 100%;
-  border-collapse: collapse;
-  table-layout: auto;
-  background: transparent;
-}
-.tbl th {
-  text-align: center;
-  font-size: 0.78rem;
-  font-weight: 700;
-  color: var(--text3);
-  padding: 18px 16px;
-  text-transform: uppercase;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface3);
-  letter-spacing: 0.08em;
-  backdrop-filter: blur(6px);
-  position: sticky;
-  top: 0;
-  z-index: 1;
-}
-.tbl td {
-  padding: 17px 16px;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.9rem;
-  word-break: normal;
-  overflow-wrap: break-word;
-  font-weight: 400;
-  background: none;
-  color: var(--text);
-  transition: background var(--transition), color var(--transition);
-  vertical-align: middle;
-  text-align: center;
-}
-.tbl tbody tr:hover td {
-  background: var(--primary-glass);
-}
-.tbl tbody tr:nth-child(even) td {
-  background: rgba(255,255,255,0.02);
-}
-
-#inbound-table th, #inbound-table td {
-  text-align: center !important;
-}
-#inbound-table td:first-child, #inbound-table th:first-child { width: 50px; }
-#inbound-table th:nth-child(8), #inbound-table td:nth-child(8) { min-width: 180px; }
-.tbl input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--primary); cursor: pointer; }
-.time-col { white-space: nowrap; min-width: 130px; text-align: center; }
-
-#login-logs-table {
-  table-layout: fixed;
-  width: 100%;
-  border-collapse: collapse;
-}
-
+.speed-card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px; display: flex; flex-direction: column; gap: 16px; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.speed-card:hover{border-color: var(--border-strong); box-shadow: var(--shadow-sm), var(--shadow-sm);}
+.speed-row{display: flex; flex-direction: column; gap: 14px;}
+.speed-item{display: flex; justify-content: space-between; align-items: center;}
+.speed-item .stat-label{margin-bottom: 0; font-size: 0.8rem;}
+.speed-item .stat-val{font-size: 1.4rem;}
+.card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding:16px; margin-bottom: 22px; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.card:hover{border-color: var(--border-strong);}
+.card-hd{display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px;}
+.card-title{font-size: 1.15rem; font-weight: 600; color: var(--text);}
+.chart-container{height: 280px; width: 100%;}
+.btn{font-family: inherit; font-size:14px; font-weight:500; border-radius:6px; padding:8px 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; border: none; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; position: relative; overflow: hidden; letter-spacing: 0.3px;}
+.btn:active{transform: scale(0.97);}
+.btn-primary{background:var(--accent); color:var(--on-accent); box-shadow:var(--shadow-sm);}
+.btn-primary:hover{ }
+.btn-primary:active{transform: translateY(0) scale(0.97);}
+.btn-outline{background:var(--surface); color: var(--text); border:1px solid var(--border-strong);}
+.btn-outline:hover{background: var(--accent-soft); border-color: var(--accent); color: var(--accent);}
+.btn-danger{background:var(--danger); color:#fff; border: 1px solid rgba(248,113,113,0.3);}
+.btn-danger:hover{background:var(--danger);}
+.btn-sm{padding: 8px 18px; font-size: 0.78rem;}
+.tbl-wrap{overflow-x: auto; border-radius: var(--radius-sm);}
+.tbl{width: 100%; border-collapse: collapse; table-layout: auto; background: transparent;}
+.tbl th{text-align: center; font-size: 0.78rem; font-weight: 700; color: var(--text-3); padding:12px 16px; text-transform: uppercase; border-bottom: 1px solid var(--border); background: var(--surface-3); letter-spacing: 0.08em; position: sticky; top: 0; z-index: 1;}
+.tbl td{padding:12px 16px; border-bottom: 1px solid var(--border); font-size: 0.9rem; word-break: normal; overflow-wrap: break-word; font-weight: 400; background: none; color: var(--text); transition:background-color 120ms ease-out, color 120ms ease-out; vertical-align: middle; text-align: center;}
+.tbl tbody tr:hover td{background: var(--accent-soft);}
+.tbl tbody tr:nth-child(even) td{background: rgba(255,255,255,0.02);}
+#inbound-table th, #inbound-table td{text-align: center !important;}
+#inbound-table td:first-child, #inbound-table th:first-child{width: 50px;}
+#inbound-table th:nth-child(8), #inbound-table td:nth-child(8){min-width:0;}
+.tbl input[type="checkbox"]{width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer;}
+.time-col{white-space: nowrap;  text-align: center;}
+#login-logs-table{table-layout: fixed; width: 100%; border-collapse: collapse;}
 #login-logs-table th,
-#login-logs-table td {
-  text-align: center;
-  vertical-align: middle;
-  word-break: break-word;
-  overflow-wrap: break-word;
-}
-
+#login-logs-table td{text-align: center; vertical-align: middle; word-break: break-word; overflow-wrap: break-word;}
 #login-logs-table th:first-child,
-#login-logs-table td:first-child { width: 15%; }
-
+#login-logs-table td:first-child{width: 15%;}
 #login-logs-table th:nth-child(2),
-#login-logs-table td:nth-child(2) {
-  width: 30%;
-  text-align: start;
-  padding-inline-start: 12px;
-  padding-inline-end: 8px;
-}
-
+#login-logs-table td:nth-child(2){width: 30%; text-align: start; padding-inline-start: 12px; padding-inline-end: 8px;}
 #login-logs-table th:nth-child(3),
-#login-logs-table td:nth-child(3) { width: 15%; }
-
+#login-logs-table td:nth-child(3){width: 15%;}
 #login-logs-table th:nth-child(4),
-#login-logs-table td:nth-child(4) { width: 20%; }
-
+#login-logs-table td:nth-child(4){width: 20%;}
 #login-logs-table th:nth-child(5),
-#login-logs-table td:nth-child(5) { width: 20%; }
-
-
-#logs-table th, #logs-tbody td {
-  text-align: center !important;
-  vertical-align: middle !important;
-}
-
+#login-logs-table td:nth-child(5){width: 20%;}
+#logs-table th, #logs-tbody td{text-align: center !important; vertical-align: middle !important;}
 .tbl.scanner-tbl th:first-child,
-.tbl.scanner-tbl td:first-child {
-  width: auto;
-  text-align: left;
-}
-
-
-.tag {
-  display: inline-flex;
-  align-items: center;
-  padding: 5px 14px;
-  border-radius: 10px;
-  font-size: 0.68rem;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-.tag-vless { background: var(--primary-dim); color: var(--primary); border: 1px solid var(--border); }
-.tag-on { background: rgba(74,222,128,0.2); color: var(--green); border: 1px solid rgba(74,222,128,0.4); }
-.tag-off { background: rgba(248,113,113,0.2); color: var(--red); border: 1px solid rgba(248,113,113,0.4); }
-.pill { display: flex; align-items: center; gap: 12px; font-size: 0.9rem; }
-.pill-used { color: var(--text); font-weight: 600; }
-.pill-bar { flex: 1; height: 8px; background: var(--border); border-radius: 5px; min-width: 30px; overflow: hidden; }
-.pill-fill { height: 100%; border-radius: 5px; transition: width 0.5s ease; }
-.pill-lim { color: var(--text3); font-size: 0.78rem; }
-
-
-.toggle {
-  width: 52px;
-  height: 30px;
-  border-radius: 15px;
-  background: var(--surface3);
-  position: relative;
-  cursor: pointer;
-  transition: all var(--transition);
-  border: 2px solid var(--border);
-  flex-shrink: 0;
-}
-.toggle::after {
-  content: '';
-  position: absolute;
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: var(--text3);
-  top: 1px;
-  inset-inline-start: 2px;
-  transition: all var(--transition);
-}
-.toggle.on {
-  background: var(--green);
-  border-color: var(--green);
-  box-shadow: 0 0 24px rgba(74,222,128,0.6);
-}
-.toggle.on::after {
-  inset-inline-end: 2px;
-  background: #fff;
-}
-
-
-.sys-bar { height: 10px; background: var(--border); border-radius: 6px; overflow: hidden; }
-.hc-spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--primary); border-radius:50%; animation:hc-rot 0.8s linear infinite; vertical-align:-2px; }
+.tbl.scanner-tbl td:first-child{width: auto; text-align: left;}
+.tag{display: inline-flex; align-items: center; padding: 5px 14px; border-radius: 10px; font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;}
+.tag-vless{background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);}
+.tag-on{background:var(--success-soft);color:var(--success);border:1px solid var(--success-border);}
+.tag-off{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger-border);}
+.pill{display: flex; align-items: center; gap: 12px; font-size: 0.9rem;}
+.pill-used{color: var(--text); font-weight: 600;}
+.pill-bar{flex: 1; height: 8px; background: var(--border); border-radius: 5px; min-width: 30px; overflow: hidden;}
+.pill-fill{height: 100%; border-radius: 5px; transition:width 150ms ease-out;}
+.pill-lim{color: var(--text-3); font-size: 0.78rem;}
+.toggle{width: 52px; height: 30px; border-radius: 15px; background: var(--surface-3); position: relative; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border: 2px solid var(--border); flex-shrink: 0;}
+.toggle::after{content: ''; position: absolute; width: 24px; height: 24px; border-radius: 50%; background: var(--text-3); top: 1px; inset-inline-start: 2px; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.toggle.on{background: var(--success); border-color: var(--success);}
+.toggle.on::after{inset-inline-end: 2px; background: var(--text);}
+.sys-bar{height: 10px; background: var(--border); border-radius: 6px; overflow: hidden;}
+.hc-spin{display:inline-block; width: 12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:hc-rot 150ms linear infinite; vertical-align:-2px;}
 @keyframes hc-rot { to { transform:rotate(360deg); } }
-.sys-fill { height: 100%; border-radius: 6px; transition: width 0.8s ease; }
-
-
-.sl-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 0;
-  border-bottom: 1px solid var(--border);
-}
-.sl-k { color: var(--text3); font-size: 0.98rem; }
-.sl-v { color: var(--text); font-weight: 600; font-size: 0.98rem; }
-
-
-.fg { display: flex; flex-direction: column; gap: 10px; margin-bottom: 26px; }
-.fl {
-  font-size: 0.78rem;
-  font-weight: 700;
-  color: var(--text2);
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-}
-.fi, .fs {
-  padding: 16px 22px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  font-family: inherit;
-  font-size: 0.92rem;
-  outline: none;
-  color: var(--text);
-  background: var(--surface);
-  transition: all var(--transition);
-  backdrop-filter: blur(8px);
-  width: 100%;
-}
-.fi:focus, .fs:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 5px var(--primary-dim);
-}
-
-
-.act-btn {
-  font-family: inherit;
-  font-size: 0.72rem;
-  font-weight: 700;
-  padding: 6px 12px;
-  border-radius: 7px;
-  cursor: pointer;
-  border: 1px solid;
-  transition: all 0.2s;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: transparent;
-}
-.act-btn:active { transform: scale(0.95); }
-.act-copy { color: var(--primary); border-color: var(--border); } .act-copy:hover { background: var(--primary-glass); }
-.act-sub { color: var(--green); border-color: rgba(74,222,128,0.4); } .act-sub:hover { background: rgba(74,222,128,0.2); }
-.act-clash { color: #c084fc; border-color: #c084fc40; } .act-clash:hover { background: #c084fc20; }
-.act-qr { color: #a78bfa; border-color: #a78bfa40; } .act-qr:hover { background: #a78bfa20; }
-.act-edit { color: var(--yellow); border-color: rgba(251,191,36,0.4); } .act-edit:hover { background: rgba(251,191,36,0.2); }
-.act-del { color: var(--red); border-color: rgba(248,113,113,0.4); } .act-del:hover { background: rgba(248,113,113,0.25); }
-.row-act-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; width: 100%; direction: ltr; }
-.row-act-top { display: flex; align-items: center; min-width: 0; }
-.row-act-grid { display: grid; grid-template-columns: repeat(5, 32px); gap: 6px; justify-content: start; min-width: 0; max-width: 100%; direction: ltr; }
-.row-act-grid .tooltip-container { display: inline-flex; width: 32px; height: 32px; min-width: 32px; min-height: 32px; }
-.row-act-grid .act-btn { width: 32px; height: 32px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px; padding: 0; font-size: 0.95rem; line-height: 1; justify-content: center; flex-shrink: 0; box-sizing: border-box; overflow: hidden; white-space: nowrap; }
-.row-act-grid .act-btn-xray { font-size: 0.85rem; font-weight: 800; }
-body[dir="rtl"] .row-act-grid { direction: ltr; }
-.row-act-note { color: var(--red); font-size: 0.8rem; max-width: 220px; text-align: left; }
-
-
-.toast {
-  position: fixed;
-  bottom: 40px;
-  left: 50%;
-  transform: translateX(-50%) translateY(20px);
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border2);
-  border-radius: var(--radius-md);
-  padding: 18px 40px;
-  font-size: 1rem;
-  font-weight: 600;
-  opacity: 0;
-  transition: all 0.45s ease;
-  z-index: 999;
-  backdrop-filter: blur(30px);
-  box-shadow: var(--shadow-soft);
-  pointer-events: none;
-  max-width: 90vw;
-  text-align: center;
-}
-.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
-
-
-.mo {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.8);
-  z-index: 200;
-  display: none;
-  align-items: flex-start;
-  justify-content: center;
-  backdrop-filter: blur(14px);
-  animation: fadeIn 0.3s ease;
-  padding: 20px 12px;
-  overflow-y: auto;
-  box-sizing: border-box;
-}
-.mo.show { display: flex; }
+.sys-fill{height: 100%; border-radius: 6px; transition:width 150ms ease-out;}
+.sl-item{display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid var(--border);}
+.sl-k{color: var(--text-3); font-size: 0.98rem;}
+.sl-v{color: var(--text); font-weight: 600; font-size: 0.98rem;}
+.fg{display: flex; flex-direction: column; gap: 10px; margin-bottom: 26px;}
+.fl{font-size:12px; font-weight:500; color:var(--text-2); text-transform: uppercase; letter-spacing: 0.07em;}
+.fi, .fs{padding: 16px 22px; border-radius: var(--radius-sm); border: 1px solid var(--border); font-family: inherit; font-size: 0.92rem; outline: none; color: var(--text); background: var(--surface); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; width: 100%;}
+.fi:focus, .fs:focus{border-color: var(--accent);}
+.act-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--text-2);cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;}
+.act-btn:active{}
+.act-del{color:var(--danger);border-color:var(--danger-border);}
+.act-del:hover{background:var(--danger-soft);color:var(--danger);}
+.row-act-wrap{display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; width: 100%; direction: ltr;}
+.row-act-top{display: flex; align-items: center; min-width: 0;}
+.row-act-grid{display: grid; grid-template-columns: repeat(5, 32px); gap: 6px; justify-content: start; min-width: 0; max-width: 100%; direction: ltr;}
+.row-act-grid .tooltip-container{display: inline-flex; width: 32px; height: 32px; min-width: 32px; min-height: 32px;}
+.row-act-grid .act-btn{width: 32px; height: 32px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px; padding: 0; font-size: 0.95rem; line-height: 1; justify-content: center; flex-shrink: 0; box-sizing: border-box; overflow: hidden; white-space: nowrap;}
+.row-act-grid .act-btn-xray{font-size: 0.85rem; font-weight: 800;}
+body[dir="rtl"] .row-act-grid{direction: ltr;}
+.row-act-note{color: var(--danger); font-size: 0.8rem; max-width: 220px; text-align: left;}
+.toast{position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%) translateY(20px); background:var(--surface-3); color:var(--text); border:1px solid var(--border-strong); border-radius:8px; padding: 18px 40px; font-size: 1rem; font-weight: 600; opacity: 0; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; z-index: 999; box-shadow:var(--shadow-md); pointer-events: none; max-width: 90vw; text-align: center;}
+.toast.show{opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto;}
+.mo{position: fixed; inset: 0; background:rgba(0,0,0,0.55); z-index: 200; display: none; align-items: flex-start; justify-content: center; animation:fadeIn 150ms ease; padding: 20px 12px; overflow-y: auto; box-sizing: border-box;}
+.mo.show{display: flex;}
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-.mo-box {
-  background: var(--surface2);
-  border: 1px solid var(--border2);
-  border-radius: var(--radius-lg);
-  padding: 42px;
-  width: 100%;
-  min-width: 0;
-  max-width: min(640px, calc(100vw - 32px));
-  max-height: 90vh;
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin: auto;
-  box-shadow: 0 32px 80px rgba(0,0,0,0.7);
-  backdrop-filter: blur(36px);
-  position: relative;
-  animation: scaleIn 0.35s ease;
-}
+.mo-box{background: var(--surface-2); border: 1px solid var(--border-strong); border-radius:var(--radius-xl); padding: 42px; width:min(560px,calc(100vw - 32px)); min-width:min(560px,calc(100vw - 32px)); max-width:min(560px,calc(100vw - 32px)); max-height: 90vh; overflow-y: auto; overflow-x: hidden; margin: auto; box-shadow: 0 32px 80px rgba(0,0,0,0.7); position: relative; animation:scaleIn 150ms ease;}
 @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-.mo-title { font-size: 1.6rem; font-weight: 700; margin-bottom: 28px; color: var(--primary); }
-.mo-close {
-  position: absolute;
-  top: 20px;
-  inset-inline-end: 20px;
-  background: var(--surface3);
-  border: 1px solid var(--border);
-  color: var(--text3);
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: all var(--transition);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.4rem;
-}
-.mo-close:hover { color: var(--red); border-color: var(--red); }
-.qr-box { text-align: center; padding: 30px; background: var(--surface3); border-radius: var(--radius-md); border: 1px solid var(--border); margin-top: 18px; }
-.qr-box img { max-width: 230px; border-radius: 18px; border: 3px solid var(--border); box-shadow: var(--shadow); }
-
-
-.footer {
-  height: var(--footer-h);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85rem;
-  color: var(--text3);
-  border-top: 1px solid var(--border);
-  background: var(--surface);
-  backdrop-filter: blur(10px);
-  margin-top: auto;
-}
-.footer-inner { display: flex; align-items: center; justify-content: center; gap: 36px; flex-wrap: wrap; }
-.footer-inner a { color: var(--primary); text-decoration: none; font-weight: 600; transition: all var(--transition); }
-.footer-inner a:hover { text-shadow: 0 0 18px var(--primary); }
-textarea.fi { resize: vertical; min-height: 130px; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word; }
-
-
-.chip {
-  padding: 9px 20px;
-  border-radius: 14px;
-  font-size: 0.82rem;
-  font-weight: 700;
-  color: var(--text3);
-  cursor: pointer;
-  border: none;
-  background: none;
-  font-family: inherit;
-  transition: all var(--transition);
-}
-.chip:hover { color: var(--primary); background: var(--primary-glass); }
-.chip.active { background: var(--primary); color: #000; }
-.chip:active { transform: scale(0.95); }
-.pill-group { display: flex; flex-wrap: wrap; gap: 14px; }
-.pill-btn {
-  padding: 12px 22px;
-  border-radius: 28px;
-  border: 1px solid var(--border);
-  background: var(--surface3);
-  color: var(--text3);
-  cursor: pointer;
-  font-size: 0.86rem;
-  font-weight: 600;
-  transition: all var(--transition);
-  font-family: inherit;
-  backdrop-filter: blur(8px);
-}
-.pill-btn:hover { border-color: var(--primary); color: var(--primary); box-shadow: 0 0 18px var(--primary-dim); }
-.pill-btn.active { background: var(--primary-glass); color: var(--primary); border-color: var(--primary); box-shadow: 0 0 28px var(--primary-dim); }
-.pill-btn:active { transform: scale(0.97); }
-
-
-.adv-toggle {
-  cursor: pointer;
-  color: var(--primary);
-  font-weight: 600;
-  margin-bottom: 20px;
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  border: none;
-  background: none;
-  font-size: 0.98rem;
-  font-family: inherit;
-  transition: all var(--transition);
-}
-.adv-toggle:hover { opacity: 0.85; }
-.adv-section {
-  display: none;
-  padding: 20px;
-  background: var(--surface);
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  margin-top: 14px;
-}
-
-
-.addr-list-scroll {
-  max-height: 420px;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px;
-  background: var(--surface);
-}
-.logs-table-container { max-height: 480px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-.scan-results-container { max-height: 350px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-
-
-.mobile-nav {
-  display: none;
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  z-index: 9999;
-  backdrop-filter: blur(30px);
-  padding: 12px 0 env(safe-area-inset-bottom, 0);
-}
-.mobile-nav .nav-items { display: flex; justify-content: space-around; align-items: center; width: 100%; }
-.mobile-nav .nav-item {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 4px;
-  color: var(--text3);
-  font-size: 0.72rem;
-  cursor: pointer;
-  transition: all var(--transition);
-  border-radius: var(--radius-sm);
-}
-.mobile-nav .nav-item.active { color: var(--primary); background: var(--primary-glass); }
-
-
-.glass-btn-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  background: var(--primary-glass);
-  border: 1px solid var(--border);
-  padding: 6px;
-  border-radius: var(--radius-sm);
-  backdrop-filter: blur(14px);
-}
-.glass-btn {
-  flex: 1;
-  min-width: 90px;
-  background: transparent;
-  border: none;
-  color: var(--text3);
-  padding: 14px 20px;
-  border-radius: 14px;
-  cursor: pointer;
-  font-weight: 600;
-  font-family: inherit;
-  font-size: 0.86rem;
-  transition: all var(--transition);
-}
-.glass-btn.active { background: var(--primary); color: #000 !important; box-shadow: 0 0 24px var(--primary-dim); }
-.glass-btn:hover:not(.active) { background: rgba(255,255,255,0.06); color: var(--text); }
-.glass-btn:active { transform: scale(0.97); }
-
-
-.status-cards-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 20px;
-  margin-top: 18px;
-}
-#page-settings .status-cards-grid { justify-items: stretch; }
-.status-glass-card {
-  padding: 26px 22px;
-  border-radius: var(--radius-md);
-  text-align: center;
-  cursor: pointer;
-  font-weight: 700;
-  transition: all var(--transition);
-  user-select: none;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 16px;
-  font-size: 0.9rem;
-  max-width: 100%;
-  backdrop-filter: blur(14px);
-  background: rgba(255,255,255,0.03);
-  border: 1px solid var(--border);
-  color: var(--text3);
-}
-.status-glass-card.active {
-  background: var(--primary-glass);
-  border: 1px solid rgba(57,255,20,0.45);
-  color: var(--primary);
-  box-shadow: 0 0 32px var(--primary-dim);
-}
-.status-glass-card.inactive {
-  background: rgba(255,255,255,0.02);
-  border: 1px solid var(--border);
-  color: var(--text3);
-}
-.status-glass-card:active { transform: scale(0.97); }
-.railway-hl {
-  background: rgba(168,85,247,0.2) !important;
-  color: #d8b4fe !important;
-  border: 1px solid #a855f7 !important;
-  font-weight: 800;
-  box-shadow: 0 0 24px rgba(168,85,247,0.3);
-}
-
-
-.tooltip-container { position: relative; display: inline-flex; }
-.tooltip-text {
-  visibility: hidden;
-  background: rgba(0,0,0,0.95);
-  color: #fff;
-  text-align: center;
-  border-radius: 12px;
-  padding: 10px 18px;
-  position: absolute;
-  z-index: 100;
-  bottom: 140%;
-  left: 50%;
-  transform: translateX(-50%);
-  white-space: nowrap;
-  width: max-content;
-  max-width: min(320px, 90vw);
-  border: 1px solid rgba(255,255,255,0.2);
-  box-shadow: 0 14px 40px rgba(0,0,0,0.6);
-  backdrop-filter: blur(20px);
-  opacity: 0;
-  transition: opacity 0.25s ease, transform 0.25s ease;
-  font-size: 0.75rem;
-  pointer-events: none;
-}
-.tooltip-container:hover .tooltip-text { visibility: visible; opacity: 1; transform: translateX(-50%) translateY(-8px); }
-
-.num{direction:ltr;unicode-bidi:isolate;white-space:nowrap}
-bdi{unicode-bidi:isolate}
-#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){text-align:start !important}
-body[dir="rtl"] .fl,body[dir="rtl"] .tbl th,body[dir="rtl"] .stat-label,body[dir="rtl"] .tag{text-transform:none;letter-spacing:normal}
-body[dir="rtl"] .tbl.scanner-tbl th:first-child,body[dir="rtl"] .tbl.scanner-tbl td:first-child{text-align:left;direction:ltr;unicode-bidi:isolate}
-body[dir="rtl"] .fi[dir="auto"],body[dir="rtl"] textarea.fi[dir="auto"],body[dir="rtl"] input[dir="auto"],body[dir="rtl"] textarea[dir="auto"]{direction:rtl !important;text-align:right !important}
-body[dir="rtl"] .bulk-actions,body[dir="rtl"] .inbound-tools{direction:rtl}
-.bulk-actions{flex-wrap:wrap}
-.header-nav{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
-.nav-link{white-space:nowrap;flex-shrink:0}
-.nav-link span{white-space:nowrap}
-.mobile-nav .nav-item span{white-space:nowrap}
-.scan-note{display:none;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.4);color:var(--red);padding:10px 14px;border-radius:10px;margin-top:10px;font-size:0.85rem;line-height:1.5}
-.provider-search{width:100%;margin-bottom:8px}
-
-
-
-.multi-panel-grid { display: flex; flex-wrap: wrap; gap: 20px; }
-.multi-panel-grid .status-glass-card {
-  max-width: 400px;
-  flex: 1 1 340px;
-  text-align: start;
-  align-items: flex-start;
-  gap: 16px;
-  flex-direction: column;
-}
-.multi-panel-grid .status-glass-card > div:first-child { width: 100%; display: flex; flex-direction: column; gap: 16px; }
-
-
-.scanner-location-filter { margin: 18px 0; display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
-.scanner-location-filter input {
-  flex: 1;
-  padding: 14px 20px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-}
-.location-checkbox { display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text2); cursor: pointer; }
-.location-checkbox input[type="checkbox"] { width: 19px; height: 19px; cursor: pointer; }
-
-
+.mo-title{font-size: 1.6rem; font-weight: 700; margin-bottom: 28px; color: var(--accent);}
+.mo-close{position: absolute; top: 20px; inset-inline-end: 20px; background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); width: 40px; height: 40px; border-radius: var(--radius-sm); cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; display: flex; align-items: center; justify-content: center; font-size: 1.4rem;}
+.mo-close:hover{color: var(--danger); border-color: var(--danger);}
+.qr-box{text-align: center; padding: 30px; background: var(--surface-3); border-radius: var(--radius-md); border: 1px solid var(--border); margin-top: 18px;}
+.qr-box canvas{display:block;max-width:100%;height:auto;}
+.footer{ display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: var(--text-3); border-top: 1px solid var(--border); background:var(--surface); margin-top: auto;}
+.footer-inner{display: flex; align-items: center; justify-content: center; gap: 36px; flex-wrap: wrap;}
+.footer-inner a{color: var(--accent); text-decoration: none; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.footer-inner a:hover{}
+textarea.fi{resize: vertical; min-height: 130px; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;}
+.chip{padding: 9px 20px; border-radius: 14px; font-size: 0.82rem; font-weight: 700; color: var(--text-3); cursor: pointer; border: none; background: none; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.chip:hover{color: var(--accent); background: var(--accent-soft);}
+.chip.active{background:var(--accent-soft); color:var(--accent);}
+.chip:active{transform: scale(0.95);}
+.pill-group{display: flex; flex-wrap: wrap; gap: 14px;}
+.pill-btn{padding: 12px 22px; border-radius: 28px; border: 1px solid var(--border); background: var(--surface-3); color: var(--text-3); cursor: pointer; font-size: 0.86rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; font-family: inherit;}
+.pill-btn:hover{border-color: var(--accent); color: var(--accent);}
+.pill-btn.active{background:var(--accent-soft); color:var(--accent); border-color:var(--accent);}
+.pill-btn:active{transform: scale(0.97);}
+.adv-toggle{cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 20px; display: inline-flex; align-items: center; gap: 10px; border: none; background: none; font-size: 0.98rem; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.adv-toggle:hover{opacity: 0.85;}
+.adv-section{display: none; padding: 20px; background: var(--surface); border-radius: var(--radius-sm); border: 1px solid var(--border); margin-top: 14px;}
+.addr-list-scroll{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; background: var(--surface);}
+.logs-table-container{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
+.scan-results-container{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
+.mobile-nav{display: none; position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border); z-index: 9999; padding: 12px 0 env(safe-area-inset-bottom, 0);}
+.mobile-nav .nav-items{display: flex; justify-content: space-around; align-items: center; width: 100%;}
+.mobile-nav .nav-item{flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px; color: var(--text-3); font-size: 0.72rem; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border-radius: var(--radius-sm);}
+.mobile-nav .nav-item.active{color: var(--accent); background: var(--accent-soft);}
+.seg-group{display: flex; flex-wrap: wrap; gap: 8px; background:var(--surface-2); border: 1px solid var(--border); padding: 6px; border-radius:6px;}
+.seg-btn{flex: 1; min-width: 90px; background:var(--surface-2); border: none; color: var(--text-3); padding: 14px 20px; border-radius:6px; cursor: pointer; font-weight: 600; font-family: inherit; font-size: 0.86rem; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.seg-btn.active{background:var(--surface);border:1px solid var(--border);color:var(--text);}
+.seg-btn:hover:not(.active){background: var(--surface-2); color: var(--text);}
+.seg-btn:active{transform: scale(0.97);}
+.status-cards-grid{display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-top: 18px;}
+#page-settings .status-cards-grid{justify-items: stretch;}
+.status-card{padding: 26px 22px; border-radius:12px; text-align: center; cursor: pointer; font-weight: 700; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; user-select: none; display: flex; flex-direction: column; align-items: center; gap: 16px; font-size: 0.9rem; max-width: 100%; background:var(--surface); border:1px solid var(--border); color: var(--text-3);}
+.status-card.active{border-color:var(--accent-border);background:var(--accent-soft);}
+.status-card.inactive{border-color:var(--border);background:var(--surface);}
+.status-card:active{transform: scale(0.97);}
+.railway-hl{background: rgba(168,85,247,0.2) !important; color: var(--accent) !important; border: 1px solid var(--accent) !important; font-weight: 800;}
+.tooltip-container{position: relative; display: inline-flex;}
+.tooltip-text{visibility: hidden; background:var(--surface-3); color:var(--text); text-align: center; border-radius: 12px; padding: 10px 18px; position: absolute; z-index: 100; bottom: 140%; left: 50%; transform: translateX(-50%); white-space: nowrap; width: max-content; max-width: min(320px, 90vw); border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 14px 40px rgba(0,0,0,0.6); opacity: 0; transition:opacity 120ms ease-out, transform 150ms ease-out; font-size: 0.75rem; pointer-events: none;border:1px solid var(--border-strong);border-radius:8px;}
+.tooltip-container:hover .tooltip-text{visibility: visible; opacity: 1; transform: translateX(-50%) translateY(-8px);}
+.num{direction:ltr; unicode-bidi:isolate; white-space:nowrap;}
+bdi{unicode-bidi:isolate;}
+#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){text-align:start !important;}
+body[dir="rtl"] .fl,body[dir="rtl"] .tbl th,body[dir="rtl"] .stat-label,body[dir="rtl"] .tag{text-transform:none; letter-spacing:normal;}
+body[dir="rtl"] .tbl.scanner-tbl th:first-child,body[dir="rtl"] .tbl.scanner-tbl td:first-child{text-align:left; direction:ltr; unicode-bidi:isolate;}
+body[dir="rtl"] .fi[dir="auto"],body[dir="rtl"] textarea.fi[dir="auto"],body[dir="rtl"] input[dir="auto"],body[dir="rtl"] textarea[dir="auto"]{direction:rtl !important; text-align:end;}
+body[dir="rtl"] .bulk-actions,body[dir="rtl"] .inbound-tools{direction:rtl;}
+.bulk-actions{flex-wrap:wrap;}
+.header-nav{flex-wrap:wrap;  scrollbar-width:thin;}
+.nav-link{white-space:nowrap; flex-shrink:0;}
+.nav-link span{white-space:nowrap;}
+.mobile-nav .nav-item span{white-space:nowrap;}
+.scan-note{display:none; background:var(--warning-soft); border:1px solid var(--warning-border); color:var(--text); padding:10px 14px; border-radius:10px; margin-top:10px; font-size:0.85rem; line-height:1.5;}
+.provider-search{width:100%; margin-bottom:8px;}
+.multi-panel-grid{display: flex; flex-wrap: wrap; gap: 20px;}
+.multi-panel-grid .status-card{max-width: 400px; flex: 1 1 340px; text-align: start; align-items: flex-start; gap: 16px; flex-direction: column;}
+.multi-panel-grid .status-card > div:first-child{width: 100%; display: flex; flex-direction: column; gap: 16px;}
+.scanner-location-filter{margin: 18px 0; display: flex; flex-wrap: wrap; gap: 16px; align-items: center;}
+.scanner-location-filter input{flex: 1; padding: 14px 20px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text);}
+.location-checkbox{display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-2); cursor: pointer;}
+.location-checkbox input[type="checkbox"]{width: 19px; height: 19px; cursor: pointer;}
 @media (min-width: 1024px) {
-  .header-inner { flex-wrap: nowrap; }
-  .main { padding: 40px 56px; }
-  .card { max-width: 100%; }
-  .status-cards-grid { grid-template-columns: repeat(2, 1fr); }
-  .status-glass-card { max-width: 100%; }
-  .btn { width: auto; }
+.header-inner{flex-wrap:wrap;}
+.main{padding:24px 16px;}
+.card{max-width: 100%;}
+.status-cards-grid{grid-template-columns: repeat(2, 1fr);}
+.status-card{max-width: 100%;}
+.btn{width: auto;}
 }
-
-
 @media (max-width: 1023px) {
-  .header {
-    min-height: auto;
-    padding: 10px 18px;
-  }
-  .header-inner {
-    flex-wrap: wrap;
-    gap: 10px;
-  }
-  .header .header-nav { display: none; }
-  .mobile-nav { display: block; }
-  .main { padding: 22px 16px 120px; }
-  .footer { display: none; }
-  .logo { font-size: 1.6rem; }
-  .version-tag { font-size: 0.7rem; }
-  .header-right { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-  .btn-icon { padding: 8px; font-size: 1.1rem; }
-  .lang-switch { flex-direction: row; }
-  .lang-btn { padding: 6px 12px; font-size: 0.72rem; }
-  .glass-btn { min-width: 70px; padding: 10px; font-size: 0.78rem; }
-  .btn { font-size: 0.82rem; padding: 8px 16px; }
-  .btn-primary { padding: 12px 20px; }
-  .stats-row { grid-template-columns: repeat(2, 1fr); gap: 14px; }
-  .stat-card { padding: 20px; }
-  .stat-label { font-size: 0.7rem; }
-  .stat-val { font-size: 1.6rem; }
-  .tbl th, .tbl td { padding: 14px 10px; font-size: 0.8rem; }
-  .mo-box { padding: 28px 20px; max-width: 95vw; max-height: 85vh; border-radius: var(--radius-md); }
-  .mo-close { top: 12px; inset-inline-end: 12px; width: 36px; height: 36px; font-size: 1.2rem; }
-  .mobile-nav .nav-item { font-size: 0.68rem; padding: 8px 2px; }
-  .pill-btn { font-size: 0.78rem; padding: 10px 16px; }
-  .fi, .fs { max-width: 100%; }
-
-  #srch { max-width: 160px; }
-
-  .multi-panel-grid .status-glass-card { max-width: 100% !important; flex: 1 1 100% !important; padding: 20px; }
-  .multi-panel-grid .status-glass-card > div:first-child {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    width: 100%;
-  }
-  #new-panel-name, #new-panel-url {
-    width: 100%;
-    padding: 14px;
-    font-size: 1rem;
-    box-sizing: border-box;
-  }
-  #new-panel-url + .btn {
-    width: 100%;
-    margin-top: 6px;
-  }
-
-  .status-glass-card { max-width: 100%; padding: 18px; font-size: 0.82rem; }
-
-  .status-cards-grid { grid-template-columns: repeat(2, 1fr) !important; }
-
-  
-  #inbound-table thead { display: none; }
-  #inbound-table tr { display: block; margin-bottom: 20px; border: 1px solid var(--border2); border-radius: var(--radius-md); padding: 20px; background: var(--surface); box-shadow: var(--shadow); }
-  #inbound-table td { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
-  #inbound-table td:last-child { border-bottom: none; }
-  #inbound-table td::before { content: attr(data-label); font-weight: 700; color: var(--text3); margin-inline-end: 16px; white-space: nowrap; }
-  #inbound-table td:first-child { display: flex !important; align-items: center; justify-content: flex-start; padding: 10px 0; border-bottom: none; }
-  #inbound-table td:first-child::before { content: "Select"; font-weight: 700; color: var(--text3); margin-inline-end: 16px; }
-  #inbound-table td:first-child input[type="checkbox"] { width: 22px; height: 22px; margin-inline-end: 14px; }
-
-  .addr-list-scroll > div { flex-direction: column !important; align-items: flex-start !important; gap: 14px; }
-  #addresses-card > div:nth-child(2) { flex-wrap: wrap; gap: 12px; }
-  #addresses-card > div:nth-child(2) .btn { flex: 1 1 auto; margin-bottom: 4px; }
-
-  
-  #login-logs-table {
-    display: block;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    white-space: nowrap;
-    min-width: 650px;
-  }
-  #login-logs-table thead,
+.header{min-height:56px; padding:0 16px;}
+.header-inner{flex-wrap: wrap; gap: 10px;}
+.header .header-nav{display: none;}
+.mobile-nav{display: block;}
+.main{padding:24px 16px;}
+.footer{display: none;}
+.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
+.version-tag{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-full);padding:2px 8px;}
+.header-right{gap: 6px; flex-wrap: wrap; justify-content: flex-end;}
+.btn-icon{padding: 8px; font-size: 1.1rem;}
+.lang-switch{flex-direction: row;}
+.lang-btn{padding: 6px 12px; font-size: 0.72rem;}
+.seg-btn{min-width: 70px; padding: 10px; font-size: 0.78rem;}
+.btn{font-size:14px; padding:8px 14px;}
+.btn-primary{padding: 12px 20px;}
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
+.stat-card{padding:16px;}
+.stat-label{font-size: 0.7rem;}
+.stat-val{font-size: 1.6rem;}
+.tbl th, .tbl td{padding: 14px 10px; font-size: 0.8rem;}
+.mo-box{padding: 28px 20px; max-width:min(560px,calc(100vw - 32px)); max-height: 85vh; border-radius:var(--radius-xl);}
+.mo-close{top: 12px; inset-inline-end: 12px; width: 36px; height: 36px; font-size: 1.2rem;}
+.mobile-nav .nav-item{font-size: 0.68rem; padding: 8px 2px;}
+.pill-btn{font-size: 0.78rem; padding: 10px 16px;}
+.fi, .fs{max-width: 100%;}
+#srch{max-width: 160px;}
+.multi-panel-grid .status-card{max-width: 100% !important; flex: 1 1 100% !important; padding: 20px;}
+.multi-panel-grid .status-card > div:first-child{display: flex; flex-direction: column; gap: 14px; width: 100%;}
+#new-panel-name, #new-panel-url{width: 100%; padding: 14px; font-size: 1rem; box-sizing: border-box;}
+#new-panel-url + .btn{width: 100%; margin-top: 6px;}
+.status-card{max-width: 100%; padding: 18px; font-size: 0.82rem;}
+.status-cards-grid{grid-template-columns: repeat(2, 1fr) !important;}
+#inbound-table thead{display: none;}
+#inbound-table tr{display: block; margin-bottom: 20px; border: 1px solid var(--border-strong); border-radius: var(--radius-md); padding: 20px; background: var(--surface); box-shadow: var(--shadow-md);}
+#inbound-table td{display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;}
+#inbound-table td:last-child{border-bottom: none;}
+#inbound-table td::before{content: attr(data-label); font-weight: 700; color: var(--text-3); margin-inline-end: 16px; white-space: nowrap;}
+#inbound-table td:first-child{display: flex !important; align-items: center; justify-content: flex-start; padding: 10px 0; border-bottom: none;}
+#inbound-table td:first-child::before{content: "Select"; font-weight: 700; color: var(--text-3); margin-inline-end: 16px;}
+#inbound-table td:first-child input[type="checkbox"]{width: 22px; height: 22px; margin-inline-end: 14px;}
+.addr-list-scroll > div{flex-direction: column !important; align-items: flex-start !important; gap: 14px;}
+#addresses-card > div:nth-child(2){flex-wrap: wrap; gap: 12px;}
+#addresses-card > div:nth-child(2) .btn{flex: 1 1 auto; margin-bottom: 4px;}
+#login-logs-table{display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; min-width: 650px;}
+#login-logs-table thead,
   #login-logs-table tbody,
   #login-logs-table tr,
   #login-logs-table th,
-  #login-logs-table td {
-    white-space: nowrap;
-  }
-  #login-logs-table td {
-    word-break: normal;
-    overflow-wrap: normal;
-  }
-
-  #doh-ping-table {
-    display: block;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-  }
-  #doh-ping-table table { min-width: 650px; }
+  #login-logs-table td{white-space: nowrap;}
+#login-logs-table td{word-break: normal; overflow-wrap: normal;}
+#doh-ping-table{display: block; overflow-x: auto; -webkit-overflow-scrolling: touch;}
+#doh-ping-table table{min-width: 560px;}
 }
-
-
 @media (max-width: 500px) {
-  .stats-row { grid-template-columns: repeat(2, 1fr); }
-  .glass-btn-group { flex-direction: column; }
-  .glass-btn { width: 100%; }
-  .page-title { font-size: 1.5rem; }
-  .header-right { gap: 4px; }
-  .btn-icon { padding: 6px; font-size: 0.95rem; }
-  .lang-btn { padding: 5px 8px; font-size: 0.68rem; }
-  .btn { padding: 8px 14px; }
-  .btn-primary { padding: 10px 16px; }
-  .mo-box { padding: 24px 16px; max-width: calc(100vw - 24px); border-radius: var(--radius-sm); }
-  .toast { padding: 14px 20px; font-size: 0.85rem; bottom: 20px; }
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));}
+.seg-group{flex-direction: column;}
+.seg-btn{width: 100%;}
+.page-title{font-size:20px;}
+.header-right{gap: 4px;}
+.btn-icon{padding: 6px; font-size: 0.95rem;}
+.lang-btn{padding: 5px 8px; font-size: 0.68rem;}
+.btn{padding:8px 14px;}
+.btn-primary{padding: 10px 16px;}
+.mo-box{padding: 24px 16px; max-width:min(560px,calc(100vw - 32px)); border-radius:var(--radius-xl);}
+.toast{padding: 14px 20px; font-size: 0.85rem; bottom: 20px;}
 }
+
+.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
+.ic svg{width:100%;height:100%;display:block}
+.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
+.status-dot.ok{background:var(--success)}
+.status-dot.warn{background:var(--warning)}
+.status-dot.err{background:var(--danger)}
+.status-dot.off{background:var(--text-3)}
+.hidden{display:none}
+.ltr{direction:ltr;unicode-bidi:isolate}
+[dir="rtl"] .ic-flip{transform:scaleX(-1)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
 </style>
 <style>
-html, body { overflow-x: hidden; }
-.main { display: block; width: 100%; max-width: 1440px; margin-left: auto; margin-right: auto; min-width: 0; padding: 24px 16px 120px; }
-.page, .card, .stat-card, .tbl-wrap, .logs-table-container, .chart-container { min-width: 0; }
-.page { scroll-margin-top: 84px; }
-html { scroll-padding-top: 84px; }
-.stats-row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.card { padding: 24px; }
-.card-hd { flex-wrap: wrap; gap: 10px; }
-.page-header { flex-wrap: wrap; gap: 12px; }
-.tbl-wrap, .logs-table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.tbl { border-collapse: collapse; min-width: 640px; }
-.tbl th, .tbl td { overflow-wrap: break-word; word-break: normal; white-space: normal; }
-#inbound-table { min-width: 880px; }
-#proxy-lines-table { min-width: 760px; }
-#logs-table, #login-logs-table { min-width: 620px; }
-.scanner-tbl { min-width: 560px; }
-.act-btn { min-width: 36px; min-height: 36px; }
-.tooltip-text { white-space: normal; max-width: 220px; overflow-wrap: anywhere; }
-.mo-box .fg { flex-wrap: wrap; }
-.mo-box input[type="color"] { width: 100%; height: 44px; padding: 4px; }
-.fi, .fs { width: 100%; max-width: 100%; }
-.btn { min-height: 44px; }
-.chart-container { max-width: 100%; }
-.chart-container canvas { max-width: 100%; }
-#proto-summary .tag { white-space: nowrap; }
+html, body{}
+.main{display: block; width: 100%; max-width: 1200px; margin-inline-start: auto; margin-inline-end: auto; min-width: 0; padding:24px 16px;}
+.page, .card, .stat-card, .tbl-wrap, .logs-table-container, .chart-container{min-width: 0;}
+.page{scroll-margin-top: 84px;}
+html{scroll-padding-top: 84px;}
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));}
+.card{padding:16px;}
+.card-hd{flex-wrap: wrap; gap: 10px;}
+.page-header{flex-wrap: wrap; gap: 12px;}
+.tbl-wrap, .logs-table-container{overflow-x: auto; -webkit-overflow-scrolling: touch;}
+.tbl{border-collapse: collapse; min-width: 560px;}
+.tbl th, .tbl td{overflow-wrap: break-word; word-break: normal; white-space: normal;}
+#inbound-table{min-width: 640px;}
+#proxy-lines-table{min-width: 640px;}
+#logs-table, #login-logs-table{min-width: 560px;}
+.scanner-tbl{min-width: 480px;}
+.act-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--text-2);cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;}
+.tooltip-text{white-space: normal; max-width: 220px; overflow-wrap: anywhere;border:1px solid var(--border-strong);border-radius:8px;}
+.mo-box .fg{flex-wrap: wrap;}
+.mo-box input[type="color"]{width: 100%; height: 44px; padding: 4px;}
+.fi, .fs{width: 100%; max-width: 100%;}
+.btn{min-height: 44px;}
+.chart-container{max-width: 100%;}
+.chart-container canvas{max-width: 100%;}
+#proto-summary .tag{white-space: nowrap;}
 @media (min-width: 1024px) {
-  .main { padding: 32px 40px 120px; }
-  .stats-row { gap: 20px; }
+.main{padding:24px 16px;}
+.stats-row{gap:16px;}
 }
 @media (max-width: 1023px) {
-  .nav-item { min-height: 44px; }
-  #inbound-table { min-width: 0; }
-  .header-nav { flex-wrap: wrap; }
-  .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.nav-item{min-height: 44px;}
+#inbound-table{min-width: 0;}
+.header-nav{flex-wrap: wrap;}
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
 }
 @media (max-width: 480px) {
-  .stats-row { grid-template-columns: minmax(0, 1fr); gap: 12px; }
-  .stat-card { padding: 18px 16px; }
-  .stat-val { font-size: 1.5rem; }
-  .logo { font-size: 1.3rem; }
-  #panel-clock { display: none; }
-  .page-title { font-size: 1.4rem; }
-  .card { padding: 18px 14px; }
-  .glass-btn-group { flex-direction: column; }
-  .glass-btn { width: 100%; }
-  .mo-box { max-height: 88vh; }
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
+.stat-card{padding:16px 16px;}
+.stat-val{font-size: 1.5rem;}
+.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
+#panel-clock{display: none;}
+.page-title{font-size:20px;}
+.card{padding:16px 14px;}
+.seg-group{flex-direction: column;}
+.seg-btn{width: 100%;}
+.mo-box{max-height: 88vh;}
 }
-.icon-activity { mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolyline points='22 12 18 12 15 21 9 3 6 12 2 12'/%3E%3C/svg%3E"); }
+.icon-activity{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolyline points='22 12 18 12 15 21 9 3 6 12 2 12'/%3E%3C/svg%3E");}
 </style>
 </head>
 <body>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg"></span></div>
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
-    <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:min(400px,calc(100vw - 32px));max-width:400px;">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="100%" viewBox="0 0 180 80" height="100%">
-          <rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/>
-          <text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text>
-        </svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:12px;display:flex;align-items:center;justify-content:center;gap:8px;">
-          SulgX Panel <span style="font-size:0.8rem; font-family:'Inter'; color:var(--bg); background:var(--primary); padding:2px 6px; border-radius:4px;">V 1.5.8</span>
+        <div style="display:flex;align-items:center;justify-content:center;gap:10px;font-family:var(--font-sans);font-size:28px;font-weight:700;color:var(--text);letter-spacing:-0.02em;">
+          <span style="width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none;"></span>SulgX Panel
         </div>
-        <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
-        <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
+        <div style="display:flex;justify-content:center;margin-top:12px;">
+          <span style="font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:9999px;padding:2px 8px;">V 1.5.8</span>
+        </div>
+        <div style="font-size:1rem;color:var(--text-3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
+        <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text-3); font-size:0.9rem;"></div>
       </div>
       <form id="login-form" onsubmit="doLogin();return false;" autocomplete="off">
       <div class="fg"><label class="fl" data-en="PASSWORD" data-fa="رمز عبور">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" autocomplete="current-password"></div>
       <button class="btn btn-primary" type="submit" id="login-btn" style="width:100%;justify-content:center;padding:14px;margin-top:16px;" data-en="LOGIN" data-fa="ورود">LOGIN</button>
       </form>
-      <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none" data-en="Invalid password" data-fa="رمز عبور نامعتبر">Invalid password</div>
+      <div id="login-err" style="color:var(--danger);font-size:0.9rem;margin-top:10px;text-align:center;display:none" data-en="Invalid password" data-fa="رمز عبور نامعتبر">Invalid password</div>
       <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:20px;">
-        <a href="https://github.com/SulgX" target="_blank" style="color:var(--text3); text-decoration:none; font-size:0.9rem;">
+        <a href="https://github.com/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem;">
           <span class="icon icon-github"></span> GitHub
         </a>
-        <a href="https://t.me/SulgX" target="_blank" style="color:var(--text3); text-decoration:none; font-size:0.9rem;">
+        <a href="https://t.me/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem;">
           <span class="icon icon-telegram-link"></span> Telegram
         </a>
       </div>
@@ -15608,7 +15904,7 @@ html { scroll-padding-top: 84px; }
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:16px;">
         <span class="logo">SulgX</span><span class="version-tag">v1.5.8</span>
-        <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-inline-start:8px;font-size:0.9rem;"></span>
+        <span id="panel-clock" style="font-weight:600;color:var(--accent);margin-inline-start:8px;font-size:0.9rem;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">
             <span class="nav-icon icon-dashboard"></span>
@@ -15664,7 +15960,7 @@ html { scroll-padding-top: 84px; }
   <main class="main">
     <section class="page active" id="page-dashboard">
       <div class="page-header"><div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div><div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" id="health-check-btn-dash" onclick="runHealthCheckDash(this)" data-en="Health Check" data-fa="بررسی سلامت">Health Check</button><button class="btn btn-outline btn-sm" id="refresh-stats-btn" onclick="refreshStats(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div></div>
-      <div id="db-fresh-banner" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--yellow);border-radius:10px;background:var(--surface3);color:var(--text);font-size:0.9rem;"><div data-en="Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts." data-fa="پایگاه‌داده تازه است: در زمان راه‌اندازی هیچ فایل پایگاه‌داده‌ای وجود نداشت و همه اینباندهای قبلی از بین رفتند. برای ماندگاری اینباندها پس از راه‌اندازی مجدد، یک والیوم پایدار به DB_PATH متصل کنید.">Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts.</div><div id="db-fresh-path" style="font-size:0.8rem;color:var(--text2);direction:ltr;text-align:left;margin-top:4px;"></div></div>
+      <div id="db-fresh-banner" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--warning);border-radius:10px;background:var(--surface-3);color:var(--text);font-size:0.9rem;"><div data-en="Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts." data-fa="پایگاه‌داده تازه است: در زمان راه‌اندازی هیچ فایل پایگاه‌داده‌ای وجود نداشت و همه اینباندهای قبلی از بین رفتند. برای ماندگاری اینباندها پس از راه‌اندازی مجدد، یک والیوم پایدار به DB_PATH متصل کنید.">Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts.</div><div id="db-fresh-path" style="font-size:0.8rem;color:var(--text-2);direction:ltr;text-align:left;margin-top:4px;"></div></div>
       <div class="stats-row">
         <div class="stat-card stat-traffic"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
         <div class="stat-card stat-requests"><div class="stat-label" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div class="stat-val" id="sv-requests">–</div></div>
@@ -15678,35 +15974,35 @@ html { scroll-padding-top: 84px; }
         <div class="stat-card" style="font-size:0.8rem;">
           <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
           <div class="status-cards-grid" id="settings-status">
-            <div class="status-glass-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Logging" data-fa="لاگ">
+            <div class="status-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Logging" data-fa="لاگ">
               <span class="status-icon icon-logging"></span> Logging
             </div>
-            <div class="status-glass-card inactive" id="st-auto" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Auto Disable" data-fa="غیرفعال‌سازی">
+            <div class="status-card inactive" id="st-auto" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Auto Disable" data-fa="غیرفعال‌سازی">
               <span class="status-icon icon-auto-disable"></span> Auto Disable
             </div>
-            <div class="status-glass-card inactive" id="st-tgrep" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Reports" data-fa="گزارش تلگرام">
+            <div class="status-card inactive" id="st-tgrep" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Reports" data-fa="گزارش تلگرام">
               <span class="status-icon icon-tg-reports"></span> TG Reports
             </div>
-            <div class="status-glass-card inactive" id="st-tgnot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Notify" data-fa="اعلان تلگرام">
+            <div class="status-card inactive" id="st-tgnot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Notify" data-fa="اعلان تلگرام">
               <span class="status-icon icon-tg-notify"></span> TG Notify
             </div>
-            <div class="status-glass-card inactive" id="st-bot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Bot" data-fa="ربات">
+            <div class="status-card inactive" id="st-bot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Bot" data-fa="ربات">
               <span class="status-icon icon-bot"></span> Bot
             </div>
-            <div class="status-glass-card inactive" id="st-stealth" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Stealth" data-fa="استتار">
+            <div class="status-card inactive" id="st-stealth" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Stealth" data-fa="استتار">
               <span class="status-icon icon-stealth"></span> Stealth
             </div>
           </div>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);width:0%"></div></div></div>
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--accent);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--success);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--success);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</span></div><div id="proto-summary" style="display:flex;flex-wrap:wrap;gap:8px;min-height:24px;"></div></div>
       <div class="card" id="dash-health-card" style="display:none;"><div class="card-hd"><span class="card-title" data-en="Protocol Health" data-fa="سلامت پروتکل">Protocol Health</span></div><div id="dash-health"></div></div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div><div id="doughnut-total" style="text-align:center;color:var(--text3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div><div id="doughnut-total" style="text-align:center;color:var(--text-3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
   <div class="card-hd">
@@ -15753,6 +16049,10 @@ html { scroll-padding-top: 84px; }
         <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')" data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</button>
         <button class="btn btn-danger btn-sm" onclick="batchAction('delete')" data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</button>
       </div>
+      <div class="card" style="padding:10px 14px;margin-bottom:10px;font-size:0.85rem;line-height:1.7;">
+        <div dir="rtl" style="text-align:right;">برای کار کردن SOCKS5 و HTTP و MTProto باید هاست پورت TCP منتشر کند (Railway: فعال‌کردن TCP Proxy؛ یا VPS با پورت باز).</div>
+        <div dir="ltr" style="text-align:left;">SOCKS5 / HTTP / MTProto need a published TCP port — enable TCP Proxy on Railway, or use a VPS with open ports.</div>
+      </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="tbl-wrap">
         <table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Owner" data-fa="مالک">Owner</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Sessions" data-fa="نشست‌ها">Sessions</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Test" data-fa="تست">Test</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
@@ -15765,19 +16065,19 @@ html { scroll-padding-top: 84px; }
       <button class="btn btn-primary btn-sm" onclick="showAddProxyMo()" data-en="+ Add Proxy" data-fa="+ افزودن پروکسی">+ Add Proxy</button>
       <button class="btn btn-outline btn-sm" onclick="testAllProxies()" data-en="Test All" data-fa="تست همه">Test All</button>
       <button id="proxy-stop-btn" class="btn btn-danger btn-sm" style="display:none;" onclick="stopProxyTest()" data-en="Stop" data-fa="توقف">Stop</button>
-      <button class="btn btn-outline btn-sm" onclick="resolveProxyFlags()" data-en="🌍 Resolve Flags" data-fa="🌍 دریافت پرچم‌ها">🌍 Resolve Flags</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteFailedProxies()" data-en="🗑️ Delete Failed" data-fa="🗑️ حذف خراب‌ها">🗑️ Delete Failed</button>
-      <button class="btn btn-danger btn-sm" onclick="deleteSelectedProxies()" data-en="🗑️ Delete Selected" data-fa="🗑️ حذف انتخاب‌شده">🗑️ Delete Selected</button>
-      <button class="btn btn-outline btn-sm" onclick="copySelectedProxies()" data-en="📋 Copy Selected" data-fa="📋 کپی انتخاب‌شده">📋 Copy Selected</button>
+      <button class="btn btn-outline btn-sm" onclick="resolveProxyFlags()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Resolve Flags" data-fa="دریافت پرچم‌ها">Resolve Flags</span></button>
+      <button class="btn btn-danger btn-sm" onclick="deleteFailedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Failed" data-fa="حذف خراب‌ها">Delete Failed</span></button>
+      <button class="btn btn-danger btn-sm" onclick="deleteSelectedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</span></button>
+      <button class="btn btn-outline btn-sm" onclick="copySelectedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Selected" data-fa="کپی انتخاب‌شده">Copy Selected</span></button>
     </div>
   </div>
   <div style="display:flex; align-items:center; gap:8px; margin:10px 0;">
     <div style="flex:1;">
       <div class="sys-bar" style="height:6px;">
-        <div id="proxy-test-bar" class="sys-fill" style="width:0%; background:var(--primary);"></div>
+        <div id="proxy-test-bar" class="sys-fill" style="width:0%; background:var(--accent);"></div>
       </div>
     </div>
-    <span id="proxy-test-percent" style="font-size:0.8rem; color:var(--text3);">0%</span>
+    <span id="proxy-test-percent" style="font-size:0.8rem; color:var(--text-3);">0%</span>
   </div>
   <div class="tbl-wrap">
     <table class="tbl" id="proxy-lines-table">
@@ -15815,7 +16115,7 @@ example.com"></textarea></div>
           <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" data-en="Delete All" data-fa="حذف همه">Delete All</button>
           <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
           <button class="btn btn-outline btn-sm" onclick="toggleAllAddresses()" data-en="Select All" data-fa="انتخاب همه">Select All</button>
-          <button class="btn btn-outline btn-sm" onclick="copySelectedAddrs()" data-en="📋 Copy Selected" data-fa="📋 کپی انتخاب‌ها">📋 Copy Selected</button>
+          <button class="btn btn-outline btn-sm" onclick="copySelectedAddrs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Selected" data-fa="کپی انتخاب‌ها">Copy Selected</span></button>
           <input type="file" id="import-ip-file" accept=".txt" style="display:none" onchange="importIpFile(this)">
           <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-ip-file').click()" data-en="Import .txt" data-fa="ورودی فایل">Import .txt</button>
           <button class="btn btn-outline btn-sm" onclick="resolveAllFlags()" data-en="Resolve All Flags" data-fa="دریافت همه پرچم‌ها">Resolve All Flags</button>
@@ -15833,10 +16133,10 @@ example.com"></textarea></div>
     </section>
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
-      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.8rem; line-height: 1.4;">
-        <strong data-en="⚠️ Safe Scan Notice:" data-fa="⚠️ هشدار اسکن ایمن:">⚠️ Safe Scan Notice:</strong><br>
+      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--warning); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.8rem; line-height: 1.4;">
+        <span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span> <strong data-en="Safe Scan Notice:" data-fa="هشدار اسکن ایمن:">Safe Scan Notice:</strong><br>
         <span data-en="To prevent your hosting provider (like Railway/Render) from banning your account due to abuse detection, scans are strictly limited to 256 IPs at a time. The scanning process is intentionally slowed down." data-fa="برای جلوگیری از مسدود شدن اکانت هاستینگ شما (مثل Railway/Render) به دلیل تشخیص اسپم، اسکن‌ها به‌طور سخت‌گیرانه‌ای به حداکثر ۲۵۶ آی‌پی در هر بار محدود شده‌اند. روند اسکن به‌طور عمدی کندتر شده تا امنیت سرور حفظ شود."></span>
-        <div id="railway-note" style="display:none; margin-top:8px; color: #d8b4fe;"><span data-en="ℹ️ Note: For Railway provider, only Railway-related IPs will work." data-fa="نکته: در ارائه دهنده railway فقط آیپی های مربوط به آن کار خواهد کرد."></span></div>
+        <div id="railway-note" style="display:none; margin-top:8px; color: var(--text-2);"><span data-en="Note: For Railway provider, only Railway-related IPs will work." data-fa="نکته: در ارائه دهنده railway فقط آیپی های مربوط به آن کار خواهد کرد."></span></div>
       </div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><input class="fi provider-search" id="provider-search" data-ph-en="Search providers…" data-ph-fa="جستجوی ارائه‌دهنده…" placeholder="Search providers…" oninput="filterProviders(this.value)"><div id="provider-btns" class="pill-group"></div><div style="margin-top:8px;"><button class="btn btn-outline btn-sm" onclick="scanAllProviders()" data-en="Scan all providers" data-fa="اسکن همه ارائه‌دهنده‌ها">Scan all providers</button></div></div>
@@ -15849,10 +16149,10 @@ example.com
           <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
         </div>
         <div class="scan-note" id="scan-egress-note"><span data-en="Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443)." data-fa="به‌نظر می‌رسد TCP خروجی این سرور مسدود است: هیچ آدرسی پاسخ نداد. اسکنر به یک VPS یا هاستی با TCP خروجی مجاز (پورت ۴۴۳) نیاز دارد.">Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443).</span></div>
-        <div style="color:var(--text3);font-size:0.8rem;margin-top:8px;" data-en="Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead." data-fa="اسکنر از این سرور TCP خروجی باز می‌کند. اگر همه اسکن‌ها در ۰٪ شکست خوردند، هاست خروجی را مسدود کرده است — پنل را روی یک VPS اجرا کنید.">Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead.</div>
-        <div class="fg" style="margin-bottom:10px;"><div style="display:flex;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text3);">0%</span></div></div>
+        <div style="color:var(--text-3);font-size:0.8rem;margin-top:8px;" data-en="Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead." data-fa="اسکنر از این سرور TCP خروجی باز می‌کند. اگر همه اسکن‌ها در ۰٪ شکست خوردند، هاست خروجی را مسدود کرده است — پنل را روی یک VPS اجرا کنید.">Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead.</div>
+        <div class="fg" style="margin-bottom:10px;"><div style="display:flex;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--accent);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text-3);">0%</span></div></div>
         <div class="scanner-location-filter" id="location-filter" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
-          <span style="color:var(--text3); font-size:0.8rem;" data-en="Location:" data-fa="موقعیت:">Location:</span>
+          <span style="color:var(--text-3); font-size:0.8rem;" data-en="Location:" data-fa="موقعیت:">Location:</span>
           <div id="location-checkboxes" style="display:flex; flex-wrap:wrap; gap:4px;"></div>
           <button class="btn btn-outline btn-sm" onclick="resetLocationFilter()" data-en="Show All" data-fa="نمایش همه">Show All</button>
         </div>
@@ -15860,9 +16160,9 @@ example.com
           <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="TCP" data-fa="TCP">TCP</th><th data-en="HTTPS" data-fa="HTTPS">HTTPS</th><th data-en="Location" data-fa="موقعیت">Location</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
         <div style="display:flex;gap:6px;margin-top:8px;">
-          <button class="btn btn-outline btn-sm" onclick="sortBestIPs()" data-en="⭐ Sort Best IPs" data-fa="⭐ مرتب‌سازی بهترین‌ها">⭐ Sort Best IPs</button>
-          <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()" data-en="📋 Copy Reachable (sorted)" data-fa="📋 کپی قابل دسترس (مرتب)">📋 Copy Reachable (sorted)</button>
-          <button class="btn btn-primary btn-sm" onclick="createProfileFromReachable()" data-en="💾 Save as Profile" data-fa="💾 ذخیره به‌عنوان پروفایل">💾 Save as Profile</button>
+          <button class="btn btn-outline btn-sm" onclick="sortBestIPs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span><span data-en="Sort Best IPs" data-fa="مرتب‌سازی بهترین‌ها">Sort Best IPs</span></button>
+          <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Reachable (sorted)" data-fa="کپی قابل دسترس (مرتب)">Copy Reachable (sorted)</span></button>
+          <button class="btn btn-primary btn-sm" onclick="createProfileFromReachable()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</span></button>
         </div>
       </div>
     </section>
@@ -15870,7 +16170,7 @@ example.com
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
       <div class="inbound-tools" style="display:flex;gap:10px;margin-bottom:16px;">
         <input id="log-search" dir="auto" placeholder="Search logs…" data-ph-en="Search logs…" data-ph-fa="جستجوی لاگ‌ها…" oninput="filterLogs()" class="fi" style="flex:1;">
-        <button class="btn btn-outline btn-sm" onclick="clearLogSearch()">✕</button>
+        <button class="btn btn-outline btn-sm" onclick="clearLogSearch()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="logs-table-container">
@@ -15882,16 +16182,16 @@ example.com
         <div class="empty" id="logs-empty" style="display:none;padding:30px;" data-en="No events recorded" data-fa="رویدادی ثبت نشده است">No events recorded</div>
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;">
-        <button class="btn btn-outline btn-sm" onclick="refreshLogs()" data-en="🔄 Refresh" data-fa="🔄 بروزرسانی">🔄 Refresh</button>
-        <button class="btn btn-outline btn-sm" onclick="fetchLogSize()" data-en="📏 Log Size" data-fa="📏 حجم لاگ">📏 Log Size</button>
-        <button class="btn btn-danger btn-sm" onclick="clearLogs()" data-en="🗑️ Clear Logs" data-fa="🗑️ پاک‌سازی لاگ‌ها">🗑️ Clear Logs</button>
+        <button class="btn btn-outline btn-sm" onclick="refreshLogs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button>
+        <button class="btn btn-outline btn-sm" onclick="fetchLogSize()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17L17 3l4 4L7 21z"/><line x1="8" y1="12" x2="10" y2="14"/><line x1="11" y1="9" x2="13" y2="11"/><line x1="14" y1="6" x2="16" y2="8"/></svg></span><span data-en="Log Size" data-fa="حجم لاگ">Log Size</span></button>
+        <button class="btn btn-danger btn-sm" onclick="clearLogs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Clear Logs" data-fa="پاک‌سازی لاگ‌ها">Clear Logs</span></button>
       </div>
     </section>
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram" data-fa="تلگرام">Telegram</div></div>
       <div class="card">
         <div class="card-hd"><span class="card-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</span><span id="tg-bot-status" class="tag tag-off">not configured</span></div>
-        <div id="tg-bot-status-line" style="color:var(--text3);font-size:0.85rem;padding:2px 0 8px;">Add Bot Token and Chat ID, then press Test.</div>
+        <div id="tg-bot-status-line" style="color:var(--text-3);font-size:0.85rem;padding:2px 0 8px;">Add Bot Token and Chat ID, then press Test.</div>
         <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" id="tg-token"></div>
         <div class="fg"><label class="fl" data-en="Chat ID" data-fa="شناسه چت">Chat ID</label><input class="fi" id="tg-chat-id"></div>
         <div class="fg"><label class="fl" data-en="Notify Events" data-fa="رویدادهای اطلاع‌رسانی">Notify Events</label>
@@ -15901,7 +16201,7 @@ example.com
             <label><input type="checkbox" value="expiry" class="tg-event"> <span data-en="Expiry" data-fa="انقضا">Expiry</span></label>
             <label><input type="checkbox" value="error" class="tg-event"> <span data-en="Error" data-fa="خطا">Error</span></label>
           </div>
-          <small style="color:var(--text3); font-size:0.75rem; display:block; margin-top:4px;"
+          <small style="color:var(--text-3); font-size:0.75rem; display:block; margin-top:4px;"
                  data-en="These events trigger instant alerts, not the periodic stats report."
                  data-fa="این رویدادها فقط برای هشدارهای لحظه‌ای هستند و روی گزارش دوره‌ای تأثیری ندارند.">
             These events trigger instant alerts, not the periodic stats report.
@@ -15914,16 +16214,16 @@ example.com
           <input type="hidden" id="tg-lang-hidden" value="en">
         </div>
         <div class="fg"><label class="fl" data-en="Custom Templates (EN)" data-fa="قالب‌های سفارشی (EN)">Custom Templates (EN)</label>
-          <textarea class="fi" id="tg-templates-en" rows="4" dir="ltr" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
-          <small style="color:var(--text3);font-size:0.8rem;display:block;margin-top:4px;">One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error.</small>
+          <textarea class="fi" id="tg-templates-en" rows="4" dir="ltr" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"{label} ({uid}) used 90% of quota","login":"SulgX Panel login\nIP: {ip}\nUA: {ua}\n{time}","expiry":"{label} expired","error":"Error on {label}: check logs"}</textarea>
+          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;">One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error.</small>
         </div>
         <div class="fg"><label class="fl" data-en="Custom Templates (FA)" data-fa="قالب‌های سفارشی (FA)">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4" dir="auto" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
-          <small style="color:var(--text3);font-size:0.8rem;display:block;margin-top:4px;" dir="auto">یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.</small>
+          <textarea class="fi" id="tg-templates-fa" rows="4" dir="auto" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"{label} ({uid}) ۹۰٪ کوتا","login":"ورود SulgX\nIP: {ip}\nUA: {ua}\n{time}","expiry":"{label} منقضی شد","error":"خطا در {label}: بررسی شود"}</textarea>
+          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;" dir="auto">یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.</small>
         </div>
         <div style="margin:6px 0;">
           <button class="btn btn-outline btn-sm" onclick="previewTemplate()" data-en="Preview" data-fa="پیش‌نمایش">Preview</button>
-          <div id="tg-preview" style="margin-top:6px; padding:8px; background:var(--surface3); border-radius:8px; white-space:pre-wrap;"></div>
+          <div id="tg-preview" style="margin-top:6px; padding:8px; background:var(--surface-3); border-radius:8px; white-space:pre-wrap;"></div>
         </div>
         <div style="display:flex;gap:6px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
       </div>
@@ -15935,7 +16235,7 @@ example.com
     <section class="page" id="page-active-users">
       <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions</div></div><button class="btn btn-outline btn-sm" onclick="refreshActiveUsers(this)">Refresh</button></div>
       <div class="card">
-        <div class="card-hd"><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span><span id="active-users-summary" style="color:var(--text2);font-size:0.85rem;"></span></div>
+        <div class="card-hd"><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span><span id="active-users-summary" style="color:var(--text-2);font-size:0.85rem;"></span></div>
         <div id="active-users-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;"></div>
       </div>
     </section>
@@ -15947,10 +16247,10 @@ example.com
         <div class="fg"><label class="fl" data-en="Default XHTTP Path" data-fa="مسیر پیش‌فرض XHTTP">Default XHTTP Path</label><input class="fi" id="set-default-xhttp-path" placeholder="/xhttp"></div>
         <div class="fg">
           <label class="fl" data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</label>
-          <div class="glass-btn-group" id="tz-glass-group">
-            <button type="button" class="glass-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')" data-en="UTC (00:00)" data-fa="UTC (۰۰:۰۰)">UTC (00:00)</button>
-            <button type="button" class="glass-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')" data-en="Tehran (+3:30)" data-fa="تهران (+۳:۳۰)">Tehran (+3:30)</button>
-            <button type="button" class="glass-btn" id="btn-tz-custom" onclick="toggleCustomTZInput(true)" data-en="Custom" data-fa="سفارشی">Custom</button>
+          <div class="seg-group" id="tz-seg-group">
+            <button type="button" class="seg-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')" data-en="UTC (00:00)" data-fa="UTC (۰۰:۰۰)">UTC (00:00)</button>
+            <button type="button" class="seg-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')" data-en="Tehran (+3:30)" data-fa="تهران (+۳:۳۰)">Tehran (+3:30)</button>
+            <button type="button" class="seg-btn" id="btn-tz-custom" onclick="toggleCustomTZInput(true)" data-en="Custom" data-fa="سفارشی">Custom</button>
           </div>
           <div id="custom-tz-container" style="display:none; margin-top:10px;">
             <input type="text" class="fi" id="custom-tz-value" placeholder="e.g. Asia/Tehran or +3.5" data-ph-en="e.g. Asia/Tehran or +3.5" data-ph-fa="مثلاً Asia/Tehran یا +3.5" oninput="applyCustomTZ(this.value)">
@@ -15958,29 +16258,29 @@ example.com
         </div>
         <div class="fg">
           <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
-          <div class="glass-btn-group" id="theme-glass-group">
-            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')" data-en="Dark" data-fa="تیره">Dark</button>
-            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')" data-en="Light" data-fa="روشن">Light</button>
-            <button type="button" class="glass-btn" id="btn-theme-blue-dark" onclick="setPanelTheme('blue-dark')" data-en="Blue" data-fa="آبی">Blue</button>
+          <div class="seg-group" id="theme-seg-group">
+            <button type="button" class="seg-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')" data-en="Dark" data-fa="تیره">Dark</button>
+            <button type="button" class="seg-btn" id="btn-theme-light" onclick="setPanelTheme('light')" data-en="Light" data-fa="روشن">Light</button>
+            <button type="button" class="seg-btn" id="btn-theme-blue-dark" onclick="setPanelTheme('blue-dark')" data-en="Blue" data-fa="آبی">Blue</button>
           </div>
           <input type="hidden" id="set-theme-color" value="dark">
         </div>
         <div class="fg">
           <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
-          <div class="glass-btn-group" id="lang-glass-group">
-            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')" data-en="English" data-fa="انگلیسی">English</button>
-            <button type="button" class="glass-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
+          <div class="seg-group" id="lang-seg-group">
+            <button type="button" class="seg-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')" data-en="English" data-fa="انگلیسی">English</button>
+            <button type="button" class="seg-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
           </div>
         </div>
         <div class="fg"><label class="fl" data-en="Keep Alive" data-fa="ضدخواب">Keep Alive</label>
-          <div class="glass-btn-group" id="keepalive-mode-group">
-            <button type="button" class="glass-btn active" id="btn-keepalive-simple" onclick="setKeepAliveMode('simple')" data-en="Simple" data-fa="ساده">Simple</button>
-            <button type="button" class="glass-btn" id="btn-keepalive-advanced" onclick="setKeepAliveMode('advanced')" data-en="Advanced" data-fa="پیشرفته">Advanced</button>
+          <div class="seg-group" id="keepalive-mode-group">
+            <button type="button" class="seg-btn active" id="btn-keepalive-simple" onclick="setKeepAliveMode('simple')" data-en="Simple" data-fa="ساده">Simple</button>
+            <button type="button" class="seg-btn" id="btn-keepalive-advanced" onclick="setKeepAliveMode('advanced')" data-en="Advanced" data-fa="پیشرفته">Advanced</button>
           </div>
           <input type="hidden" id="set-keepalive-mode" value="simple">
           <div class="status-cards-grid" style="margin-top:8px;grid-template-columns:repeat(auto-fit,minmax(200px,260px));justify-content:start;">
-            <div class="status-glass-card active" id="card-keepalive" onclick="toggleSettingCard('card-keepalive', 'set-keepalive-enabled')">
-              <span style="font-size:1.5rem;">⚡</span><span data-en="Keep-Alive Enabled" data-fa="ضدخواب فعال">Keep-Alive</span>
+            <div class="status-card active" id="card-keepalive" onclick="toggleSettingCard('card-keepalive', 'set-keepalive-enabled')">
+              <span class="ic" style="--ic:24px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span data-en="Keep-Alive Enabled" data-fa="ضدخواب فعال">Keep-Alive</span>
               <input type="hidden" id="set-keepalive-enabled" value="1">
             </div>
           </div>
@@ -16015,8 +16315,8 @@ example.com
           <input class="fi" id="custom-doh-input" placeholder="Custom upstream URL" data-ph-en="Custom upstream URL" data-ph-fa="آدرس آپ‌استریم سفارشی" style="margin-top:6px;">
           <button class="btn btn-outline btn-sm" onclick="addCustomDoh()" data-en="Add" data-fa="افزودن">Add</button>
           <div class="status-cards-grid" style="margin-top:8px;">
-            <div class="status-glass-card active" id="card-doh" onclick="toggleSettingCard('card-doh', 'set-doh-enabled')">
-              <span style="font-size:1.5rem;">🌐</span><span data-en="DoH Enabled" data-fa="DoH فعال">DoH</span>
+            <div class="status-card active" id="card-doh" onclick="toggleSettingCard('card-doh', 'set-doh-enabled')">
+              <span class="ic" style="--ic:24px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="DoH Enabled" data-fa="DoH فعال">DoH</span>
               <input type="hidden" id="set-doh-enabled" value="1">
             </div>
           </div>
@@ -16029,9 +16329,9 @@ example.com
           </div>
         </div>
         <div class="fg" style="margin-top:10px; padding:15px; background:rgba(251,191,36,0.05); border:1px solid rgba(251,191,36,0.3); border-radius:16px;">
-          <label class="fl" style="color:var(--yellow);" data-en="Anti-Abuse & Stealth" data-fa="ضد ابیوز و استتار">Anti-Abuse & Stealth</label>
+          <label class="fl" style="color:var(--warning);" data-en="Anti-Abuse & Stealth" data-fa="ضد ابیوز و استتار">Anti-Abuse & Stealth</label>
           <div class="status-cards-grid" style="margin-bottom:10px;">
-            <div class="status-glass-card inactive" id="card-stealth" onclick="toggleSettingCard('card-stealth', 'set-stealth-mode')">
+            <div class="status-card inactive" id="card-stealth" onclick="toggleSettingCard('card-stealth', 'set-stealth-mode')">
               <span class="status-icon icon-stealth"></span><span data-en="Stealth Mode" data-fa="حالت استتار (مخفی‌سازی اسکنر)">Stealth Mode</span>
               <input type="hidden" id="set-stealth-mode" value="0">
             </div>
@@ -16054,19 +16354,19 @@ example.com
         <div class="fg" style="margin-top:20px;">
           <label class="fl" data-en="System Toggles" data-fa="وضعیت تنظیمات">System Toggles</label>
           <div class="status-cards-grid">
-            <div class="status-glass-card active" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
+            <div class="status-card active" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
               <span class="status-icon icon-logs"></span><span data-en="Logs" data-fa="لاگ سیستم">Logs</span>
               <input type="hidden" id="set-log-toggle" value="1">
             </div>
-            <div class="status-glass-card active" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
+            <div class="status-card active" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
               <span class="status-icon icon-auto-disable"></span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
               <input type="hidden" id="set-auto-disable" value="1">
             </div>
-            <div class="status-glass-card active" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
+            <div class="status-card active" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
               <span class="status-icon icon-tg-reports"></span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
               <input type="hidden" id="set-tg-report" value="1">
             </div>
-            <div class="status-glass-card active" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
+            <div class="status-card active" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
               <span class="status-icon icon-tg-notify"></span><span data-en="TG Alerts" data-fa="اعلان تلگرام">TG Alerts</span>
               <input type="hidden" id="set-tg-notify" value="1">
             </div>
@@ -16083,7 +16383,7 @@ example.com
         <hr style="border-color:var(--border);margin:14px 0;">
         <div style="display:flex;align-items:center;gap:10px;">
           <button class="btn btn-danger" onclick="resetAllSettings()" data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</button>
-          <span style="font-size:0.8rem;color:var(--text3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
+          <span style="font-size:0.8rem;color:var(--text-3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
         </div>
       </div>
     </section>
@@ -16106,34 +16406,35 @@ example.com
       <a href="https://t.me/SulgX" target="_blank" data-en="Telegram" data-fa="Telegram">Telegram</a>
       <a href="https://github.com/SulgX" target="_blank">GitHub</a>
       <a href="https://github.com/SulgX/SulgX-Panel" target="_blank" data-en="Project Repo" data-fa="مخزن پروژه">Project Repo</a>
+      <span style="color:var(--text-2);font-size:0.85rem;">Telegram proxies powered by telemt (TELEMT LICENSE 3.3)</span>
     </div>
   </footer>
 </div>
 <div class="mo" id="mo-add" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="Leave empty for random name" data-ph-en="Leave empty for random name" data-ph-fa="برای نام تصادفی خالی بگذارید" maxlength="60"></div>
     <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
       <select class="fs" id="flag-select-create" onchange="applyFlagCreate()">
         <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
-        <option value="cn" data-en="🇨🇳 China" data-fa="🇨🇳 چین">🇨🇳 China</option>
-        <option value="nl" data-en="🇳🇱 Netherlands" data-fa="🇳🇱 هلند">🇳🇱 Netherlands</option>
-        <option value="ru" data-en="🇷🇺 Russia" data-fa="🇷🇺 روسیه">🇷🇺 Russia</option>
-        <option value="us" data-en="🇺🇸 United States" data-fa="🇺🇸 ایالات متحده">🇺🇸 United States</option>
-        <option value="ca" data-en="🇨🇦 Canada" data-fa="🇨🇦 کانادا">🇨🇦 Canada</option>
-        <option value="ir" data-en="🇮🇷 Iran" data-fa="🇮🇷 ایران">🇮🇷 Iran</option>
-        <option value="de" data-en="🇩🇪 Germany" data-fa="🇩🇪 آلمان">🇩🇪 Germany</option>
-        <option value="gb" data-en="🇬🇧 United Kingdom" data-fa="🇬🇧 بریتانیا">🇬🇧 United Kingdom</option>
-        <option value="it" data-en="🇮🇹 Italy" data-fa="🇮🇹 ایتالیا">🇮🇹 Italy</option>
-        <option value="fr" data-en="🇫🇷 France" data-fa="🇫🇷 فرانسه">🇫🇷 France</option>
-        <option value="tr" data-en="🇹🇷 Turkey" data-fa="🇹🇷 ترکیه">🇹🇷 Turkey</option>
-        <option value="ae" data-en="🇦🇪 UAE" data-fa="🇦🇪 امارات">🇦🇪 UAE</option>
+        <option value="cn" data-en="CN China" data-fa="CN چین">CN China</option>
+        <option value="nl" data-en="NL Netherlands" data-fa="NL هلند">NL Netherlands</option>
+        <option value="ru" data-en="RU Russia" data-fa="RU روسیه">RU Russia</option>
+        <option value="us" data-en="US United States" data-fa="US ایالات متحده">US United States</option>
+        <option value="ca" data-en="CA Canada" data-fa="CA کانادا">CA Canada</option>
+        <option value="ir" data-en="IR Iran" data-fa="IR ایران">IR Iran</option>
+        <option value="de" data-en="DE Germany" data-fa="DE آلمان">DE Germany</option>
+        <option value="gb" data-en="GB United Kingdom" data-fa="GB بریتانیا">GB United Kingdom</option>
+        <option value="it" data-en="IT Italy" data-fa="IT ایتالیا">IT Italy</option>
+        <option value="fr" data-en="FR France" data-fa="FR فرانسه">FR France</option>
+        <option value="tr" data-en="TR Turkey" data-fa="TR ترکیه">TR Turkey</option>
+        <option value="ae" data-en="AE UAE" data-fa="AE امارات">AE UAE</option>
         <option value="custom" data-en="Custom (2-letter)" data-fa="سفارشی (۲ حرفی)">Custom (2-letter)</option>
       </select>
       <input class="fi" id="flag-custom-create" placeholder="e.g. jp" data-ph-en="e.g. jp" data-ph-fa="مثلاً jp" style="display:none; margin-top:5px;" maxlength="2">
       <input type="hidden" id="flag-code-create" value="">
-      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagCreate()" style="margin-top:4px;" data-en="🔍 Auto Detect" data-fa="🔍 تشخیص خودکار">🔍 Auto Detect</button>
+      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagCreate()" style="margin-top:4px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span data-en="Auto Detect" data-fa="تشخیص خودکار">Auto Detect</span></button>
     </div>
     <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
       <select class="fs" id="aprotocol" onchange="toggleProxyFields('create')">
@@ -16152,14 +16453,14 @@ example.com
       </select>
     </div>
     <div id="cred-fields-create">
-      <div class="fg" id="fg-auuid"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')" data-en="🎲 Generate" data-fa="🎲 تولید">🎲 Generate</button></div></div>
+      <div class="fg" id="fg-auuid"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
       <div class="fg" id="fg-avmess-security"><label class="fl" data-en="VMess Security" data-fa="امنیت VMess">VMess Security</label>
       <select class="fs" id="avmess-security">
       <option value="auto" data-en="auto (recommended)" data-fa="auto (پیشنهادی)">auto (recommended)</option>
       <option value="aes-128-gcm" data-en="aes-128-gcm" data-fa="aes-128-gcm">aes-128-gcm</option>
       <option value="chacha20-poly1305" data-en="chacha20-poly1305" data-fa="chacha20-poly1305">chacha20-poly1305</option>
       </select></div>
-      <div class="fg" id="fg-apassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="apassword" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('apassword')" data-en="🎲 Generate" data-fa="🎲 تولید">🎲 Generate</button></div><div style="font-size:0.85rem;color:var(--text3);">Trojan password. It must be a UUID.</div></div>
+      <div class="fg" id="fg-apassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="apassword" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('apassword')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Trojan password. It must be a UUID.</div></div>
       <div class="fg" id="fg-ass-method"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
       <select class="fs" id="ass-method">
       <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
@@ -16170,9 +16471,9 @@ example.com
       <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
       </select>
       </div>
-      <div class="fg" id="fg-ass-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ass-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text3);">For 2022 methods this must be a base64 key of the right length. For classic methods it is the password.</div></div>
+      <div class="fg" id="fg-ass-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ass-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);">For 2022 methods this must be a base64 key of the right length. For classic methods it is the password.</div></div>
       <div class="fg" id="fg-aproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="aproxy-username" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
-      <div class="fg" id="fg-aproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="aproxy-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateProxyAuth('create')" data-en="🎲 Generate" data-fa="🎲 تولید">🎲 Generate</button></div><div style="font-size:0.85rem;color:var(--text3);">Username and password are identical: both are the link UUID used for auth.</div></div>
+      <div class="fg" id="fg-aproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="aproxy-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateProxyAuth('create')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Leave both empty for an auto-generated code, or type any username and password (username: no : @ / ? # or spaces; password: no spaces).</div></div>
       <div class="fg" id="fg-amtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
       <select class="fs" id="amtproto-variant" onchange="toggleProxyFields('create')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
@@ -16185,19 +16486,19 @@ example.com
       <select class="fs" id="awebproxy-port">
       <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
       </select>
-      <div class="hint" style="color:var(--text3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
+      <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
       <div class="fg" id="fg-awebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><input class="fi" id="awebproxy-secret" readonly placeholder="Derived after creation — each user gets their own link" data-ph-en="Derived after creation — each user gets their own link" data-ph-fa="پس از ایجاد ساخته می‌شود — هر کاربر لینک جدا دارد"></div>
       <div class="fg" id="fg-awebproxy-token"><label class="fl" data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</label><input class="fi" id="awebproxy-token" readonly placeholder="Assigned by token routing after creation" data-ph-en="Assigned by token routing after creation" data-ph-fa="پس از ایجاد، توسط مسیریابی توکن اختصاص می‌یابد"></div>
     </div>
     <div id="proxy-fields-create" style="display:none;">
-      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="aproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
+      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="aproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
     </div>
     <div class="fg" id="adv-toggle-row-create"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
-    <div class="hint" id="adv-hint-create" style="color:var(--text3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
+    <div class="hint" id="adv-hint-create" style="color:var(--text-3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-create" class="adv-section">
         <div class="fg" data-adv="profile"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
           <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="youtube" data-en="YouTube" data-fa="YouTube">YouTube</option><option value="instagram" data-en="Instagram" data-fa="Instagram">Instagram</option><option value="twitter" data-en="Twitter" data-fa="Twitter">Twitter</option><option value="tiktok" data-en="TikTok" data-fa="TikTok">TikTok</option><option value="whatsapp" data-en="WhatsApp" data-fa="WhatsApp">WhatsApp</option><option value="telegram" data-en="Telegram" data-fa="Telegram">Telegram</option><option value="netflix" data-en="Netflix" data-fa="Netflix">Netflix</option><option value="spotify" data-en="Spotify" data-fa="Spotify">Spotify</option><option value="google" data-en="Google" data-fa="Google">Google</option></select>
-          <small style="color:var(--text3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
+          <small style="color:var(--text-3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
         </div>
         <div class="fg" data-adv="path"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
         <div class="fg" data-adv="sni"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="asni" placeholder="example.com"></div>
@@ -16295,19 +16596,19 @@ example.com
         <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="aowner-name" placeholder="Owner name (optional)" maxlength="60"></div>
         <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="aowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
     <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="hint" id="consumed-create" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;">Consumed: 0 B</div>
+    <div class="hint" id="consumed-create" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;">Consumed: 0 B</div>
     <div class="fg"><label class="fl" data-en="Max Sessions" data-fa="حداکثر نشست‌ها">Max Sessions</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
     <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('create')"></div>
-    <div class="hint" id="expires-preview-create" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
-    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#39ff14"></div>
+    <div class="hint" id="expires-preview-create" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
+    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#3b82f6"></div>
     <div class="fg" id="fg-outbound-proxy-create">
       <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
       <select class="fs" id="proxy-line-select-create">
         <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
       <input class="fi" id="proxy-line-text-create" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" style="margin-top:6px;">
-      <div style="font-size:0.85rem;color:var(--text3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
-      <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('create')" style="margin-top:6px;" data-en="🌍 Refresh Flags" data-fa="🌍 بروزرسانی پرچم‌ها">🌍 Refresh Flags</button>
+      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
+      <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('create')" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Refresh Flags" data-fa="بروزرسانی پرچم‌ها">Refresh Flags</span></button>
     </div>
     <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
   </div>
@@ -16315,7 +16616,7 @@ example.com
 
 <div class="mo" id="mo-edit" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
     <input type="hidden" id="eu">
     <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
@@ -16342,7 +16643,7 @@ example.com
       <option value="aes-128-gcm" data-en="aes-128-gcm" data-fa="aes-128-gcm">aes-128-gcm</option>
       <option value="chacha20-poly1305" data-en="chacha20-poly1305" data-fa="chacha20-poly1305">chacha20-poly1305</option>
       </select></div>
-      <div class="fg" id="fg-epassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="epassword" readonly><div style="font-size:0.85rem;color:var(--text3);">Trojan password is the UUID. Change it with Regenerate UUID.</div></div>
+      <div class="fg" id="fg-epassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="epassword" readonly><div style="font-size:0.85rem;color:var(--text-3);">Trojan password is the UUID. Change it with Regenerate UUID.</div></div>
       <div class="fg" id="fg-ess-method"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
       <select class="fs" id="ess-method">
       <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
@@ -16355,7 +16656,7 @@ example.com
       </div>
       <div class="fg" id="fg-ess-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ess-password" placeholder="Leave empty to keep the current key" data-ph-en="Leave empty to keep the current key" data-ph-fa="برای حفظ کلید فعلی خالی بگذارید"></div>
       <div class="fg" id="fg-eproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="eproxy-username" readonly></div>
-      <div class="fg" id="fg-eproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="eproxy-password" readonly><div style="font-size:0.85rem;color:var(--text3);">Username and password are identical: both are the link UUID used for auth.</div></div>
+      <div class="fg" id="fg-eproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="eproxy-password" readonly><div style="font-size:0.85rem;color:var(--text-3);">Per-inbound credentials: a generated code when left empty at create time, or the values typed at create time.</div></div>
       <div class="fg" id="fg-emtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
       <select class="fs" id="emtproto-variant" onchange="toggleProxyFields('edit')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
@@ -16368,41 +16669,41 @@ example.com
       <select class="fs" id="ewebproxy-port">
       <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
       </select>
-      <div class="hint" style="color:var(--text3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
+      <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
       <div class="fg" id="fg-ewebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><input class="fi" id="ewebproxy-secret" readonly></div>
       <div class="fg" id="fg-ewebproxy-token"><label class="fl" data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</label><input class="fi" id="ewebproxy-token" readonly placeholder="Assigned by token routing" data-ph-en="Assigned by token routing" data-ph-fa="توسط مسیریابی توکن اختصاص می‌یابد"></div>
     </div>
     <div id="proxy-fields-edit" style="display:none;">
-      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="eproxy-hint" style="color:var(--text3);font-size:0.85rem;"></div></div>
+      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="eproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
     </div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" maxlength="60"></div>
     <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
       <select class="fs" id="flag-select-edit" onchange="applyFlagEdit()">
         <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
-        <option value="cn" data-en="🇨🇳 China" data-fa="🇨🇳 چین">🇨🇳 China</option>
-        <option value="nl" data-en="🇳🇱 Netherlands" data-fa="🇳🇱 هلند">🇳🇱 Netherlands</option>
-        <option value="ru" data-en="🇷🇺 Russia" data-fa="🇷🇺 روسیه">🇷🇺 Russia</option>
-        <option value="us" data-en="🇺🇸 United States" data-fa="🇺🇸 ایالات متحده">🇺🇸 United States</option>
-        <option value="ca" data-en="🇨🇦 Canada" data-fa="🇨🇦 کانادا">🇨🇦 Canada</option>
-        <option value="ir" data-en="🇮🇷 Iran" data-fa="🇮🇷 ایران">🇮🇷 Iran</option>
-        <option value="de" data-en="🇩🇪 Germany" data-fa="🇩🇪 آلمان">🇩🇪 Germany</option>
-        <option value="gb" data-en="🇬🇧 United Kingdom" data-fa="🇬🇧 بریتانیا">🇬🇧 United Kingdom</option>
-        <option value="it" data-en="🇮🇹 Italy" data-fa="🇮🇹 ایتالیا">🇮🇹 Italy</option>
-        <option value="fr" data-en="🇫🇷 France" data-fa="🇫🇷 فرانسه">🇫🇷 France</option>
-        <option value="tr" data-en="🇹🇷 Turkey" data-fa="🇹🇷 ترکیه">🇹🇷 Turkey</option>
-        <option value="ae" data-en="🇦🇪 UAE" data-fa="🇦🇪 امارات">🇦🇪 UAE</option>
+        <option value="cn" data-en="CN China" data-fa="CN چین">CN China</option>
+        <option value="nl" data-en="NL Netherlands" data-fa="NL هلند">NL Netherlands</option>
+        <option value="ru" data-en="RU Russia" data-fa="RU روسیه">RU Russia</option>
+        <option value="us" data-en="US United States" data-fa="US ایالات متحده">US United States</option>
+        <option value="ca" data-en="CA Canada" data-fa="CA کانادا">CA Canada</option>
+        <option value="ir" data-en="IR Iran" data-fa="IR ایران">IR Iran</option>
+        <option value="de" data-en="DE Germany" data-fa="DE آلمان">DE Germany</option>
+        <option value="gb" data-en="GB United Kingdom" data-fa="GB بریتانیا">GB United Kingdom</option>
+        <option value="it" data-en="IT Italy" data-fa="IT ایتالیا">IT Italy</option>
+        <option value="fr" data-en="FR France" data-fa="FR فرانسه">FR France</option>
+        <option value="tr" data-en="TR Turkey" data-fa="TR ترکیه">TR Turkey</option>
+        <option value="ae" data-en="AE UAE" data-fa="AE امارات">AE UAE</option>
         <option value="custom" data-en="Custom (2-letter)" data-fa="سفارشی (۲ حرفی)">Custom (2-letter)</option>
       </select>
       <input class="fi" id="flag-custom-edit" placeholder="e.g. jp" data-ph-en="e.g. jp" data-ph-fa="مثلاً jp" style="display:none; margin-top:5px;" maxlength="2">
       <input type="hidden" id="flag-code-edit" value="">
-      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagEdit()" style="margin-top:4px;" data-en="🔍 Auto Detect" data-fa="🔍 تشخیص خودکار">🔍 Auto Detect</button>
+      <button class="btn btn-outline btn-sm" onclick="autoDetectFlagEdit()" style="margin-top:4px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span data-en="Auto Detect" data-fa="تشخیص خودکار">Auto Detect</span></button>
     </div>
     <div class="fg" id="adv-toggle-row-edit"><button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
-    <div class="hint" id="adv-hint-edit" style="color:var(--text3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
+    <div class="hint" id="adv-hint-edit" style="color:var(--text-3);font-size:0.85rem;">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-edit" class="adv-section">
         <div class="fg" data-adv="profile"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
           <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="youtube" data-en="YouTube" data-fa="YouTube">YouTube</option><option value="instagram" data-en="Instagram" data-fa="Instagram">Instagram</option><option value="twitter" data-en="Twitter" data-fa="Twitter">Twitter</option><option value="tiktok" data-en="TikTok" data-fa="TikTok">TikTok</option><option value="whatsapp" data-en="WhatsApp" data-fa="WhatsApp">WhatsApp</option><option value="telegram" data-en="Telegram" data-fa="Telegram">Telegram</option><option value="netflix" data-en="Netflix" data-fa="Netflix">Netflix</option><option value="spotify" data-en="Spotify" data-fa="Spotify">Spotify</option><option value="google" data-en="Google" data-fa="Google">Google</option></select>
-          <small style="color:var(--text3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
+          <small style="color:var(--text-3);font-size:0.75rem;" data-en="App profiles only change SNI/Host for DPI bypass and do not affect server connection." data-fa="پروفایل‌های اپ فقط SNI/Host را برای عبور از DPI تغییر می‌دهند و روی اتصال سرور تأثیری ندارند.">App profiles only change SNI/Host for DPI bypass and do not affect server connection.</small>
         </div>
         <div class="fg" data-adv="path"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ep"></div>
         <div class="fg" data-adv="sni"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="esni"></div>
@@ -16500,20 +16801,20 @@ example.com
         <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="eowner-name" placeholder="Owner name (optional)" maxlength="60"></div>
         <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="eowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
     <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Used / Limit / Remaining" data-fa="مصرف / سقف / باقی‌مانده">Used / Limit / Remaining</label><div class="hint" id="eusage" style="color:var(--text2);font-size:0.9rem;"></div></div>
+    <div class="fg"><label class="fl" data-en="Used / Limit / Remaining" data-fa="مصرف / سقف / باقی‌مانده">Used / Limit / Remaining</label><div class="hint" id="eusage" style="color:var(--text-2);font-size:0.9rem;"></div></div>
     <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
     <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('edit')"></div>
-    <div class="hint" id="expires-preview-edit" style="color:var(--text3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
-    <div class="fg"><label class="fl" data-en="Consumed Volume" data-fa="حجم مصرف‌شده">Consumed Volume</label><div class="hint" id="eused-summary" style="color:var(--text2);font-size:0.9rem;">–</div></div>
-    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#39ff14"></div>
+    <div class="hint" id="expires-preview-edit" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
+    <div class="fg"><label class="fl" data-en="Consumed Volume" data-fa="حجم مصرف‌شده">Consumed Volume</label><div class="hint" id="eused-summary" style="color:var(--text-2);font-size:0.9rem;">–</div></div>
+    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#3b82f6"></div>
     <div class="fg" id="fg-outbound-proxy-edit">
       <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
       <select class="fs" id="proxy-line-select-edit">
         <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
       <input class="fi" id="proxy-line-text-edit" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" style="margin-top:6px;">
-      <div style="font-size:0.85rem;color:var(--text3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
-      <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('edit')" style="margin-top:6px;" data-en="🌍 Refresh Flags" data-fa="🌍 بروزرسانی پرچم‌ها">🌍 Refresh Flags</button>
+      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
+      <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('edit')" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Refresh Flags" data-fa="بروزرسانی پرچم‌ها">Refresh Flags</span></button>
     </div>
     <div class="fg"><label class="fl" data-en="Link text" data-fa="متن لینک">Link text</label><div style="display:flex;gap:6px;"><input class="fi" id="edit-link-text" readonly style="direction:ltr;text-align:left;flex:1;min-width:0;"><button class="btn btn-outline btn-sm" onclick="copyToClipboard(document.getElementById('edit-link-text').value)" data-en="Copy" data-fa="کپی">Copy</button></div></div>
     <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="regenUuidFromEdit()" data-en="Regenerate UUID" data-fa="تولید دوباره UUID">Regenerate UUID</button><button class="btn btn-outline btn-sm" onclick="disconnectFromEdit()" data-en="Disconnect all" data-fa="قطع همه اتصال‌ها">Disconnect all</button></div>
@@ -16523,18 +16824,18 @@ example.com
 
 <div class="mo" id="mo-qr" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box" style="max-width:360px;">
-    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="QR Code" data-fa="کد QR">QR Code</div>
-    <div class="qr-box"><img id="qr-img" src="" alt="QR Code"></div>
+    <div class="qr-box"><canvas id="qr-canvas" width="280" height="280" role="img" aria-label="QR code"></canvas></div>
     <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:10px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
   </div>
 </div>
 
 <div class="mo" id="mo-confirm" onclick="if(event.target===this) _confirmDone(false)">
   <div class="mo-box" style="max-width:420px;">
-    <button class="mo-close" onclick="_confirmDone(false)">✕</button>
+    <button class="mo-close" onclick="_confirmDone(false)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Confirm" data-fa="تأیید">Confirm</div>
-    <div id="confirm-msg" style="color:var(--text2);font-size:0.95rem;line-height:1.6;margin:8px 0 4px;"></div>
+    <div id="confirm-msg" style="color:var(--text-2);font-size:0.95rem;line-height:1.6;margin:8px 0 4px;"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
       <button class="btn btn-outline" onclick="_confirmDone(false)" data-en="Cancel" data-fa="انصراف">Cancel</button>
       <button class="btn btn-danger" id="confirm-ok" onclick="_confirmDone(true)">Delete</button>
@@ -16544,7 +16845,7 @@ example.com
 
 <div class="mo" id="mo-addr-edit" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Edit Address" data-fa="ویرایش آدرس">Edit Address</div>
     <div class="fg"><label class="fl" data-en="New Address" data-fa="آدرس جدید">New Address</label><input class="fi" id="edit-addr-input"></div>
     <button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
@@ -16553,7 +16854,7 @@ example.com
 
 <div class="mo" id="mo-quick-add" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-quick-add').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-quick-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Quick Add Inbound" data-fa="ساخت سریع اینباند">Quick Add Inbound</div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="quick-label"></div>
     <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
@@ -16580,7 +16881,7 @@ example.com
       <option value="chacha20-poly1305">chacha20-poly1305</option>
       </select>
     </div>
-    <div class="fg" id="fg-quick-password" style="display:none;"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="quick-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text3);">Trojan password. It must be a UUID.</div></div>
+    <div class="fg" id="fg-quick-password" style="display:none;"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="quick-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);">Trojan password. It must be a UUID.</div></div>
     <div class="fg" id="fg-quick-ss-method" style="display:none;"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
       <select class="fs" id="quick-ss-method">
       <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
@@ -16603,9 +16904,9 @@ example.com
       <select class="fs" id="quick-webproxy-port">
       <option value="443">443</option><option value="2053">2053</option><option value="2083">2083</option><option value="2087">2087</option><option value="2096">2096</option><option value="8443">8443</option>
       </select>
-      <div class="hint" style="color:var(--text3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
-    <div class="fg" id="fg-quick-proxy-note" style="display:none;"><div class="hint" style="color:var(--text3);font-size:0.85rem;">Username and password are auto-generated (both are the link UUID used for auth).</div></div>
-    <div class="fg" id="fg-quick-secret-note" style="display:none;"><div class="hint" style="color:var(--text3);font-size:0.85rem;">Secret is derived per inbound after creation.</div></div>
+      <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
+    <div class="fg" id="fg-quick-proxy-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;">Username and password are auto-generated when left empty.</div></div>
+    <div class="fg" id="fg-quick-secret-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;">Secret is derived per inbound after creation.</div></div>
     <div class="fg"><label class="fl" data-en="Traffic (GB)" data-fa="حجم (گیگ)">Traffic (GB)</label><input class="fi" type="number" id="quick-limit" value="0"></div>
     <div class="fg"><label class="fl" data-en="Days" data-fa="روز">Days</label><input class="fi" type="number" id="quick-days" value="0"></div>
     <button class="btn btn-primary" onclick="quickCreate()" style="width:100%;justify-content:center;" data-en="Create & Get Link" data-fa="ایجاد و دریافت لینک">Create & Get Link</button>
@@ -16614,7 +16915,7 @@ example.com
 
 <div class="mo" id="mo-ip-profile" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-ip-profile').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-ip-profile').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Manage IP Profile" data-fa="مدیریت پروفایل آی‌پی">Manage IP Profile</div>
     <div class="fg"><label class="fl" data-en="Profile Name" data-fa="نام پروفایل">Profile Name</label><input class="fi" id="ip-profile-name"></div>
     <div class="fg">
@@ -16622,9 +16923,9 @@ example.com
       <textarea class="fi" id="ip-profile-addrs" rows="6" placeholder="1.1.1.1#MyServer+us+1
 8.8.8.8#Google+us
 example.com"></textarea>
-      <small style="color:var(--text3); font-size:0.75rem;" data-en="Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)" data-fa="قالب: IP#Name+Flag+SortNumber (نام، پرچم و شماره ترتیب اختیاری)">Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)</small>
+      <small style="color:var(--text-3); font-size:0.75rem;" data-en="Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)" data-fa="قالب: IP#Name+Flag+SortNumber (نام، پرچم و شماره ترتیب اختیاری)">Format: IP#Name+Flag+SortNumber (Name, Flag, SortNumber optional)</small>
     </div>
-    <button class="btn btn-outline btn-sm" onclick="detectFlagsForProfile()" style="margin-top:6px;" data-en="🔍 Auto-Detect Flags" data-fa="🔍 تشخیص خودکار پرچم‌ها">🔍 Auto-Detect Flags</button>
+    <button class="btn btn-outline btn-sm" onclick="detectFlagsForProfile()" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span data-en="Auto-Detect Flags" data-fa="تشخیص خودکار پرچم‌ها">Auto-Detect Flags</span></button>
     <input type="hidden" id="ip-profile-id">
     <button class="btn btn-primary" onclick="saveIpProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
   </div>
@@ -16632,7 +16933,7 @@ example.com"></textarea>
 
 <div class="mo" id="mo-scanner-profile" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-scanner-profile').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-scanner-profile').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</div>
     <div class="fg"><label class="fl" data-en="Profile Name" data-fa="نام پروفایل">Profile Name</label><input class="fi" id="scanner-profile-name"></div>
     <button class="btn btn-primary" onclick="saveScannerProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
@@ -16640,7 +16941,7 @@ example.com"></textarea>
 </div>
 <div class="mo" id="mo-proxy" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-proxy').classList.remove('show')">✕</button>
+    <button class="mo-close" onclick="document.getElementById('mo-proxy').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
     <div class="mo-title" data-en="Add/Edit Proxy" data-fa="افزودن/ویرایش پروکسی">Add/Edit Proxy</div>
     <input type="hidden" id="proxy-id">
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="proxy-name"></div>
@@ -16725,7 +17026,7 @@ function copyToClipboard(text) {
 function fallbackCopy(text) {
     var textArea = document.createElement("textarea");
     textArea.value = text;
-    textArea.style.top = "0"; textArea.style.left = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
+    textArea.style.top = "0"; textArea.style.insetInlineStart = "0"; textArea.style.position = "fixed"; textArea.style.opacity = "0";
     document.body.appendChild(textArea);
     textArea.focus(); textArea.select();
     try {
@@ -16750,8 +17051,8 @@ const i18n = {
     active:'Active', inactive:'Inactive', expired:'Expired', unlimited:'∞',
     create:'Create', save:'Save', cancel:'Cancel', edit:'Edit', copy:'Copy', sub:'Sub', qr:'QR', del:'Del',
     on:'On', off:'Off',
-    logout: '🚪 Logout',
-    reachable:'✅ Reachable', failed:'❌ Failed',
+    logout: 'Logout',
+    reachable:'Reachable', failed:'Failed',
     testing:'Testing...',
     Error: 'Error',
     'None (Direct)': 'None (Direct)',
@@ -16883,8 +17184,8 @@ const i18n = {
     active:'فعال', inactive:'غیرفعال', expired:'منقضی', unlimited:'∞',
     create:'ایجاد', save:'ذخیره', cancel:'انصراف', edit:'ویرایش', copy:'کپی', sub:'اشتراک', qr:'QR', del:'حذف',
     on:'روشن', off:'خاموش',
-    logout: '🚪 خروج',
-    reachable:'✅ در دسترس', failed:'❌ خطا',
+    logout: 'خروج',
+    reachable:'در دسترس', failed:'خطا',
     testing:'در حال تست',
     Error: 'خطا',
     'None (Direct)': 'هیچ‌کدام (مستقیم)',
@@ -17019,8 +17320,8 @@ const stealth_i18n = {
     create: 'New Service', save: 'Save', cancel: 'Cancel', edit: 'Modify',
     copy: 'Copy', sub: 'Link', qr: 'QR', del: 'Remove',
     on: 'On', off: 'Off',
-    logout: '🚪 Logout',
-    reachable: '✅ Reachable', failed: '❌ Failed',
+    logout: 'Logout',
+    reachable: 'Reachable', failed: 'Failed',
     Inbound: 'Service', Inbounds: 'Services', Subscription: 'Sync',
     VLESS: 'Channel', Clash: 'Meta Config', SingBox: 'Sing Config',
     'Quick Add': 'Quick Service', 'Manage VLESS Configs': 'Manage Channels',
@@ -17158,8 +17459,8 @@ const stealth_i18n = {
     create: 'سرویس جدید', save: 'ذخیره', cancel: 'انصراف', edit: 'ویرایش',
     copy: 'کپی', sub: 'لینک', qr: 'QR', del: 'حذف',
     on: 'روشن', off: 'خاموش',
-    logout: '🚪 خروج',
-    reachable: '✅ در دسترس', failed: '❌ خطا',
+    logout: 'خروج',
+    reachable: 'در دسترس', failed: 'خطا',
     Inbound: 'سرویس', Inbounds: 'سرویس‌ها', Subscription: 'همگام‌سازی',
     VLESS: 'کانال', Clash: 'تنظیمات متا', SingBox: 'پیکربندی سینگ',
     'Quick Add': 'سرویس سریع', 'Manage VLESS Configs': 'مدیریت کانال‌ها',
@@ -17307,8 +17608,395 @@ function t(key, params = {}) {
 }
 function codeToFlag(code) {
     if (!code || code.length !== 2) return '';
-    code = code.toUpperCase();
-    return String.fromCodePoint(0x1F1E6 + code.charCodeAt(0) - 65) + String.fromCodePoint(0x1F1E6 + code.charCodeAt(1) - 65);
+    return '<span class="cc">' + code.toUpperCase() + '</span>';
+}
+function codeText(code) {
+    if (!code || code.length !== 2) return '';
+    return code.toUpperCase();
+}
+const ICONS={
+  'copy':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  'eye':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+  'eye-off':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+  'edit':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>',
+  'delete':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>',
+  'test':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/><path d="M7.5 14h9"/></svg>',
+  'search':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  'sub':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="21" x2="9" y2="21"/></svg>',
+  'qr':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3h-3M21 21h-7v-7"/></svg>',
+  'clone':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><line x1="18" y1="2" x2="18" y2="6"/><line x1="16" y1="4" x2="20" y2="4"/></svg>',
+  'clash':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l3 3-3 3-3-3z"/><path d="M6 11l3 3-3 3-3-3z"/><path d="M18 11l3 3-3 3-3-3z"/></svg>',
+  'singbox':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
+  'xray':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+  'refresh':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
+  'plus':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  'close':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  'check':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  'check-circle':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  'x-circle':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+  'warning':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  'info':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+  'globe':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+  'server':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+  'shield':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+  'link':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+  'save':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+  'dice':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg>',
+  'star':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
+  'ruler':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17L17 3l4 4L7 21z"/><line x1="8" y1="12" x2="10" y2="14"/><line x1="11" y1="9" x2="13" y2="11"/><line x1="14" y1="6" x2="16" y2="8"/></svg>',
+  'flag':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>',
+  'chevron-down':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>',
+  'chevron-left':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>',
+  'chevron-right':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>',
+  'disconnect':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0z"/><line x1="12" y1="16" x2="12" y2="21"/><line x1="4" y1="4" x2="20" y2="20"/></svg>',
+  'power':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>',
+  'lock':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+  'key':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg>',
+  'user':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+  'users':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  'clock':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  'filter':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>',
+  'sort':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg>',
+  'external':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
+  'bell':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+  'zap':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  'calendar':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+  'dashboard':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
+  'inbounds':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
+  'scanner':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M3.5 8.5A9 9 0 0 1 11 2"/></svg>',
+  'telegram':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
+  'settings':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>',
+  'logs':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>',
+  'activity':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+  'traffic':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12M17 20l4-4M17 20l-4-4"/></svg>',
+  'download':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  'upload':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+  'requests':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  'uptime':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  'disk':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  'monthly':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+  'cleanip':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>',
+  'quick-add':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>',
+  'logout':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  'theme-dark':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+  'theme-light':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
+  'bot':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="8" width="14" height="12" rx="2"/><line x1="12" y1="8" x2="12" y2="4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1" fill="currentColor" stroke="none"/><line x1="9" y1="17" x2="15" y2="17"/></svg>',
+  'stealth':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+  'auto-disable':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>',
+  'tg-notify':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+  'tg-reports':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>',
+  'telegram-link':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
+  'logging':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
+};
+function icon(name,size){return '<span class="ic" style="--ic:'+(size||18)+'px" aria-hidden="true">'+(ICONS[name]||ICONS.info)+'</span>';}
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+var QR_TABLE = [[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[2,35,17],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9],[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],[2,86,68],[4,43,27],[4,43,19],[4,43,15],[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]];
+var QR_ALIGN = [[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]];
+var QR_ECL = 1;
+function qrUtf8(s) {
+  var b = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c < 128) b.push(c);
+    else if (c < 2048) { b.push(192 | (c >> 6)); b.push(128 | (c & 63)); }
+    else if (c >= 55296 && c < 57344) {
+      var c2 = s.charCodeAt(i + 1);
+      var cp = 65536 + ((c - 55296) << 10) + (c2 - 56320);
+      b.push(240 | (cp >> 18)); b.push(128 | ((cp >> 12) & 63)); b.push(128 | ((cp >> 6) & 63)); b.push(128 | (cp & 63));
+      i++;
+    } else { b.push(224 | (c >> 12)); b.push(128 | ((c >> 6) & 63)); b.push(128 | (c & 63)); }
+  }
+  return b;
+}
+function qrRsMul(x, y) {
+  var z = 0;
+  for (var i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >>> 7) * 0x11D); z ^= ((y >>> i) & 1) * x; }
+  return z;
+}
+function qrRsDivisor(deg) {
+  var result = [];
+  for (var i = 0; i < deg - 1; i++) result.push(0);
+  result.push(1);
+  var root = 1;
+  for (var i = 0; i < deg; i++) {
+    for (var j = 0; j < result.length; j++) {
+      result[j] = qrRsMul(result[j], root);
+      if (j + 1 < result.length) result[j] ^= result[j + 1];
+    }
+    root = qrRsMul(root, 2);
+  }
+  return result;
+}
+function qrRsRemainder(data, divisor) {
+  var result = [];
+  for (var i = 0; i < divisor.length; i++) result.push(0);
+  for (var i = 0; i < data.length; i++) {
+    var factor = data[i] ^ result.shift();
+    result.push(0);
+    for (var j = 0; j < divisor.length; j++) result[j] ^= qrRsMul(divisor[j], factor);
+  }
+  return result;
+}
+function qrRawModules(ver) {
+  var result = (16 * ver + 128) * ver + 64;
+  if (ver >= 2) {
+    var numAlign = Math.floor(ver / 7) + 2;
+    result -= (25 * numAlign - 10) * numAlign - 55;
+    if (ver >= 7) result -= 36;
+  }
+  return result;
+}
+function qrNumDataCodewords(ver) {
+  var entry = QR_TABLE[(ver - 1) * 4 + QR_ECL];
+  var ecc = 0;
+  var blocks = 0;
+  for (var i = 0; i < entry.length; i += 3) { ecc = entry[i + 1] - entry[i + 2]; blocks += entry[i]; }
+  return Math.floor(qrRawModules(ver) / 8) - ecc * blocks;
+}
+function qrBitLen(n, len) {
+  var b = [];
+  for (var i = len - 1; i >= 0; i--) b.push((n >>> i) & 1);
+  return b;
+}
+function qrMakeData(text) {
+  var data = qrUtf8(text);
+  for (var ver = 1; ver <= 40; ver++) {
+    var ccbits = ver <= 9 ? 8 : 16;
+    var cap = qrNumDataCodewords(ver) * 8;
+    if (4 + ccbits + data.length * 8 <= cap) {
+      var bb = qrBitLen(4, 4).concat(qrBitLen(data.length, ccbits));
+      for (var i = 0; i < data.length; i++) bb = bb.concat(qrBitLen(data[i], 8));
+      var capBits = qrNumDataCodewords(ver) * 8;
+      var term = Math.min(4, capBits - bb.length);
+      for (var i = 0; i < term; i++) bb.push(0);
+      while (bb.length % 8 !== 0) bb.push(0);
+      var pad = 236;
+      while (bb.length < capBits) { bb = bb.concat(qrBitLen(pad, 8)); pad = pad === 236 ? 17 : 236; }
+      var cw = [];
+      for (var i = 0; i < bb.length; i += 8) {
+        var v = 0;
+        for (var j = 0; j < 8; j++) v = (v << 1) | bb[i + j];
+        cw.push(v);
+      }
+      return { ver: ver, cw: cw };
+    }
+  }
+  return null;
+}
+function qrGetBit(x, i) { return ((x >>> i) & 1) !== 0; }
+function qrFormatBits(mask) {
+  var fb = [1, 0, 3, 2][QR_ECL];
+  var data = fb * 8 + mask;
+  var rem = data;
+  for (var i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+  return ((data << 10) | rem) ^ 0x5412;
+}
+function qrVersionBits(ver) {
+  var rem = ver;
+  for (var i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >> 11) * 0x1F25);
+  return (ver << 12) | rem;
+}
+function qrEncode(text) {
+  var made = qrMakeData(text);
+  if (!made) return null;
+  var ver = made.ver;
+  var size = ver * 4 + 17;
+  var entry = QR_TABLE[(ver - 1) * 4 + QR_ECL];
+  var blocks = [];
+  var eccLen = 0;
+  var off = 0;
+  for (var i = 0; i < entry.length; i += 3) {
+    for (var k = 0; k < entry[i]; k++) {
+      var dc = entry[i + 2];
+      var total = entry[i + 1];
+      eccLen = total - dc;
+      blocks.push({ data: made.cw.slice(off, off + dc), ecc: null });
+      off += dc;
+    }
+  }
+  var divisor = qrRsDivisor(eccLen);
+  for (var i = 0; i < blocks.length; i++) blocks[i].ecc = qrRsRemainder(blocks[i].data, divisor);
+  var all = [];
+  var maxData = 0;
+  for (var i = 0; i < blocks.length; i++) maxData = Math.max(maxData, blocks[i].data.length);
+  for (var i = 0; i < maxData; i++) {
+    for (var j = 0; j < blocks.length; j++) {
+      if (i < blocks[j].data.length) all.push(blocks[j].data[i]);
+    }
+  }
+  for (var i = 0; i < eccLen; i++) {
+    for (var j = 0; j < blocks.length; j++) all.push(blocks[j].ecc[i]);
+  }
+  var bits = [];
+  for (var i = 0; i < all.length; i++) bits = bits.concat(qrBitLen(all[i], 8));
+  bits = bits.concat(qrBitLen(0, qrRawModules(ver) - bits.length));
+  var best = null;
+  for (var mask = 0; mask < 8; mask++) {
+    var q = qrBuild(ver, size, bits, mask);
+    var pen = qrPenalty(q.modules, size);
+    if (!best || pen < best.pen) best = { pen: pen, modules: q.modules, ver: ver, size: size, mask: mask };
+  }
+  return best;
+}
+function qrBuild(ver, size, bits, mask) {
+  var modules = [];
+  var isFunc = [];
+  for (var y = 0; y < size; y++) { modules.push([]); isFunc.push([]); for (var x = 0; x < size; x++) { modules[y].push(false); isFunc[y].push(false); } }
+  function setFn(x, y, v) { modules[y][x] = v; isFunc[y][x] = true; }
+  function finder(cx, cy) {
+    for (var dy = -4; dy <= 4; dy++) {
+      for (var dx = -4; dx <= 4; dx++) {
+        var xx = cx + dx;
+        var yy = cy + dy;
+        if (xx < 0 || xx >= size || yy < 0 || yy >= size) continue;
+        var d = Math.max(Math.abs(dx), Math.abs(dy));
+        var on = d !== 2 && d !== 4;
+        setFn(xx, yy, on);
+      }
+    }
+  }
+  for (var i = 0; i < size; i++) {
+    setFn(6, i, i % 2 === 0);
+    setFn(i, 6, i % 2 === 0);
+  }
+  finder(3, 3);
+  finder(size - 4, 3);
+  finder(3, size - 4);
+  var align = QR_ALIGN[ver - 1];
+  var nAlign = align.length;
+  for (var i = 0; i < nAlign; i++) {
+    for (var j = 0; j < nAlign; j++) {
+      if (!((i === 0 && j === 0) || (i === 0 && j === nAlign - 1) || (i === nAlign - 1 && j === 0))) {
+        for (var dy = -2; dy <= 2; dy++) {
+          for (var dx = -2; dx <= 2; dx++) {
+            setFn(align[i] + dx, align[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+          }
+        }
+      }
+    }
+  }
+  var fb = qrFormatBits(mask);
+  for (var i = 0; i <= 5; i++) setFn(8, i, qrGetBit(fb, i));
+  setFn(8, 7, qrGetBit(fb, 6));
+  setFn(8, 8, qrGetBit(fb, 7));
+  setFn(7, 8, qrGetBit(fb, 8));
+  for (var i = 9; i < 15; i++) setFn(14 - i, 8, qrGetBit(fb, i));
+  for (var i = 0; i < 8; i++) setFn(size - 1 - i, 8, qrGetBit(fb, i));
+  for (var i = 8; i < 15; i++) setFn(8, size - 15 + i, qrGetBit(fb, i));
+  setFn(8, size - 8, true);
+  if (ver >= 7) {
+    var vb = qrVersionBits(ver);
+    for (var i = 0; i < 18; i++) {
+      var bit = qrGetBit(vb, i);
+      var a = size - 11 + (i % 3);
+      var b = Math.floor(i / 3);
+      setFn(a, b, bit);
+      setFn(b, a, bit);
+    }
+  }
+  var i = 0;
+  for (var right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (var vert = 0; vert < size; vert++) {
+      for (var j = 0; j < 2; j++) {
+        var x = right - j;
+        var upward = ((right + 1) & 2) === 0;
+        var y = upward ? size - 1 - vert : vert;
+        if (!isFunc[y][x] && i < bits.length) { modules[y][x] = bits[i] === 1; i++; }
+      }
+    }
+  }
+  for (var y = 0; y < size; y++) {
+    for (var x = 0; x < size; x++) {
+      if (isFunc[y][x]) continue;
+      var m = false;
+      if (mask === 0) m = (y + x) % 2 === 0;
+      else if (mask === 1) m = y % 2 === 0;
+      else if (mask === 2) m = x % 3 === 0;
+      else if (mask === 3) m = (y + x) % 3 === 0;
+      else if (mask === 4) m = (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0;
+      else if (mask === 5) m = ((y * x) % 2 + (y * x) % 3) === 0;
+      else if (mask === 6) m = (((y * x) % 2 + (y * x) % 3) % 2) === 0;
+      else m = (((y + x) % 2 + (y * x) % 3) % 2) === 0;
+      if (m) modules[y][x] = !modules[y][x];
+    }
+  }
+  return { modules: modules };
+}
+function qrPenalty(m, size) {
+  var pen = 0;
+  for (var y = 0; y < size; y++) {
+    var runColor = false;
+    var runLen = 0;
+    for (var x = 0; x < size; x++) {
+      if (m[y][x] === runColor) runLen++;
+      else { if (runLen >= 5) pen += 3 + (runLen - 5); runColor = m[y][x]; runLen = 1; }
+    }
+    if (runLen >= 5) pen += 3 + (runLen - 5);
+  }
+  for (var x = 0; x < size; x++) {
+    var runColor = false;
+    var runLen = 0;
+    for (var y = 0; y < size; y++) {
+      if (m[y][x] === runColor) runLen++;
+      else { if (runLen >= 5) pen += 3 + (runLen - 5); runColor = m[y][x]; runLen = 1; }
+    }
+    if (runLen >= 5) pen += 3 + (runLen - 5);
+  }
+  for (var y = 0; y < size - 1; y++) {
+    for (var x = 0; x < size - 1; x++) {
+      var c = m[y][x];
+      if (c === m[y][x + 1] && c === m[y + 1][x] && c === m[y + 1][x + 1]) pen += 3;
+    }
+  }
+  function patScore(line) {
+    var s = 0;
+    for (var i = 0; i + 10 < line.length; i++) {
+      var seg = line.slice(i, i + 11).join('');
+      if (seg === '10111010000' || seg === '00001011101') s += 40;
+    }
+    return s;
+  }
+  for (var y = 0; y < size; y++) {
+    var row = [];
+    for (var x = 0; x < size; x++) row.push(m[y][x] ? '1' : '0');
+    pen += patScore(row);
+  }
+  for (var x = 0; x < size; x++) {
+    var col = [];
+    for (var y = 0; y < size; y++) col.push(m[y][x] ? '1' : '0');
+    pen += patScore(col);
+  }
+  var dark = 0;
+  for (var y = 0; y < size; y++) {
+    for (var x = 0; x < size; x++) if (m[y][x]) dark++;
+  }
+  var total = size * size;
+  var k = Math.floor(Math.abs(dark * 100 / total - 50) / 5);
+  pen += k * 10;
+  return pen;
+}
+function drawQr(canvas, text) {
+  if (!canvas) return false;
+  var q = qrEncode(text);
+  if (!q) return false;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width;
+  var h = canvas.height;
+  var border = 4;
+  var scale = Math.max(1, Math.floor(Math.min(w, h) / (q.size + border * 2)));
+  var px = (q.size + border * 2) * scale;
+  var ox = Math.floor((w - px) / 2);
+  var oy = Math.floor((h - px) / 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#000000';
+  for (var y = 0; y < q.size; y++) {
+    for (var x = 0; x < q.size; x++) {
+      if (q.modules[y][x]) ctx.fillRect(ox + (x + border) * scale, oy + (y + border) * scale, scale, scale);
+    }
+  }
+  return true;
 }
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false,isInitialChecking=false,lastVisibleLinks=[],usageViewReady=false;
@@ -17546,12 +18234,12 @@ async function autoDetectFlagEdit() {
 }
 
 function setPanelLanguage(l) {
-    document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#lang-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`btn-lang-${l}`).classList.add('active');
     setLang(l);
 }
 function setPanelTheme(th) {
-    document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#theme-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
     const btn = document.getElementById(`btn-theme-${th}`);
     if (btn) btn.classList.add('active');
     const hiddenInput = $m('set-theme-color');
@@ -17560,7 +18248,7 @@ function setPanelTheme(th) {
     localStorage.setItem('theme', th);
 }
 function setPanelTZ(offset, name) {
-    document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#tz-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
     if (name === 'Tehran') document.getElementById('btn-tz-tehran').classList.add('active');
     else if (name === 'UTC') document.getElementById('btn-tz-utc').classList.add('active');
     else if (name === 'Custom') document.getElementById('btn-tz-custom').classList.add('active');
@@ -17573,7 +18261,7 @@ function toggleCustomTZInput(show) {
     const container = $m('custom-tz-container');
     const customBtn = document.getElementById('btn-tz-custom');
     if (show) {
-        document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('#tz-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
         customBtn.classList.add('active');
         container.style.display = 'block';
     } else {
@@ -17592,7 +18280,7 @@ function saveSingleSetting(key, value) {
     fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({[key]: value}) });
 }
 function setKeepAliveMode(mode) {
-    document.querySelectorAll('#keepalive-mode-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#keepalive-mode-group .seg-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`btn-keepalive-${mode}`).classList.add('active');
     var el = $m('set-keepalive-mode');
     if (el) el.value = mode;
@@ -17602,20 +18290,22 @@ function setTheme(t){
   theme=t;
   document.body.classList.toggle('light-mode',t==='light');
   document.documentElement.classList.toggle('light-mode',t==='light');
-  document.body.classList.toggle('blue-mode',t==='blue-dark');
+  document.body.classList.toggle('blue-dark',t==='blue-dark');
   localStorage.setItem('theme',t);
-  const themeBtn = document.getElementById('theme-toggle-btn');
-  if (themeBtn) themeBtn.textContent = t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');
+  const darkIcon = document.getElementById('dark-icon');
+  const lightIcon = document.getElementById('light-icon');
+  if (darkIcon) darkIcon.classList.toggle('hidden', t==='light');
+  if (lightIcon) lightIcon.classList.toggle('hidden', t!=='light');
   updChartColors();
-  syncGlassThemeButtons();
+  syncSegThemeButtons();
 }
 function toggleTheme(){
   const themes=['dark','light','blue-dark'];
   const idx=themes.indexOf(theme);
   setTheme(themes[(idx+1)%themes.length]);
 }
-function syncGlassThemeButtons() {
-    document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+function syncSegThemeButtons() {
+    document.querySelectorAll('#theme-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
     const btn = document.getElementById(`btn-theme-${theme}`);
     if (btn) btn.classList.add('active');
 }
@@ -17688,11 +18378,13 @@ function updateSettingsStatus(settings){
 }
 
 function updateSettingsStatusLabels(){
-  document.querySelectorAll('#settings-status .status-glass-card').forEach(card => {
+  document.querySelectorAll('#settings-status .status-card').forEach(card => {
     const key = card.id.replace('st-','');
     let label = card.getAttribute('data-'+lang) || card.querySelector('span[data-'+lang+']')?.textContent || '';
-    const icon = card.querySelector('span:first-child')?.textContent || '';
-    card.innerHTML = (card.classList.contains('active') ? '✅ ' : '❌ ') + icon + ' ' + label;
+    const iconEl = card.querySelector('span:first-child');
+    const iconHtml = iconEl ? iconEl.outerHTML : '';
+    const ok = card.classList.contains('active');
+    card.innerHTML = iconHtml + '<span class="status"><span class="status-dot ' + (ok ? 'ok' : 'err') + '"></span><span>' + esc(label) + '</span></span>';
   });
 }
 function setLang(l){
@@ -17714,7 +18406,7 @@ function setLang(l){
   }
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
-  document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('#lang-seg-group .seg-btn').forEach(b => b.classList.remove('active'));
   const activeLangBtn = document.getElementById(`btn-lang-${l}`);
   if (activeLangBtn) activeLangBtn.classList.add('active');
 }
@@ -17739,13 +18431,13 @@ async function maybeRefreshSession(){
 }
 function showLinksSkeleton(){
   const tb = $m('ltb');
-  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text3);">Loading inbounds…</td></tr>';
+  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-3);">Loading inbounds…</td></tr>';
   const em = $m('lempty');
   if (em) em.style.display = 'none';
 }
 function showLogsSkeleton(){
   const tb = $m('logs-tbody');
-  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3);">Loading logs…</td></tr>';
+  if (tb && !tb.innerHTML.trim()) tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-3);">Loading logs…</td></tr>';
 }
 function setChartEmpty(canvasId, show, msg){
   const cv = $m(canvasId);
@@ -17754,7 +18446,7 @@ function setChartEmpty(canvasId, show, msg){
   if (!box) return;
   let note = box.querySelector('.chart-empty-note');
   if (show) {
-    if (!note) { note = document.createElement('div'); note.className = 'chart-empty-note'; note.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:0.9rem;text-align:center;padding:12px;pointer-events:none;'; box.style.position = 'relative'; box.appendChild(note); }
+    if (!note) { note = document.createElement('div'); note.className = 'chart-empty-note'; note.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:0.9rem;text-align:center;padding:12px;pointer-events:none;'; box.style.position = 'relative'; box.appendChild(note); }
     note.textContent = msg || 'No data yet';
     note.style.display = 'flex';
   } else if (note) { note.style.display = 'none'; }
@@ -17834,7 +18526,7 @@ async function runHealthCheck(btn,boxEl){
     if(totalSteps>0&&step>protoTotal)return (lang==='fa'?'در حال بررسی پروکسی لاین ':'Checking proxy line ')+(step-protoTotal)+' '+(lang==='fa'?'از':'of')+' '+proxyTotal+'…';
     return lang==='fa'?'در حال بررسی سلامت پروتکل‌ها، یکی‌یکی با فاصله یک ثانیه…':'Checking protocol health, one by one, 1s apart…';
   };
-  if(box)box.innerHTML='<div style="color:var(--text3);font-size:0.9rem;"><span class="hc-spin"></span> <span class="health-step">'+stepLabel(1)+'</span> <span class="health-elapsed">0s</span></div><div class="sys-bar" style="height:6px;margin-top:8px;"><div class="sys-fill health-fill" style="width:8%;background:var(--primary);"></div></div>';
+  if(box)box.innerHTML='<div style="color:var(--text-3);font-size:0.9rem;"><span class="hc-spin"></span> <span class="health-step">'+stepLabel(1)+'</span> <span class="health-elapsed">0s</span></div><div class="sys-bar" style="height:6px;margin-top:8px;"><div class="sys-fill health-fill" style="width:8%;background:var(--accent);"></div></div>';
   const tick=setInterval(()=>{
     const el=box?box.querySelector('.health-elapsed'):null;
     if(el)el.textContent=Math.floor((Date.now()-started)/1000)+'s';
@@ -17847,13 +18539,13 @@ async function runHealthCheck(btn,boxEl){
   try{
     const r=await authenticatedFetch('/api/health-check',{method:'POST'});
     clearInterval(tick);
-    if(r.status===409){if(box)box.innerHTML='<div style="color:var(--text3);font-size:0.9rem;">'+(lang==='fa'?'بررسی سلامت در حال اجراست.':'A health check is already running.')+'</div>';return;}
+    if(r.status===409){if(box)box.innerHTML='<div style="color:var(--text-3);font-size:0.9rem;">'+(lang==='fa'?'بررسی سلامت در حال اجراست.':'A health check is already running.')+'</div>';return;}
     if(!r.ok)throw new Error('HTTP '+r.status);
     const d=await r.json();
     renderHealthResults(d,box);
   }catch(e){
     clearInterval(tick);
-    if(box)box.innerHTML='<div style="color:var(--red);font-size:0.9rem;">'+(lang==='fa'?'بررسی سلامت ناموفق بود.':'Health check failed.')+' '+esc(String(e&&e.message?e.message:e))+'</div>';
+    if(box)box.innerHTML='<div style="color:var(--danger);font-size:0.9rem;">'+(lang==='fa'?'بررسی سلامت ناموفق بود.':'Health check failed.')+' '+esc(String(e&&e.message?e.message:e))+'</div>';
   }finally{
     healthCheckRunning=false;
     if(btn){btn.disabled=false;btn.textContent=(btn.getAttribute('data-'+lang))||origLabel||'Refresh';}
@@ -17864,15 +18556,15 @@ function renderHealthResults(d,boxEl){
   if(!box)return;
   const p=d.probe||{};
   const pill=x=>{
-    if(x.status==='untestable')return '<span class="tag" style="color:var(--text3);">'+(lang==='fa'?'غیرقابل تست':'not testable')+'</span>';
+    if(x.status==='untestable')return '<span class="tag" style="color:var(--text-3);">'+(lang==='fa'?'غیرقابل تست':'not testable')+'</span>';
     return '<span class="tag '+(x.ok?'tag-on':'tag-off')+'">'+(x.ok?(lang==='fa'?'سالم':'healthy'):(lang==='fa'?'ناسالم':'unhealthy'))+'</span>';
   };
-  const rows=(d.results||[]).map(x=>'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+esc(protoShort(x.protocol))+'</b>'+pill(x)+'<span style="font-size:0.85rem;">'+esc(x.label||'')+'</span><span style="font-size:0.85rem;color:var(--text3);direction:ltr;text-align:left;">'+esc(x.target||'')+'</span><span style="font-size:0.85rem;color:var(--text3);">'+(x.latency_ms===null||x.latency_ms===undefined?'–':x.latency_ms+'ms')+'</span><span style="font-size:0.85rem;color:var(--text3);">'+esc(x.detail||'')+'</span></div>').join('');
-  const proxies=(d.proxy_lines||[]).map(x=>'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+esc(x.protocol||'')+'</b><span class="tag '+(x.ok?'tag-on':'tag-off')+'">'+(x.ok?(lang==='fa'?'سالم':'healthy'):(lang==='fa'?'ناسالم':'unhealthy'))+'</span><span style="font-size:0.85rem;">'+esc((x.host||'')+':'+String(x.port||''))+'</span><span style="font-size:0.85rem;color:var(--text3);">'+(x.latency_ms===null||x.latency_ms===undefined?'–':x.latency_ms+'ms')+'</span><span style="font-size:0.85rem;color:var(--text3);">'+esc(x.detail||'')+'</span></div>').join('');
+  const rows=(d.results||[]).map(x=>'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+esc(protoShort(x.protocol))+'</b>'+pill(x)+'<span style="font-size:0.85rem;">'+esc(x.label||'')+'</span><span style="font-size:0.85rem;color:var(--text-3);direction:ltr;text-align:left;">'+esc(x.target||'')+'</span><span style="font-size:0.85rem;color:var(--text-3);">'+(x.latency_ms===null||x.latency_ms===undefined?'–':x.latency_ms+'ms')+'</span><span style="font-size:0.85rem;color:var(--text-3);">'+esc(x.detail||'')+'</span></div>').join('');
+  const proxies=(d.proxy_lines||[]).map(x=>'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+esc(x.protocol||'')+'</b><span class="tag '+(x.ok?'tag-on':'tag-off')+'">'+(x.ok?(lang==='fa'?'سالم':'healthy'):(lang==='fa'?'ناسالم':'unhealthy'))+'</span><span style="font-size:0.85rem;">'+esc((x.host||'')+':'+String(x.port||''))+'</span><span style="font-size:0.85rem;color:var(--text-3);">'+(x.latency_ms===null||x.latency_ms===undefined?'–':x.latency_ms+'ms')+'</span><span style="font-size:0.85rem;color:var(--text-3);">'+esc(x.detail||'')+'</span></div>').join('');
   const secs=((d.total_ms||0)/1000).toFixed(1);
   const dom=p.public_domain?esc(p.domain||''):(lang==='fa'?'تشخیص داده نشد (شنونده محلی)':'not detected (local listener)');
-  const head='<div style="color:var(--text2);font-size:0.9rem;margin-bottom:4px;"><b>'+(lang==='fa'?'سلامت پروتکل':'Protocol health')+'</b> · '+esc(String((d.results||[]).length))+' '+(lang==='fa'?'پروتکل، ترتیبی با فاصله':'protocols, sequential, gap')+' '+esc(String(d.interval_seconds||1))+'s · '+secs+'s</div><div style="color:var(--text3);font-size:0.85rem;margin-bottom:4px;">'+(lang==='fa'?'دامنه':'Domain')+': <span style="direction:ltr;display:inline-block;">'+dom+'</span> · '+(lang==='fa'?'پورت':'Port')+': '+esc(String(p.port||''))+' ('+esc(p.scheme||'')+')'+(p.single_port_host?' · '+(lang==='fa'?'تک‌پورت HTTPS (PaaS) — پروتکل‌های TCP خام به‌صورت زنده قابل تست نیستند':'single HTTPS port only (PaaS) — raw TCP protocols not testable live'):'')+'</div>';
-  box.innerHTML=head+rows+(proxies?'<div style="color:var(--text2);font-size:0.9rem;margin:8px 0 4px;"><b>'+(lang==='fa'?'پروکسی لاین‌ها':'Proxy lines')+'</b></div>'+proxies:'');
+  const head='<div style="color:var(--text-2);font-size:0.9rem;margin-bottom:4px;"><b>'+(lang==='fa'?'سلامت پروتکل':'Protocol health')+'</b> · '+esc(String((d.results||[]).length))+' '+(lang==='fa'?'پروتکل، ترتیبی با فاصله':'protocols, sequential, gap')+' '+esc(String(d.interval_seconds||1))+'s · '+secs+'s</div><div style="color:var(--text-3);font-size:0.85rem;margin-bottom:4px;">'+(lang==='fa'?'دامنه':'Domain')+': <span style="direction:ltr;display:inline-block;">'+dom+'</span> · '+(lang==='fa'?'پورت':'Port')+': '+esc(String(p.port||''))+' ('+esc(p.scheme||'')+')'+(p.single_port_host?' · '+(lang==='fa'?'تک‌پورت HTTPS (PaaS) — پروتکل‌های TCP خام به‌صورت زنده قابل تست نیستند':'single HTTPS port only (PaaS) — raw TCP protocols not testable live'):'')+'</div>';
+  box.innerHTML=head+rows+(proxies?'<div style="color:var(--text-2);font-size:0.9rem;margin:8px 0 4px;"><b>'+(lang==='fa'?'پروکسی لاین‌ها':'Proxy lines')+'</b></div>'+proxies:'');
   window.LAST_HEALTH_CHECK=d;
 }
 async function checkAuth() {
@@ -17952,7 +18644,7 @@ async function showDashboard(){
   safeCall(fillPortNotes);
   setLang(lang);
   startPanelClock();
-  syncGlassThemeButtons();
+  syncSegThemeButtons();
   startSSE();
   startSessionRefreshTimer();
   if (stealthMode) {
@@ -18038,25 +18730,25 @@ function inbOutReasonText(c){
 }
 function inbOutCardHtml(c){
   const on=!!c.enabled;
-  const dot=on?'var(--green)':'var(--red)';
+  const dot=on?'var(--success)':'var(--danger)';
   const glow=on?'rgba(74,222,128,.25)':'rgba(248,113,113,.25)';
   const lbl=on?(lang==='fa'?'روشن':'ON'):(lang==='fa'?'خاموش':'OFF');
   const tagCls=on?'tag-on':'tag-off';
   const portLbl=lang==='fa'?'پورت':'port';
   let h='<div style="border:1px solid var(--border);border-radius:12px;padding:12px;background:var(--surface);min-width:0;">'
     +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
-    +'<span style="width:12px;height:12px;border-radius:50%;background:'+dot+';box-shadow:0 0 0 3px '+glow+';flex:none;"></span>'
+    +'<span style="width:8px;height:8px;border-radius:50%;background:'+dot+';flex:none;"></span>'
     +'<b>'+esc(c.name||'')+'</b>'
     +'<span class="tag '+tagCls+'">'+lbl+'</span>'
-    +'<span style="margin-inline-start:auto;color:var(--text3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String(c.port||'—'))+'</span></span>'
+    +'<span style="margin-inline-start:auto;color:var(--text-3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String(c.port||'—'))+'</span></span>'
     +'</div>';
-  if(c.id==='webproxy'&&c.shared)h+='<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
-  if(!on)h+='<div style="color:var(--text3);font-size:0.85rem;margin-top:6px;">'+esc(inbOutReasonText(c))+'</div>';
+  if(c.id==='webproxy'&&c.shared)h+='<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
+  if(!on)h+='<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">'+esc(inbOutReasonText(c))+'</div>';
   return h+'</div>';
 }
 async function loadInbOutCard(){
   const body=$m('inb-out-body');
-  if(body)body.innerHTML='<div style="color:var(--text3);font-size:0.9rem;"><span class="hc-spin"></span> '+(lang==='fa'?'در حال بارگذاری…':'Loading…')+'</div>';
+  if(body)body.innerHTML='<div style="color:var(--text-3);font-size:0.9rem;"><span class="hc-spin"></span> '+(lang==='fa'?'در حال بارگذاری…':'Loading…')+'</div>';
   try{
     const [di,dout]=await Promise.all([fetchJsonTimeout('/api/inbounds',15000),fetchJsonTimeout('/api/outbounds',15000)]);
     if(!di.listener_cards||!di.listener_cards.length)throw new Error('listener_cards missing');
@@ -18064,17 +18756,17 @@ async function loadInbOutCard(){
     const cards=di.listener_cards.map(c=>inbOutCardHtml(c)).join('');
     const headIn=(lang==='fa'?'اینباندها (WS/XHTTP روی پورت ':'Inbounds (WS/XHTTP on port ')+esc(String(pubPort))+')';
     const headOut=lang==='fa'?'خروجی‌ها (پروکسی لاین‌ها)':'Outbounds (proxy lines)';
-    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text3);font-size:0.85rem;">'+esc(x.flag||'')+' '+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>'+t('noProxyLines')+'</div>';
+    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text-3);font-size:0.85rem;">'+(x.flag?'<span class="cc">'+esc(x.flag)+'</span> ':'')+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>'+t('noProxyLines')+'</div>';
     if(body){body.innerHTML='<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headIn+'</div></div>'+cards+'<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headOut+'</div>'+out+'</div>';body.setAttribute('data-loaded','1');}
     return true;
-  }catch(e){ const b=$m('inb-out-body'); if(b)b.innerHTML='<div style="color:var(--red);font-size:0.9rem;">'+(lang==='fa'?'بارگذاری ورودی‌ها و خروجی‌ها ناموفق بود: ':'Failed to load Inbounds and Outbounds: ')+esc(String(e&&e.message?e.message:e))+'</div><button class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="loadInbOutCard()" data-en="Retry" data-fa="تلاش دوباره">Retry</button>'; return false; }
+  }catch(e){ const b=$m('inb-out-body'); if(b)b.innerHTML='<div style="color:var(--danger);font-size:0.9rem;">'+(lang==='fa'?'بارگذاری ورودی‌ها و خروجی‌ها ناموفق بود: ':'Failed to load Inbounds and Outbounds: ')+esc(String(e&&e.message?e.message:e))+'</div><button class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="loadInbOutCard()" data-en="Retry" data-fa="تلاش دوباره">Retry</button>'; return false; }
 }
 function tgProxyLinkRow(label, url){
   if(!url) return '';
   const copyLbl = lang==='fa'?'کپی':'Copy';
   const showLbl = lang==='fa'?'نمایش لینک':'Show link';
   const copyLinkLbl = lang==='fa'?'کپی متن لینک':'Copy link text';
-  return '<div class="tg-link-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b>'+label+'</b><button class="btn btn-outline btn-sm" onclick="cpLink(\''+esc(url)+'\')">'+copyLbl+'</button><button class="btn btn-outline btn-sm" onclick="toggleRowLink(this)">'+showLbl+'</button></div><div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="'+esc(url)+'" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">'+copyLinkLbl+'</button></div>';
+  return '<div class="tg-link-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b>'+label+'</b><button class="btn btn-outline btn-sm" onclick="cpLink(\''+esc(url)+'\')">'+copyLbl+'</button><button class="btn btn-outline btn-sm" onclick="toggleRowLink(this)">'+showLbl+'</button></div><div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="'+esc(url)+'" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">'+copyLinkLbl+'</button></div>';
 }
 function toggleRowLink(btn){
   let box = null;
@@ -18105,17 +18797,17 @@ async function loadTgProxyCard(){
     const cardFor = (id, dKey, port) => cards[id] || {id: id, enabled: !!(d[dKey] && d[dKey].enabled), port: port || '—', reason_code: ''};
     const protoRow = (name, card) => {
       const on = !!(card && card.enabled);
-      let h = '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+name+'</b>'+pill(on)+'<span style="color:var(--text3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String((card && card.port) || '—'))+'</span></span></div>';
-      if (!on && card && card.reason_code) h += '<div style="color:var(--text3);font-size:0.85rem;padding:2px 0 6px;">'+esc(inbOutReasonText(card))+'</div>';
+      let h = '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border);"><b style="min-width:90px;">'+name+'</b>'+pill(on)+'<span style="color:var(--text-3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String((card && card.port) || '—'))+'</span></span></div>';
+      if (!on && card && card.reason_code) h += '<div style="color:var(--text-3);font-size:0.85rem;padding:2px 0 6px;">'+esc(inbOutReasonText(card))+'</div>';
       return h;
     };
     const webPort = (d.webproxy_public_port || (d.webproxy && d.webproxy.port)) || 443;
-    let html = '<div style="color:var(--text3);font-size:0.9rem;margin-bottom:8px;">'+(lang==='fa'?'دامنه':'Domain')+': <b style="color:var(--text);">'+esc(d.domain || '')+'</b></div>';
-    if (d.domain === 'localhost') html += '<div style="color:var(--red);font-size:0.85rem;margin-bottom:8px;">'+(lang==='fa'?'دامنه localhost قابل استفاده نیست':'localhost is not a usable domain')+'</div>';
+    let html = '<div style="color:var(--text-3);font-size:0.9rem;margin-bottom:8px;">'+(lang==='fa'?'دامنه':'Domain')+': <b style="color:var(--text);">'+esc(d.domain || '')+'</b></div>';
+    if (d.domain === 'localhost') html += '<div style="color:var(--danger);font-size:0.85rem;margin-bottom:8px;">'+(lang==='fa'?'دامنه localhost قابل استفاده نیست':'localhost is not a usable domain')+'</div>';
     html += protoRow('SOCKS5', cardFor('socks5', 'socks', d.socks_port));
     html += protoRow('MTProto', cardFor('mtproto', 'mtproxy', d.mtproxy_port));
     html += protoRow('WEB', cardFor('webproxy', 'webproxy', webPort));
-    if(d.webproxy_shared_443) html += '<div style="color:var(--text3);font-size:0.85rem;padding:2px 0 6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
+    if(d.webproxy_shared_443) html += '<div style="color:var(--text-3);font-size:0.85rem;padding:2px 0 6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
     html += protoRow('HTTP', cardFor('http-proxy', 'http', d.http_port));
     if(d.webproxy_link){ html += tgProxyLinkRow((lang==='fa'?'لینک وب‌پروکسی (پورت ':'WEB proxy link (port ') + esc(String(webPort)) + ')', d.webproxy_link); }
     if(d.webproxy_link_https){ html += tgProxyLinkRow((lang==='fa'?'لینک وب‌پروکسی، فرم t.me (پورت ':'WEB proxy link, t.me form (port ') + esc(String(webPort)) + ')', d.webproxy_link_https); }
@@ -18150,7 +18842,10 @@ function switchPage(id){
 }
 function toast(msg, err = false) {
     const t = $m('toast');
-    t.textContent = msg;
+    const m = $m('toast-msg');
+    const ic = $m('toast-ic');
+    if (m) m.textContent = msg;
+    if (ic) { ic.innerHTML = err ? ICONS['x-circle'] : ICONS['check-circle']; ic.className = 'ic ' + (err ? 'err' : 'ok'); }
     t.className = 'toast' + (err ? ' err' : '') + ' show';
     clearTimeout(t._hide);
     t._hide = setTimeout(() => t.classList.remove('show'), 3000);
@@ -18199,7 +18894,7 @@ function filterLinks() {
     updDoughnutChart();
 }
 function numUsed(l){const v=Number(l&&l.used_bytes)||0;return v>0?v:0;}
-function linkDisplayLabel(l){const f=l&&l.flag?codeToFlag(l.flag):'';return (f?f+' ':'')+(l&&l.label?l.label:'');}
+function linkDisplayLabel(l){const f=l&&l.flag?codeText(l.flag):'';return (f?f+' ':'')+(l&&l.label?l.label:'');}
 function usageRows(){return usageViewReady?lastVisibleLinks:allLinks;}
 function usageTotal(rows){return (rows||[]).reduce((s,l)=>s+numUsed(l),0);}
 
@@ -18210,11 +18905,11 @@ function copyXrayConfig(uid) {
 
 function testCellHtml(l){
   const v = l.last_test_verdict || '';
-  if(!v) return '<span style="color:var(--text3);font-size:0.8rem;">–</span>';
+  if(!v) return '<span style="color:var(--text-3);font-size:0.8rem;">–</span>';
   const ms = (l.last_test_ms !== undefined && l.last_test_ms !== null) ? l.last_test_ms + 'ms' : '';
-  const col = v === 'pass' ? 'var(--green)' : v === 'fail' ? 'var(--red)' : v === 'local_only' ? 'var(--yellow)' : 'var(--text3)';
+  const col = v === 'pass' ? 'var(--success)' : v === 'fail' ? 'var(--danger)' : v === 'local_only' ? 'var(--warning)' : 'var(--text-3)';
   const label = v === 'pass' ? 'OK' : v === 'fail' ? 'FAIL' : v === 'local_only' ? 'LOCAL ONLY' : 'N/A';
-  const tgt = l.last_test_target ? '<div style="font-size:0.75rem;color:var(--text3);direction:ltr;text-align:left;word-break:break-all;">' + esc(l.last_test_target) + '</div>' : '';
+  const tgt = l.last_test_target ? '<div style="font-size:0.75rem;color:var(--text-3);direction:ltr;text-align:left;word-break:break-all;">' + esc(l.last_test_target) + '</div>' : '';
   return '<span title="' + esc(l.last_test_detail || '') + '" style="color:' + col + ';font-weight:700;font-size:0.85rem;white-space:nowrap;">' + label + ' ' + ms + '</span>' + tgt;
 }
 function renderLinks(links) {
@@ -18230,38 +18925,39 @@ function renderLinks(links) {
         const u = l.used_bytes || 0,
               lim = l.limit_bytes || 0,
               pct = lim > 0 ? Math.min(100, (u / lim) * 100) : 0,
-              col = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--yellow)' : 'var(--primary)',
+              col = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--accent)',
               ex = fmtExp(l.expires_at),
-              ec = ex === 'Expired' ? 'var(--red)' : ex === '∞' ? 'var(--text3)' : 'var(--text2)',
+              ec = ex === 'Expired' ? 'var(--danger)' : ex === '∞' ? 'var(--text-3)' : 'var(--text-2)',
               cc = l.current_connections || 0,
               mc2 = l.max_connections || 0,
               check = selectedUids.has(l.uuid) ? 'checked' : '',
-              labelDisplay = esc(linkDisplayLabel(l)) + (l.proxy && !l.proxy.enabled ? ' <span title="' + esc(t('proxyListenerDisabled') + (l.proxy.reason || '')) + '" style="color:var(--red);font-size:0.8rem;">' + t('listenerDisabled') + '</span>' : ''),
+              labelDisplay = esc(linkDisplayLabel(l)) + (l.proxy && !l.proxy.enabled ? ' <span title="' + esc(t('proxyListenerDisabled') + (l.proxy.reason || '')) + '" style="color:var(--danger);font-size:0.8rem;">' + t('listenerDisabled') + '</span>' : ''),
               udpEnabled = l.udp_enabled !== undefined ? l.udp_enabled : true,
               isProxy = ['socks5', 'mtproto', 'webproxy', 'http-proxy'].includes(l.protocol),
               nativeLink = l.vless_link || (l.proxy && l.proxy.protocol_link) || '';
-        const linkTextHtml = nativeLink ? `<div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="${esc(nativeLink)}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">Copy link text</button></div>` : `<div class="row-link-text" style="display:none;padding:4px 0 8px;color:var(--red);font-size:0.85rem;">listener disabled — no working link</div>`;
+        const linkTextHtml = nativeLink ? `<div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="${esc(nativeLink)}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">Copy link text</button></div>` : `<div class="row-link-text" style="display:none;padding:4px 0 8px;color:var(--danger);font-size:0.85rem;">listener disabled — no working link</div>`;
         const actGrid = isProxy ? `
                   <div class="row-act-grid">
-                    ${nativeLink ? `<span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(nativeLink)}')">📋</button><span class="tooltip-text">Copy proxy link</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(nativeLink)}')">📷</button><span class="tooltip-text">${t('qr')}</span></span>` : ''}
-                    <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">👁</button><span class="tooltip-text">Show link</span></span>
-                    <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">🧪</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">✏️</button><span class="tooltip-text">${t('edit')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">🗑️</button><span class="tooltip-text">${t('del')}</span></span>
+                    ${nativeLink ? `<span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(nativeLink)}')">${icon('copy')}</button><span class="tooltip-text">Copy proxy link</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(nativeLink)}')">${icon('qr')}</button><span class="tooltip-text">${t('qr')}</span></span>` : ''}
+                    <span class="tooltip-container"><button class="act-btn act-sub" onclick="cpSub('${esc(l.uuid)}')">${icon('link')}</button><span class="tooltip-text">${t('sub')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">${icon('eye')}</button><span class="tooltip-text">Show link</span></span>
+                    <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">${icon('test')}</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">${icon('edit')}</button><span class="tooltip-text">${t('edit')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">${icon('delete')}</button><span class="tooltip-text">${t('del')}</span></span>
                   </div>${nativeLink ? '' : '<div class="row-act-note">listener disabled — no working link</div>'}` : `
                   <div class="row-act-grid">
-                    <span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(l.vless_link)}')">📋</button><span class="tooltip-text">${t('copy')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">🐱</button><span class="tooltip-text">${t('copyClashTip')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">🧩</button><span class="tooltip-text">${t('copySingboxTip')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-copy" onclick="cpLink('${esc(l.vless_link)}')">${icon('copy')}</button><span class="tooltip-text">${t('copy')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-clash" onclick="copyClashLink('${esc(l.uuid)}')">${icon('clash')}</button><span class="tooltip-text">${t('copyClashTip')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-clash" onclick="copySingboxLink('${esc(l.uuid)}')">${icon('singbox')}</button><span class="tooltip-text">${t('copySingboxTip')}</span></span>
                     <span class="tooltip-container"><button class="act-btn act-clash act-btn-xray" onclick="copyXrayConfig('${esc(l.uuid)}')">X</button><span class="tooltip-text">${t('xrayConfigTip')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(l.vless_link)}')">📷</button><span class="tooltip-text">${t('qr')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-sub" onclick="cpSub('${esc(l.uuid)}')">🔗</button><span class="tooltip-text">${t('sub')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">👁</button><span class="tooltip-text">Show link</span></span>
-                    <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">🧪</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">✏️</button><span class="tooltip-text">${t('edit')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">🗑️</button><span class="tooltip-text">${t('del')}</span></span>
-                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="cloneLink('${esc(l.uuid)}')">🐑</button><span class="tooltip-text">${t('cloneTip')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-qr" onclick="showQR('${esc(l.vless_link)}')">${icon('qr')}</button><span class="tooltip-text">${t('qr')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-sub" onclick="cpSub('${esc(l.uuid)}')">${icon('link')}</button><span class="tooltip-text">${t('sub')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn" onclick="toggleRowLink(this)">${icon('eye')}</button><span class="tooltip-text">Show link</span></span>
+                    <span class="tooltip-container"><button class="act-btn" onclick="testInbound('${esc(l.uuid)}')">${icon('test')}</button><span class="tooltip-text">${t('testInboundTip')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="showEditMo('${esc(l.uuid)}')">${icon('edit')}</button><span class="tooltip-text">${t('edit')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-del" onclick="delLink('${esc(l.uuid)}')">${icon('delete')}</button><span class="tooltip-text">${t('del')}</span></span>
+                    <span class="tooltip-container"><button class="act-btn act-edit" onclick="cloneLink('${esc(l.uuid)}')">${icon('clone')}</button><span class="tooltip-text">${t('cloneTip')}</span></span>
                   </div>`;
 
         tableBuffer += `<tr>
@@ -18269,7 +18965,7 @@ function renderLinks(links) {
           <td data-label="Name" dir="auto" style="font-weight:600">${labelDisplay}</td>
           <td data-label="Owner" dir="auto">${esc(l.owner_name || '')}</td>
           <td data-label="Type"><span class="tag tag-vless">${esc(protoShort(l.protocol))}</span></td>
-          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used num">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="num">${fmtLim(lim)}</span></div><div style="font-size:0.8rem;color:var(--text2)">Remaining ${lim ? fmtB(Math.max(0, lim - u)) : '∞'}</div></td>
+          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used num">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="num">${fmtLim(lim)}</span></div><div style="font-size:0.8rem;color:var(--text-2)">Remaining ${lim ? fmtB(Math.max(0, lim - u)) : '∞'}</div></td>
           <td data-label="Conns">${cc}/${mc2 || '∞'}</td>
           <td data-label="Expiry" style="color:${ec}">${ex}</td>
           <td data-label="Status"><span class="tag ${l.active ? 'tag-on' : 'tag-off'}">${l.active ? t('on') : t('off')}</span></td>
@@ -18396,13 +19092,13 @@ function renderActiveUsers(sessions){
   if(!box) return;
   const sum = $m('active-users-summary');
   if(sum) sum.textContent = (sessions||[]).length + ' active';
-  if(!sessions || !sessions.length){ box.innerHTML = '<div style="color:var(--text2);">No active users</div>'; return; }
+  if(!sessions || !sessions.length){ box.innerHTML = '<div style="color:var(--text-2);">No active users</div>'; return; }
   box.innerHTML = sessions.map(s => `<div class="card" style="margin:0;padding:12px;">
     <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>${esc(s.label || s.uid || '')}</b><span class="tag tag-vless">${esc(s.protocol || '')}</span></div>
-    <div style="font-size:0.85rem;color:var(--text2);margin-top:6px;">${esc(s.user || '')} · ${esc(s.inbound_tag || '')}${s.outbound_proxy ? ' · ' + esc(s.outbound_proxy) : ''} · ${esc(s.outbound_mode || '')}</div>
+    <div style="font-size:0.85rem;color:var(--text-2);margin-top:6px;">${esc(s.user || '')} · ${esc(s.inbound_tag || '')}${s.outbound_proxy ? ' · ' + esc(s.outbound_proxy) : ''} · ${esc(s.outbound_mode || '')}</div>
     <div style="font-size:0.85rem;margin-top:6px;">↑ ${fmtBps(s.up_bps)} &nbsp; ↓ ${fmtBps(s.down_bps)}</div>
     <div style="font-size:0.85rem;">${t('totalWord')} ↑ <span class="num">${fmtB(s.bytes_up)}</span> &nbsp; ↓ <span class="num">${fmtB(s.bytes_down)}</span></div>
-    <div style="font-size:0.85rem;color:var(--text2);">IP ${esc(s.client_ip || '')} · Since ${esc(s.started_at || '')}</div>
+    <div style="font-size:0.85rem;color:var(--text-2);">IP ${esc(s.client_ip || '')} · Since ${esc(s.started_at || '')}</div>
     <div style="font-size:0.85rem;">${t('quotaLeft')} ${s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>'} · ${t('sessionsOnLink')} ${s.link_sessions}/${s.max_connections || '∞'}</div>
     <button class="btn btn-danger btn-sm" style="margin-top:8px;" onclick="disconnectActiveUser('${esc(s.conn_id)}')">Disconnect</button>
   </div>`).join('');
@@ -18410,7 +19106,7 @@ function renderActiveUsers(sessions){
 async function loadActiveUsers(){
   try{
     const box = $m('active-users-cards');
-    if (box && !box.innerHTML.trim()) box.innerHTML = '<div style="color:var(--text3);">Loading…</div>';
+    if (box && !box.innerHTML.trim()) box.innerHTML = '<div style="color:var(--text-3);">Loading…</div>';
     const r = await authenticatedFetch('/api/active-users');
     const d = await r.json();
     renderActiveUsers(d.sessions || []);
@@ -18576,8 +19272,9 @@ async function createLink(){
   const webproxyPort=$m('awebproxy-port') ? parseInt($m('awebproxy-port').value)||443 : 443;
   const uuidRe=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if(protocol==='trojan-ws' && credPassword && !uuidRe.test(credPassword)){ toast('Trojan password must be a UUID', true); return; }
-  if((protocol==='socks5' || protocol==='http-proxy') && (credProxyUser || credProxyPass) && credProxyUser!==credProxyPass){ toast('Proxy username and password must be identical', true); return; }
-  if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser && !uuidRe.test(credProxyUser)){ toast('Proxy username and password must be a UUID', true); return; }
+  if((protocol==='socks5' || protocol==='http-proxy') && (credProxyUser || credProxyPass) && (!credProxyUser || !credProxyPass)){ toast('Proxy username and password must both be set', true); return; }
+  if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser && /[:@\/?#\s]/.test(credProxyUser)){ toast('Proxy username must not contain : @ / ? # or spaces', true); return; }
+  if((protocol==='socks5' || protocol==='http-proxy') && credProxyPass && /\s/.test(credProxyPass)){ toast('Proxy password must not contain spaces', true); return; }
   const outboundMode=$m('aoutbound-mode').value||'auto';
   const gamingProfile=$m('agaming-profile').value||'balanced';
   const ssMethod=$m('ass-method').value||'2022-blake3-aes-256-gcm';
@@ -18608,7 +19305,7 @@ async function createLink(){
     label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
     custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),
     custom_host:$m('ahost').value.trim(),custom_fp:fingerprint,
-    color:$m('alink-color')?.value||'#39ff14',flag:flagCode,
+    color:$m('alink-color')?.value||'#3b82f6',flag:flagCode,
     fragment:fragment,ip_profile_id:ipProfileId,naming_mode:namingMode,
     tfo:tfo,ech_enabled:echEnabled,ech_sni:echSni,ech_doh:echDoh,
     fragment_mode:fragMode,fragment_length:$m('afrag-length').value.trim()||'100-200',
@@ -18629,7 +19326,7 @@ async function createLink(){
   };
   if(protocol==='trojan-ws'){ if(credPassword) body.password=credPassword; body.port=port; }
   else if(protocol==='ss-ws'){ body.ss_method=ssMethod; if(credSsPassword) body.ss_password=credSsPassword; body.port=port; }
-  else if(protocol==='socks5'||protocol==='http-proxy'){ if(credProxyUser){ body.proxy_username=credProxyUser; body.proxy_password=credProxyPass; } }
+  else if(protocol==='socks5'||protocol==='http-proxy'){ if(credProxyUser || credProxyPass){ body.proxy_username=credProxyUser; body.proxy_password=credProxyPass; } }
   else if(protocol==='mtproto'){ body.mtproto_variant=mtprotoVariant; if(mtprotoVariant==='faketls') body.mtproto_domain=mtprotoDomain; }
   else if(protocol==='webproxy'){ body.port=webproxyPort; }
   else if(protocol==='vmess-ws'){ if(credUuid) body.uuid=credUuid; body.vmess_security=vmessSecurity; body.port=port; }
@@ -18666,7 +19363,7 @@ async function showEditMo(uid) {
   $m('ep').value = l.custom_path || '';
   $m('esni').value = l.custom_sni || '';
   $m('ehost').value = l.custom_host || '';
-  $m('e-color').value = l.color || '#39ff14';
+  $m('e-color').value = l.color || '#3b82f6';
 
   const flag = l.flag || '';
   $m('flag-code-edit').value = flag;
@@ -18711,8 +19408,8 @@ async function showEditMo(uid) {
   if($m('emtproto-domain')) $m('emtproto-domain').value = l.mtproto_domain || 'www.google.com';
   if($m('ewebproxy-port')) $m('ewebproxy-port').value = String(l.port || 443);
   if($m('epassword')) $m('epassword').value = l.uuid || '';
-  if($m('eproxy-username')) $m('eproxy-username').value = l.uuid || '';
-  if($m('eproxy-password')) $m('eproxy-password').value = l.uuid || '';
+  if($m('eproxy-username')) $m('eproxy-username').value = l.proxy_username || l.uuid || '';
+  if($m('eproxy-password')) $m('eproxy-password').value = l.proxy_password || l.uuid || '';
   if($m('ess-password')) $m('ess-password').value = '';
   if($m('emtproto-secret')) $m('emtproto-secret').value = (l.proxy && l.proxy.variants && l.proxy.variants.dd) ? proxySecretFromLink(l.proxy.variants.dd) : '';
   if($m('ewebproxy-secret')) $m('ewebproxy-secret').value = (l.proxy && l.proxy.secret) || '';
@@ -18992,14 +19689,17 @@ function showQR(txt) {
     toast(t('qrTooLong'), true);
     return;
   }
-  const img = $m('qr-img');
-  img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=' + encodeURIComponent(txt);
+  const canvas = $m('qr-canvas');
+  if (canvas && !drawQr(canvas, txt)) {
+    toast(t('qrTooLong'), true);
+    return;
+  }
   $m('mo-qr').classList.add('show');
 }
 
 function dlQR() {
   const a = document.createElement('a');
-  a.href = $m('qr-img').src;
+  a.href = $m('qr-canvas').toDataURL('image/png');
   a.download = 'sulgx-qr.png';
   a.click();
 }
@@ -19120,16 +19820,16 @@ function initChart(){
   if(typeof Chart==='undefined'){ setChartEmpty('tc', true, 'Chart library failed to load'); return; }
   tChart=new Chart(ctx,{
     type:'bar',
-    data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.6)',borderColor:'#39ff14',borderWidth:1,barPercentage:0.7,categoryPercentage:0.9}]},
+    data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:cssVar('--accent-soft'),borderColor:cssVar('--accent'),borderWidth:1,barPercentage:0.7,categoryPercentage:0.9}]},
     options:{
       responsive:true, maintainAspectRatio:false,
       plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'rgba(57,255,20,0.3)',maxRotation:45}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'},beginAtZero:true}}
+      scales:{x:{ticks:{color:cssVar('--text-3'),maxRotation:45}},y:{ticks:{color:cssVar('--text-3'),callback:v=>v+' MB'},beginAtZero:true}}
     }
   });
   updChartColors();
 }
-function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
+function updChartColors(){if(!tChart)return;const col=cssVar('--text-3');tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;if(tChart.options.scales.x.grid)tChart.options.scales.x.grid.color=cssVar('--border');if(tChart.options.scales.y.grid)tChart.options.scales.y.grid.color=cssVar('--border');tChart.update();}
 function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);}return d;}
 function getLocalTimeString(){const d=new Date();d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;}
 function updChart(){
@@ -19155,7 +19855,7 @@ function updDoughnutChart(){
   setChartEmpty('doughnut-chart', total<=0, 'No usage data yet');
   doughnutChart.data.labels=rows.map(l=>linkDisplayLabel(l));
   doughnutChart.data.datasets[0].data=rows.map(l=>numUsed(l));
-  doughnutChart.data.datasets[0].backgroundColor=rows.map(l=>l.color||'#39ff14');
+  doughnutChart.data.datasets[0].backgroundColor=rows.map(l=>l.color||'#3b82f6');
   doughnutChart.update();
   const tot=$m('doughnut-total');
   if(tot)tot.textContent='Total '+fmtB(total)+' ('+rows.length+' links)';
@@ -19165,7 +19865,7 @@ function initSpeedChart(){
   if(typeof Chart==='undefined')return;
   const ctx=$m('speed-chart');if(!ctx||speedChart)return;
   if(typeof Chart==='undefined'){setChartEmpty('speed-chart',true,'Chart library failed to load');return;}
-  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
+  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:cssVar('--success'),data:[],tension:0.2},{label:'UL',borderColor:cssVar('--danger'),data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
 }
 function updSpeedChart(up,down){
   if(!speedChart)return;
@@ -19243,12 +19943,12 @@ function renderAddrs() {
         return;
     }
     if (!allAddrs.length) {
-        el.innerHTML = '<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';
+        el.innerHTML = '<div style="color:var(--text-3);font-size:0.9rem">No addresses added</div>';
         return;
     }
     let buffer = '';
     allAddrs.forEach((a, i) => {
-        buffer += `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px"><div style="display:flex;align-items:center;gap:8px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.9rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:4px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`;
+        buffer += `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface-3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px"><div style="display:flex;align-items:center;gap:8px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.9rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:4px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">${icon('edit')}</button><button class="act-btn act-del" onclick="delAddr(${i})">${icon('delete')}</button></div></div>`;
     });
     el.innerHTML = buffer;
 }
@@ -19257,7 +19957,7 @@ function renderProfileAddresses(addresses) {
     const el = $m('addr-list');
     if (!el) return;
     if (!addresses.length) {
-        el.innerHTML = '<div style="color:var(--text3);font-size:0.9rem">No addresses in this profile</div>';
+        el.innerHTML = '<div style="color:var(--text-3);font-size:0.9rem">No addresses in this profile</div>';
         return;
     }
     let buffer = '';
@@ -19266,14 +19966,14 @@ function renderProfileAddresses(addresses) {
         const displayName = a.name ? esc(a.name) : '';
         const displayAddr = esc(a.address);
         const metaText = displayName ? `${displayName} (${displayAddr})` : displayAddr;
-        buffer += `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+        buffer += `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface-3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
                   <div style="display:flex;align-items:center;gap:8px">
                     <input type="checkbox" class="addr-checkbox" data-index="${i}" onchange="toggleSelectAddr(${i})">
                     <span style="font-size:0.9rem;font-weight:600">${flagEmoji ? flagEmoji + ' ' : ''}${esc(metaText)}</span>
                   </div>
                   <div style="display:flex;gap:4px;">
-                    <button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button>
-                    <button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button>
+                    <button class="act-btn act-edit" onclick="showEditAddr(${i})">${icon('edit')}</button>
+                    <button class="act-btn act-del" onclick="delAddr(${i})">${icon('delete')}</button>
                   </div>
                 </div>`;
     });
@@ -19355,11 +20055,12 @@ async function loadIpProfilesForSelectEdit(currentId){try{const r=await authenti
 function renderIpProfiles(profiles){
   const list=$m('ip-profiles-list'); if(!list)return;
   list.innerHTML = profiles.map(p=>`
-    <div class="status-glass-card active" style="cursor:default; text-align:start;">
+    <div class="status-card active" style="cursor:default; text-align:start;">
       <div style="font-weight:700;">${esc(p.name)} <span style="font-size:0.7rem;">(${p.address_count} IPs)</span></div>
+      ${p.first_ip ? `<div style="font-size:0.8rem;color:var(--text-2);direction:ltr;text-align:left;">${esc(p.first_ip)}${p.last_ip && p.last_ip !== p.first_ip ? ' – ' + esc(p.last_ip) : ''}</div>` : ''}
       <div style="display:flex; gap:4px; margin-top:6px;">
-        <button class="act-btn act-edit" onclick="editIpProfile('${p.id}')">✏️</button>
-        <button class="act-btn act-del" onclick="deleteIpProfile('${p.id}')">🗑️</button>
+        <button class="act-btn act-edit" onclick="editIpProfile('${p.id}')">${icon('edit')}</button>
+        <button class="act-btn act-del" onclick="deleteIpProfile('${p.id}')">${icon('delete')}</button>
       </div>
     </div>
   `).join('');
@@ -19515,7 +20216,7 @@ function buildDohUI() {
       if (!isPreset) {
         const delBtn = document.createElement('button');
         delBtn.className = 'pill-btn';
-        delBtn.textContent = '✕';
+        delBtn.innerHTML = icon('close'); delBtn.setAttribute('aria-label', 'Delete');
         delBtn.style.padding = '4px 8px';
         delBtn.onclick = (e) => {
           e.stopPropagation();
@@ -19552,7 +20253,7 @@ function addCustomDoh() {
     btn.onclick = () => { btn.classList.toggle('active'); };
     const delBtn = document.createElement('button');
     delBtn.className = 'pill-btn';
-    delBtn.textContent = '✕';
+    delBtn.innerHTML = icon('close'); delBtn.setAttribute('aria-label', 'Delete');
     delBtn.style.padding = '4px 8px';
     delBtn.onclick = (e) => {
       e.stopPropagation();
@@ -19584,7 +20285,7 @@ async function testDohPing() {
     const row = `<tr>
         <td>${url}</td>
         <td>${res.latency_ms !== null ? res.latency_ms + ' ms' : '–'}</td>
-        <td style="color:${res.status==='failed'?'var(--red)':'var(--green)'}">${res.status}</td>
+        <td style="color:${res.status==='failed'?'var(--danger)':'var(--success)'}">${res.status}</td>
     </tr>`;
     tbody.insertAdjacentHTML('beforeend', row);
   }
@@ -19611,12 +20312,12 @@ let editingPanelIndex = -1;
 function renderMultiPanel(panels) {
   const list = $m('multipanel-list');
   list.innerHTML = panels.map((p,i)=>`
-    <div class="status-glass-card active">
+    <div class="status-card active">
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <span style="font-weight:700;" onclick="window.open('${esc(p.url)}', '_blank')">${esc(p.name)}</span>
         <div>
-          <button class="act-btn act-edit" onclick="editMultiPanel(${i})">✏️</button>
-          <button class="act-btn act-del" onclick="removeMultiPanel(${i})">🗑️</button>
+          <button class="act-btn act-edit" onclick="editMultiPanel(${i})">${icon('edit')}</button>
+          <button class="act-btn act-del" onclick="removeMultiPanel(${i})">${icon('delete')}</button>
         </div>
       </div>
       <div style="font-size:0.7rem; margin-top:4px;">${esc(p.url)}</div>
@@ -19758,7 +20459,7 @@ async function startIPScan(){
         if(d.ok)scanOkCount++;
         const pct = Math.round((scannedCount / totalScanCount) * 100);
         $m('scan-progress').style.width = pct + '%'; $m('progress-text').textContent = pct + '%';
-        const row = `<tr class="scan-row" data-ip="${esc(d.ip)}"><td>${esc(d.ip)}</td><td style="color:${d.ok ? 'var(--green)' : 'var(--red)'}">${d.ok ? t('reachable') : t('failed')}</td><td>${d.tcp_latency!=null ? d.tcp_latency+' ms' : '–'}</td><td>${d.https_latency!=null ? d.https_latency+' ms' : '–'}</td><td class="location-cell">–</td></tr>`;
+        const row = `<tr class="scan-row" data-ip="${esc(d.ip)}"><td>${esc(d.ip)}</td><td data-ok="${d.ok ? '1' : '0'}" style="color:${d.ok ? 'var(--success)' : 'var(--danger)'}"><span class="status"><span class="status-dot ${d.ok ? 'ok' : 'err'}"></span><span>${d.ok ? t('reachable') : t('failed')}</span></span></td><td>${d.tcp_latency!=null ? d.tcp_latency+' ms' : '–'}</td><td>${d.https_latency!=null ? d.https_latency+' ms' : '–'}</td><td class="location-cell">–</td></tr>`;
         $m('scan-tbody').insertAdjacentHTML('beforeend', row);
     };
     wsScanner.onerror = () => {
@@ -19777,7 +20478,7 @@ async function fetchLocationData(){
     const rows = document.querySelectorAll('#scan-tbody tr.scan-row');
     const ips = [];
     rows.forEach(r => {
-        if(r.querySelector('td:nth-child(2)')?.textContent.includes('✅')) {
+        if(r.querySelector('td:nth-child(2)')?.dataset.ok === '1') {
             ips.push(r.dataset.ip);
         }
     });
@@ -19850,7 +20551,7 @@ function sortBestIPs(){
     rows.forEach(r=>{
         const cells=r.querySelectorAll('td');
         const ip=cells[0].textContent.trim();
-        const ok=cells[1].textContent.includes('✅');
+        const ok=cells[1].dataset.ok==='1';
         const tcp=parseFloat(cells[2].textContent);
         if(ok&&!isNaN(tcp))items.push({ip,latency:tcp});
     });
@@ -19870,7 +20571,7 @@ function copyReachableSorted(){
   rows.forEach(r=>{
     const cells=r.querySelectorAll('td');
     const ip=cells[0].textContent.trim();
-    const ok=cells[1].textContent.includes('✅');
+    const ok=cells[1].dataset.ok==='1';
     const lat=parseFloat(cells[2].textContent);
     if(ok&&!isNaN(lat))reachable.push({ip,lat});
   });
@@ -19885,7 +20586,7 @@ async function createProfileFromReachable() {
   rows.forEach(r=>{
     const cells = r.querySelectorAll('td');
     const ip = cells[0].textContent.trim();
-    const ok = cells[1].textContent.includes('✅');
+    const ok = cells[1].dataset.ok === '1';
     if(ok) reachable.push(ip);
   });
   if (reachable.length === 0) return toast(t('noReachableIps'), true);
@@ -19932,8 +20633,8 @@ async function loadLoginLogs(){
       const locationDisplay = country ? `${city ? city + ', ' : ''}${country}` : '-';
       const isp = l.isp || '-';
       const isLogout = l.path && l.path.includes('logout');
-      const statusStyle = isLogout ? 'color: var(--yellow);' : (l.success ? 'color: var(--green);' : 'color: var(--red);');
-      const statusText = isLogout ? t('logout') : (l.success ? '✅ ' + t('success') : t('failed'));
+      const statusStyle = isLogout ? 'color: var(--warning);' : (l.success ? 'color: var(--success);' : 'color: var(--danger);');
+      const statusText = isLogout ? '<span class="status"><span class="status-dot warn"></span><span>' + t('logout') + '</span></span>' : (l.success ? '<span class="status"><span class="status-dot ok"></span><span>' + t('success') + '</span></span>' : '<span class="status"><span class="status-dot err"></span><span>' + t('failed') + '</span></span>');
       return `<tr>
         <td>${timeAgo(l.timestamp)}</td>
         <td>
@@ -19978,9 +20679,9 @@ async function loadTelegramSettings(){
     });
 
     $m('tg-templates-en').value = d.telegram_templates_en ||
-      '{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login\\n🌐 IP: {ip}\\n📍 Location: {location}\\n🏢 ISP: {isp}\\n🏛️ Org: {org}\\n🖥️ Browser: {browser}\\n💻 OS: {os}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';
+      '{"quota_90":"{label} ({uid}) used 90% of quota","login":"Panel login\\nIP: {ip}\\nLocation: {location}\\nISP: {isp}\\nOrg: {org}\\nBrowser: {browser}\\nOS: {os}\\nUA: {ua}\\n{time}","expiry":"{label} expired","error":"Error on {label}: check logs"}';
     $m('tg-templates-fa').value = d.telegram_templates_fa ||
-      '{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود به پنل\\n🌐 IP: {ip}\\n📍 موقعیت: {location}\\n🏢 ISP: {isp}\\n🏛️ سازمان: {org}\\n🖥️ مرورگر: {browser}\\n💻 سیستم‌عامل: {os}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';
+      '{"quota_90":"{label} ({uid}) ۹۰٪ کوتا","login":"ورود به پنل\\nIP: {ip}\\nموقعیت: {location}\\nISP: {isp}\\nسازمان: {org}\\nمرورگر: {browser}\\nسیستم‌عامل: {os}\\nUA: {ua}\\n{time}","expiry":"{label} منقضی شد","error":"خطا در {label}: بررسی شود"}';
 
     const tgLang = d.telegram_lang || 'en';
     const toggle = $m('tg-lang-toggle');
@@ -20069,7 +20770,7 @@ async function testTelegram(){
     return;
   }
   const tglang = $m('tg-lang-hidden').value;
-  const msg = tglang === 'fa' ? '✅ SulgX متصل شد' : '✅ SulgX is connected';
+  const msg = tglang === 'fa' ? 'SulgX متصل شد' : 'SulgX is connected';
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
@@ -20133,21 +20834,21 @@ function previewTemplate() {
                        .replace(/{browser}/g, mockData.browser)
                        .replace(/{os}/g, mockData.os);
             previewHTML += `<div style="margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:6px;">`;
-            previewHTML += `<span style="color:var(--primary);font-weight:bold;font-size:0.8rem;">[${key}]:</span><br>`;
+            previewHTML += `<span style="color:var(--accent);font-weight:bold;font-size:0.8rem;">[${key}]:</span><br>`;
             previewHTML += `<span>${text}</span></div>`;
         }
 
         const mockDomain = window.location.host || "your-domain.com";
         const prefix = window.panelPrefix ? '/' + window.panelPrefix : '';
         previewHTML += `<div style="margin-top:6px;padding-top:4px;color:#4caf50;">`;
-        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}${prefix}/panel)`;
+        previewHTML += icon('warning') + ` <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}${prefix}/panel)`;
         previewHTML += `</div>`;
 
         previewDiv.innerHTML = previewHTML;
-        previewDiv.style.border = "1px solid var(--primary)";
+        previewDiv.style.border = "1px solid var(--border-strong)";
     } catch (e) {
-        previewDiv.innerHTML = `<span style="color:#ff4d4f;font-weight:600;">❌ Invalid JSON:</span><br><small style="color:#ff7875;">${e.message}</small>`;
-        previewDiv.style.border = "1px solid #ff4d4f";
+        previewDiv.innerHTML = `<span style="color:var(--danger);font-weight:600;">` + icon('x-circle') + ` Invalid JSON:</span><br><small style="color:var(--danger);">${e.message}</small>`;
+        previewDiv.style.border = "1px solid var(--danger-border)";
     }
 }
 async function loadGeneralSettings(){
@@ -20387,9 +21088,9 @@ function renderProxyLines(lines) {
         const flagEmoji = p.flag ? codeToFlag(p.flag) : '';
         let healthHtml = '–';
         if (p.last_test_status === 'ok') {
-            healthHtml = `<span style="color:var(--green)">✅ ${p.last_latency_ms}ms</span>`;
+            healthHtml = `<span class="status"><span class="status-dot ok"></span><span>${p.last_latency_ms}ms</span></span>`;
         } else if (p.last_test_status) {
-            healthHtml = `<span style="color:var(--red)">❌ ${p.last_test_status}</span>`;
+            healthHtml = `<span class="status"><span class="status-dot err"></span><span>${p.last_test_status}</span></span>`;
         }
         return `
         <tr id="proxy-row-${p.id}">
@@ -20400,9 +21101,9 @@ function renderProxyLines(lines) {
             <td><span class="tag ${p.is_active ? 'tag-on' : 'tag-off'}">${p.is_active ? 'On' : 'Off'}</span></td>
             <td id="proxy-status-${p.id}">${healthHtml}</td>
             <td>
-                <button class="act-btn act-edit" onclick="editProxy(${p.id})">✏️</button>
-                <button class="act-btn act-del" onclick="deleteProxy(${p.id})">🗑️</button>
-                <button class="act-btn act-sub" onclick="testProxyDirect(${p.id})">🔍</button>
+                <button class="act-btn act-edit" onclick="editProxy(${p.id})">${icon('edit')}</button>
+                <button class="act-btn act-del" onclick="deleteProxy(${p.id})">${icon('delete')}</button>
+                <button class="act-btn act-sub" onclick="testProxyDirect(${p.id})">${icon('search')}</button>
             </td>
         </tr>`;
     }).join('');
@@ -20477,6 +21178,7 @@ function copySelectedProxies() {
 
 async function resolveProxyFlags() {
     const btn = document.querySelector('[onclick="resolveProxyFlags()"]');
+    const btnHtml = btn ? btn.innerHTML : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Resolving...'; }
     try {
         const r = await authenticatedFetch('/api/proxy-lines/resolve-flags', { method: 'POST' });
@@ -20484,7 +21186,7 @@ async function resolveProxyFlags() {
         toast(`Flags resolved for ${d.resolved} proxies`);
         loadProxyLines();
     } catch(e) { toast(t('Error'), true); }
-    if (btn) { btn.disabled = false; btn.textContent = '🌍 Resolve Flags'; }
+    if (btn) { btn.disabled = false; btn.innerHTML = btnHtml; }
 }
 
 async function testProxyDirect(pid) {
@@ -20494,9 +21196,9 @@ async function testProxyDirect(pid) {
         const statusEl = $m('proxy-status-' + pid);
         if (statusEl) {
             if (d.ok) {
-                statusEl.innerHTML = `<span style="color:var(--green)">✅ ${d.latency_ms}ms</span>`;
+                statusEl.innerHTML = `<span class="status"><span class="status-dot ok"></span><span>${d.latency_ms}ms</span></span>`;
             } else {
-                statusEl.innerHTML = `<span style="color:var(--red)">❌ ${d.error || 'Failed'}</span>`;
+                statusEl.innerHTML = `<span class="status"><span class="status-dot err"></span><span>${d.error || 'Failed'}</span></span>`;
             }
         }
         toast(d.ok ? `OK (${d.latency_ms}ms)` : (d.error || 'Failed'));
@@ -20714,16 +21416,16 @@ async function testAllProxies() {
                 const rowStatus = document.getElementById('proxy-status-' + proxy.id);
                 if (rowStatus) {
                     if (d.ok) {
-                        rowStatus.innerHTML = '<span style="color:var(--green)">\u2705 ' + d.latency_ms + 'ms</span>';
+                        rowStatus.innerHTML = '<span class="status"><span class="status-dot ok"></span><span>' + d.latency_ms + 'ms</span></span>';
                     } else {
-                        rowStatus.innerHTML = '<span style="color:var(--red)">\u274c ' + (d.error || 'Failed') + '</span>';
+                        rowStatus.innerHTML = '<span class="status"><span class="status-dot err"></span><span>' + (d.error || 'Failed') + '</span></span>';
                     }
                 }
             } catch (e) {
                 if (e.name === 'AbortError') break;
                 results.push({ id: proxy.id, ok: false, error: 'Request failed' });
                 const rowStatus = document.getElementById('proxy-status-' + proxy.id);
-                if (rowStatus) rowStatus.innerHTML = '<span style="color:var(--red)">\u274c Error</span>';
+                if (rowStatus) rowStatus.innerHTML = '<span class="status"><span class="status-dot err"></span><span>Error</span></span>';
             }
             completed++;
             const pct = Math.round((completed / total) * 100);
@@ -20793,7 +21495,11 @@ async def create_proxy_lines_bulk(request: Request, _=Depends(require_auth)):
             continue
         proxy_type = item.get("type", "socks5")
         host = (item.get("host") or "").strip()
-        port = int(item.get("port") or 0)
+        try:
+            port = _parse_int_value(item.get("port"), "port", 0, 0, 65535)
+        except HTTPException:
+            errors += 1
+            continue
         if not host or port <= 0:
             errors += 1
             continue
@@ -21421,6 +22127,39 @@ async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 
+from starlette.convertors import Convertor, register_url_convertor
+
+
+class _Hex12Convertor(Convertor):
+    regex = "[0-9a-f]{12}"
+
+    def convert(self, value):
+        return str(value).lower()
+
+    def to_string(self, value):
+        return str(value).lower()
+
+
+register_url_convertor("hex12", _Hex12Convertor())
+
+
+@app.api_route("/{token:hex12}/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def webproxy_forwarder(request: Request, token: str, rest: str):
+    token = str(token or "").strip().lower()
+    link = _web_link_for_token(token)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    uid = str(link.get("uid", ""))
+    body = await request.body()
+    if body:
+        try:
+            await consume_quota_partial(uid, len(body))
+        except Exception:
+            pass
+    query = request.url.query.encode("latin-1") if request.url.query else b""
+    return await _forward_http_to_telemt(request, uid, "/" + token + "/" + rest, query, body=body)
+
+
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def dynamic_xhttp_router(full_path: str, request: Request):
     """
@@ -21433,12 +22172,19 @@ async def dynamic_xhttp_router(full_path: str, request: Request):
     """
     base_paths = set()
     if request.method in ("GET", "HEAD") and re.fullmatch(r"[0-9a-f]{12}", full_path or ""):
-        bridge = _webproxy_bridge_for_request(request)
-        if bridge is not None:
-            return HTMLResponse(content=bridge)
+        _bare_token = full_path.strip().lower()
+        _bare_link = _web_link_for_token(_bare_token)
+        if _bare_link is not None:
+            _bare_body = await request.body()
+            if _bare_body:
+                try:
+                    await consume_quota_partial(str(_bare_link.get("uid", "")), len(_bare_body))
+                except Exception:
+                    pass
+            _bare_query = request.url.query.encode("latin-1") if request.url.query else b""
+            return await _forward_http_to_telemt(request, str(_bare_link.get("uid", "")), "/" + _bare_token + "/", _bare_query, body=_bare_body)
         if request.query_params.get("bridge", "") or request.query_params.get("capability", "") or request.query_params.get("cap", "") or request.query_params.get("secret", "") or request.query_params.get("token", ""):
-            if tgproxy is not None:
-                return HTMLResponse(content=tgproxy.webproxy_decoy_html())
+            return Response(content="no active WEB proxy inbound for this token", status_code=404, media_type="text/plain")
     async with LINKS_LOCK:
         for uid, link in LINKS.items():
             if not link.get("active"):
