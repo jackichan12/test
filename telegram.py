@@ -1,26 +1,33 @@
+"""SulgX Telegram proxy layer.
+
+SOCKS5 and HTTP CONNECT stay in this module and only accept Telegram
+destinations. MTProto and WEB proxying are delegated to the telemt binary:
+one shared telemt child serves classic MTProto for every inbound, and one
+telemt child per WEB inbound serves that inbound token. The panel never
+implements the MTProto or WEB wire protocols itself any more.
+"""
 import asyncio
 import base64
 import hashlib
 import hmac as hmac_mod
 import ipaddress
 import json
+import logging
 import os
-import random
+import re
+import secrets
+import shutil
 import socket
 import struct
+import tempfile
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote as _url_quote
+from urllib.parse import quote as _url_path_quote
+import urllib.error
+import urllib.request
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-DC_SEEDS = {
-    1: ["149.154.175.50", "149.154.175.51", "149.154.175.52"],
-    2: ["149.154.167.51", "149.154.167.50", "149.154.167.41"],
-    3: ["149.154.175.100"],
-    4: ["149.154.167.91", "149.154.167.92"],
-    5: ["149.154.171.5", "91.108.56.130", "91.108.56.156"],
-}
+_LOG = logging.getLogger("sulgx.telegram")
 
 TG_NETWORKS = [
     ipaddress.ip_network("91.108.4.0/22"),
@@ -32,12 +39,21 @@ TG_NETWORKS = [
     ipaddress.ip_network("91.105.192.0/18"),
 ]
 
-TLS_START_BYTES = b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03"
-TLS_HELLO_LEN = 517
-TAG_ABRIDGED = b"\xef\xef\xef\xef"
-TAG_INTERMEDIATE = b"\xee\xee\xee\xee"
-TAG_PADDED = b"\xdd\xdd\xdd\xdd"
-VALID_TAGS = (TAG_ABRIDGED, TAG_INTERMEDIATE, TAG_PADDED)
+TELEMT_VERSION = "3.5.17"
+_TELEMT_DEFAULT_BIN = "/usr/local/bin/telemt"
+_TELEMT_DEFAULT_DIR = "/data/telemt"
+_TELEMT_LOG_MAX = 500
+_TELEMT_BACKOFF = (1, 2, 5, 10, 30)
+_TELEMT_MAX_FAILURES = 5
+_TELEMT_FAILURE_WINDOW = 60.0
+_TELEMT_BOOT_LOG_MAX = 40
+_TELEMT_DECOY_HTML = "<!doctype html><html><head><meta charset=\"utf-8\"><title>OK</title></head><body>OK</body></html>"
+_HTTP_METHODS = (b"CONNECT ", b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TELEMT_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_TELEMT_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_TELEMT_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+_HEXDIGITS = frozenset("0123456789abcdefABCDEF")
 
 _SECRET = b""
 _DOMAIN = "www.google.com"
@@ -48,8 +64,13 @@ _SESSION_ALLOWED = None
 ACTIVE_PROXY = {}
 _SERVERS = []
 _STATS = {"socks_connections": 0, "socks_bytes": 0, "mtproxy_connections": 0, "mtproxy_bytes": 0, "http_connections": 0, "http_bytes": 0}
-_REPLAY = {}
-_FAKE_TLS_REPLAY = {}
+_MTPROXY_LINK_SECRETS = {}
+
+_TELEMT_DIR_CACHED = ""
+_TELEMT_DECOY_READY = False
+_TELEMT_MTPROTO = None
+_TELEMT_WEB = {}
+_TELEMT_LOCKS = {}
 
 
 def configure(secret, domain="www.google.com"):
@@ -76,10 +97,6 @@ def mtproxy_dd_link(host, port):
     return "tg://proxy?server=" + str(host) + "&port=" + str(port) + "&secret=dd" + _SECRET.hex()
 
 
-
-_MTPROXY_LINK_SECRETS = {}
-
-
 def mtproxy_secret_for_uid(uid):
     return hashlib.sha256(_SECRET + b"mtproxy-link-v1\x00" + str(uid).encode("utf-8")).digest()[:16]
 
@@ -98,7 +115,7 @@ def mtproxy_link_for_uid(host, port, uid, variant="dd", domain="www.google.com")
     secret = mtproxy_secret_for_uid(uid)
     if variant == "faketls":
         dom = (domain or "www.google.com").strip() or "www.google.com"
-        return "tg://proxy?server=" + str(host) + "&port=" + str(port) + "&secret=" + "dd" + secret.hex() + dom.encode("utf-8").hex()
+        return "tg://proxy?server=" + str(host) + "&port=" + str(port) + "&secret=" + "ee" + secret.hex() + dom.encode("utf-8").hex()
     if variant == "plain":
         return "tg://proxy?server=" + str(host) + "&port=" + str(port) + "&secret=" + secret.hex()
     return "tg://proxy?server=" + str(host) + "&port=" + str(port) + "&secret=" + "dd" + secret.hex()
@@ -120,46 +137,6 @@ def http_proxy_link(host, port, username, password):
     return "http://" + _url_quote(str(username), safe="") + ":" + _url_quote(str(password), safe="") + "@" + str(host) + ":" + str(port)
 
 
-def _mtproxy_candidates():
-    out = []
-    for uid, secret in list(_MTPROXY_LINK_SECRETS.items()):
-        out.append((uid, secret))
-    return out
-
-
-def _mtproxy_match_plain(init):
-    if init[0] == 0xEF:
-        return None, None
-    for uid, secret in _mtproxy_candidates():
-        try:
-            enc_key, enc_iv, dec_key, dec_iv = _derive_obfs_keys(init, secret)
-            decryptor = _aes_ctr(enc_key, enc_iv).decryptor()
-            plain = decryptor.update(init)
-        except (ValueError, TypeError):
-            continue
-        tag = plain[56:60]
-        if tag not in VALID_TAGS:
-            continue
-        dc_id = struct.unpack("<h", plain[60:62])[0]
-        dc = abs(dc_id)
-        if dc >= 10000:
-            dc -= 10000
-        if dc < 1 or dc > 5:
-            continue
-        return secret, uid
-    return None, None
-
-
-def _mtproxy_match_faketls(hello):
-    zeroed = hello[:11] + b"\x00" * 32 + hello[43:]
-    received = hello[11:43]
-    for uid, secret in _mtproxy_candidates():
-        digest = hmac_mod.new(secret, zeroed, hashlib.sha256).digest()
-        xored = bytes(a ^ b for a, b in zip(received, digest))
-        if xored[:28] == b"\x00" * 28:
-            return secret, uid, xored
-    return None, None, None
-
 def stats():
     return dict(_STATS)
 
@@ -175,37 +152,6 @@ def is_telegram_ip(ip_str):
     return False
 
 
-def _aes_ctr(key, iv):
-    return Cipher(algorithms.AES(key), modes.CTR(iv))
-
-
-def _derive_obfs_keys(init, secret):
-    enc_key_raw = init[8:40]
-    enc_iv = init[40:56]
-    rev = init[::-1]
-    dec_key_raw = rev[8:40]
-    dec_iv = rev[40:56]
-    if secret:
-        enc_key = hashlib.sha256(enc_key_raw + secret).digest()
-        dec_key = hashlib.sha256(dec_key_raw + secret).digest()
-    else:
-        enc_key = enc_key_raw
-        dec_key = dec_key_raw
-    return enc_key, enc_iv, dec_key, dec_iv
-
-
-def _build_obfs_init(tag, dc_id):
-    init = bytearray(os.urandom(64))
-    while init[0] == 0xEF:
-        init[0] = os.urandom(1)[0]
-    init[56:60] = tag
-    init[60:62] = struct.pack("<h", dc_id)
-    enc_key, enc_iv, _dk, _di = _derive_obfs_keys(bytes(init), b"")
-    cipher = _aes_ctr(enc_key, enc_iv).encryptor()
-    encrypted = cipher.update(bytes(init))
-    return bytes(init[:56]) + encrypted[56:64], cipher, bytes(init)
-
-
 async def _read_exact(reader, n):
     data = b""
     while len(data) < n:
@@ -214,53 +160,6 @@ async def _read_exact(reader, n):
             raise ConnectionError("connection closed while reading")
         data += chunk
     return data
-
-
-async def _tls_read_record(reader):
-    header = await _read_exact(reader, 5)
-    rtype = header[0]
-    length = struct.unpack(">H", header[3:5])[0]
-    if length > 18432:
-        raise ConnectionError("tls record too large")
-    payload = await _read_exact(reader, length) if length else b""
-    return rtype, payload
-
-
-async def _tls_read_data(reader, need):
-    data = b""
-    while len(data) < need:
-        rtype, payload = await _tls_read_record(reader)
-        if rtype == 0x14:
-            continue
-        if rtype != 0x17:
-            raise ConnectionError("unexpected tls record")
-        data += payload
-    return data[:need], data[need:]
-
-
-async def _tls_write(writer, data):
-    offset = 0
-    while offset < len(data):
-        chunk = data[offset:offset + 16384]
-        writer.write(b"\x17\x03\x03" + struct.pack(">H", len(chunk)) + chunk)
-        await writer.drain()
-        offset += len(chunk)
-
-
-def _fake_tls_server_hello(hello, secret):
-    client_random = hello[11:43]
-    digest = hmac_mod.new(secret, client_random + hello, hashlib.sha256).digest()
-    session_len = hello[43]
-    session_id = hello[44:44 + session_len]
-    body = b"\x03\x03" + digest + bytes([session_len]) + session_id + b"\x13\x01\x00"
-    extensions = b"\x00\x2b\x00\x03\x02\x03\x04" + b"\x00\x33\x00\x26\x00\x1d\x00\x20" + os.urandom(32)
-    body += struct.pack(">H", len(extensions)) + extensions
-    handshake = b"\x02" + len(body).to_bytes(3, "big") + body
-    record = b"\x16\x03\x03" + struct.pack(">H", len(handshake)) + handshake
-    record += b"\x14\x03\x03\x00\x01\x01"
-    cert = os.urandom(2048)
-    record += b"\x17\x03\x03" + struct.pack(">H", len(cert)) + cert
-    return record
 
 
 def active_proxy_sessions():
@@ -283,226 +182,214 @@ def disconnect_proxy_session(sid):
     ACTIVE_PROXY.pop(sid, None)
     return True
 
+class _PrefixedReader:
+    def __init__(self, reader, prefix):
+        self._reader = reader
+        self._buf = bytearray(prefix or b"")
 
-async def _handle_mtproxy(reader, writer):
+    async def read(self, n=-1):
+        if n is None or n < 0:
+            chunks = [bytes(self._buf)]
+            self._buf.clear()
+            while True:
+                chunk = await self._reader.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        if self._buf:
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            return out
+        chunk = await self._reader.read(n)
+        return bytes(chunk or b"")
+
+    async def readexactly(self, n):
+        data = b""
+        while len(data) < n:
+            chunk = await self.read(n - len(data))
+            if not chunk:
+                raise asyncio.IncompleteReadError(data, n)
+            data += chunk
+        return data
+
+    async def readuntil(self, separator=b"\n"):
+        while True:
+            idx = self._buf.find(separator)
+            if idx >= 0:
+                end = idx + len(separator)
+                out = bytes(self._buf[:end])
+                del self._buf[:end]
+                return out
+            chunk = await self._reader.read(65536)
+            if not chunk:
+                raise asyncio.IncompleteReadError(bytes(self._buf), None)
+            self._buf += chunk
+
+
+def _looks_http(prefix):
+    if not prefix:
+        return False
+    for method in _HTTP_METHODS:
+        if prefix.startswith(method):
+            return True
+        if len(prefix) >= 3 and len(prefix) < len(method) and method.startswith(prefix):
+            return True
+    return False
+
+
+def _looks_socks5(prefix):
+    if len(prefix) < 2:
+        return False
+    if prefix[0] != 0x05:
+        return False
+    count = prefix[1]
+    if count < 1 or count > 4:
+        return False
+    for byte in prefix[2:2 + count]:
+        if byte not in (0x00, 0x01, 0x02):
+            return False
+    return True
+
+
+def _could_be_http_or_socks5(prefix):
+    if not prefix:
+        return True
+    for method in _HTTP_METHODS:
+        if method.startswith(prefix):
+            return True
+    if prefix[0] == 0x05:
+        if len(prefix) < 2:
+            return True
+        count = prefix[1]
+        if count < 1 or count > 4:
+            return False
+        for byte in prefix[2:2 + count]:
+            if byte not in (0x00, 0x01, 0x02):
+                return False
+        return True
+    return False
+
+
+async def _peek_prefix(reader):
+    prefix = b""
+    deadline = time.monotonic() + 1.0
+    while len(prefix) < 8:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            chunk = await asyncio.wait_for(reader.read(8 - len(prefix)), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+        except (ConnectionError, OSError):
+            break
+        if not chunk:
+            break
+        prefix += bytes(chunk)
+        if _looks_http(prefix):
+            break
+        if _looks_socks5(prefix) and len(prefix) >= 2 + prefix[1]:
+            break
+        if not _could_be_http_or_socks5(prefix):
+            break
+    return prefix
+
+
+async def _handle_mtproto_relay(reader, writer, prefix):
     _STATS["mtproxy_connections"] += 1
     upstream_reader = None
     upstream_writer = None
-    client_enc = None
-    client_dec = None
-    up_enc = None
-    up_dec = None
-    tls_mode = False
-    mt_sid = None
-    mt_entry = None
-    mt_uid = ""
-    mt_secret = _SECRET
-    mt_totals = {"up": 0, "down": 0, "up_flushed": 0, "down_flushed": 0}
-    async def _mt_flush(direction, force=False):
-        if not mt_uid or _COUNT_TRAFFIC is None:
-            return True
-        delta = mt_totals[direction] - mt_totals[direction + "_flushed"]
-        if delta <= 0:
-            return True
-        if not force and delta < 1048576:
-            return True
-        ok = await _COUNT_TRAFFIC(mt_uid, delta)
-        if ok:
-            mt_totals[direction + "_flushed"] = mt_totals[direction]
-            if mt_entry is not None:
-                mt_entry["bytes_flushed"] = mt_totals["up_flushed"] + mt_totals["down_flushed"]
-        return ok
+    sid = None
+    entry = None
+    total_up = 0
+    total_down = 0
     try:
         if _MTPROXY_QUOTA_OK is not None:
             if not await _MTPROXY_QUOTA_OK():
                 writer.close()
                 return
-        first = await _read_exact(reader, 11)
-        if first == TLS_START_BYTES:
-            rest = await _read_exact(reader, TLS_HELLO_LEN - 11)
-            hello = first + rest
-            matched_secret, matched_uid, xored = _mtproxy_match_faketls(hello)
-            if matched_secret is None:
-                writer.close()
-                return
-            stamp = struct.unpack("<I", xored[28:32])[0]
-            now = int(time.time())
-            if stamp < now - 1200 or stamp > now + 600:
-                writer.close()
-                return
-            replay_key = hmac_mod.new(matched_secret, hello[:11] + b"\x00" * 32 + hello[43:], hashlib.sha256).digest()[:16]
-            if replay_key in _FAKE_TLS_REPLAY:
-                writer.close()
-                return
-            _FAKE_TLS_REPLAY[replay_key] = now
-            if len(_FAKE_TLS_REPLAY) > 65536:
-                oldest = min(_FAKE_TLS_REPLAY, key=_FAKE_TLS_REPLAY.get)
-                del _FAKE_TLS_REPLAY[oldest]
-            mt_secret = matched_secret
-            mt_uid = matched_uid
-            writer.write(_fake_tls_server_hello(hello, mt_secret))
-            await writer.drain()
-            tls_mode = True
-            init, leftover = await _tls_read_data(reader, 64)
-            pending = leftover
-        else:
-            rest = await _read_exact(reader, 53)
-            init = first + rest
-            pending = b""
-            matched_secret, matched_uid = _mtproxy_match_plain(init)
-            if matched_secret is None:
-                writer.close()
-                return
-            mt_secret = matched_secret
-            mt_uid = matched_uid
-        if not mt_uid:
+        port = telemt_mtproto_port()
+        if port is None:
+            _LOG.warning("telemt MTProto child is not running; closing MTProto connection")
             writer.close()
             return
-        replay_key = hashlib.sha256(init).digest()[:16]
-        if replay_key in _REPLAY:
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port), timeout=10
+            )
+        except (OSError, asyncio.TimeoutError):
             writer.close()
             return
-        _REPLAY[replay_key] = time.time()
-        if len(_REPLAY) > 65536:
-            oldest = min(_REPLAY, key=_REPLAY.get)
-            del _REPLAY[oldest]
-        enc_key, enc_iv, dec_key, dec_iv = _derive_obfs_keys(init, mt_secret)
-        decryptor = _aes_ctr(enc_key, enc_iv).decryptor()
-        plain_init = decryptor.update(init)
-        tag = plain_init[56:60]
-        if tag not in VALID_TAGS:
-            writer.close()
-            return
-        dc_id = struct.unpack("<h", plain_init[60:62])[0]
-        dc = abs(dc_id)
-        if dc >= 10000:
-            dc -= 10000
-        if dc < 1 or dc > 5:
-            writer.close()
-            return
-        if mt_uid:
-            peer = writer.get_extra_info("peername")
-            cip = peer[0] if peer else ""
-            if _SESSION_ALLOWED is not None and not _SESSION_ALLOWED(mt_uid, cip):
-                writer.close()
-                return
-            if _COUNT_TRAFFIC is not None and not await _COUNT_TRAFFIC(mt_uid, 0):
-                writer.close()
-                return
-        client_enc = _aes_ctr(dec_key, dec_iv).encryptor()
-        client_dec = decryptor
-        seeds = DC_SEEDS.get(dc, [])
-        upstream_reader = None
-        upstream_writer = None
-        last_error = None
-        for seed in seeds:
-            try:
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(seed, 443), timeout=10
-                )
-                break
-            except (OSError, asyncio.TimeoutError) as exc:
-                last_error = exc
-        if upstream_writer is None:
-            writer.close()
-            return
-        up_init, up_enc, up_orig = _build_obfs_init(tag, dc)
-        upstream_writer.write(up_init)
-        await upstream_writer.drain()
-        _uk, _ui, up_dec_key, up_dec_iv = _derive_obfs_keys(up_orig, b"")
-        up_dec = _aes_ctr(up_dec_key, up_dec_iv).decryptor()
-        async def _client_write(data):
-            if tls_mode:
-                await _tls_write(writer, data)
-            else:
-                writer.write(data)
-                await writer.drain()
-        if pending:
-            chunk = client_dec.update(pending)
-            chunk = up_enc.update(chunk)
-            upstream_writer.write(chunk)
+        if prefix:
+            upstream_writer.write(prefix)
             await upstream_writer.drain()
-        async def _up_to_client():
-            total = 0
-            try:
-                while True:
-                    chunk = await upstream_reader.read(65536)
-                    if not chunk:
-                        break
-                    chunk = up_dec.update(chunk)
-                    chunk = client_enc.update(chunk)
-                    await _client_write(chunk)
-                    total += len(chunk)
-                    mt_totals["down"] += len(chunk)
-                    _STATS["mtproxy_bytes"] += len(chunk)
-                    if mt_entry is not None:
-                        mt_entry["bytes_down"] += len(chunk)
-                    if mt_uid and not await _mt_flush("down"):
-                        break
-            except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
-                pass
-            finally:
-                try:
-                    writer.close()
-                except OSError:
-                    pass
-            return total
-        async def _client_to_up():
-            total = 0
-            try:
-                while True:
-                    if tls_mode:
-                        rtype, payload = await _tls_read_record(reader)
-                        if rtype == 0x14:
-                            continue
-                        if rtype != 0x17:
-                            break
-                        chunk = payload
-                    else:
-                        chunk = await reader.read(65536)
-                    if not chunk:
-                        break
-                    chunk = client_dec.update(chunk)
-                    chunk = up_enc.update(chunk)
-                    upstream_writer.write(chunk)
-                    await upstream_writer.drain()
-                    total += len(chunk)
-                    mt_totals["up"] += len(chunk)
-                    _STATS["mtproxy_bytes"] += len(chunk)
-                    if mt_entry is not None:
-                        mt_entry["bytes_up"] += len(chunk)
-                    if mt_uid and not await _mt_flush("up"):
-                        break
-            except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
-                pass
-            finally:
-                try:
-                    upstream_writer.close()
-                except OSError:
-                    pass
-            return total
+            total_up += len(prefix)
+            _STATS["mtproxy_bytes"] += len(prefix)
         peer = writer.get_extra_info("peername")
-        mt_sid = "mtproxy-" + os.urandom(6).hex()
-        mt_entry = {"id": mt_sid, "username": mt_uid, "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
-        ACTIVE_PROXY[mt_sid] = mt_entry
-        await asyncio.gather(_client_to_up(), _up_to_client())
-        if mt_uid:
-            await _mt_flush("up", force=True)
-            await _mt_flush("down", force=True)
+        sid = "mtproxy-" + os.urandom(6).hex()
+        entry = {"id": sid, "username": "", "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": total_up, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
+        ACTIVE_PROXY[sid] = entry
+
+        async def _relay(src, dst, direction):
+            nonlocal total_up, total_down
+            try:
+                while True:
+                    chunk = await src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    await dst.drain()
+                    _STATS["mtproxy_bytes"] += len(chunk)
+                    if direction == "up":
+                        total_up += len(chunk)
+                        entry["bytes_up"] = total_up
+                    else:
+                        total_down += len(chunk)
+                        entry["bytes_down"] = total_down
+            except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+                pass
+            finally:
+                try:
+                    dst.write_eof()
+                except (AttributeError, OSError, RuntimeError):
+                    try:
+                        dst.close()
+                    except OSError:
+                        pass
+
+        up_task = asyncio.create_task(_relay(reader, upstream_writer, "up"))
+        down_task = asyncio.create_task(_relay(upstream_reader, writer, "down"))
+        done, pending = await asyncio.wait((up_task, down_task), return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(up_task, down_task, return_exceptions=True)
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
-        try:
-            writer.close()
-        except OSError:
-            pass
         if upstream_writer is not None:
             try:
                 upstream_writer.close()
             except OSError:
                 pass
-        if mt_sid is not None:
-            ACTIVE_PROXY.pop(mt_sid, None)
+        if sid is not None:
+            ACTIVE_PROXY.pop(sid, None)
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def _handle_multi(reader, writer):
+    prefix = await _peek_prefix(reader)
+    if _looks_http(prefix):
+        await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+        return
+    if _looks_socks5(prefix):
+        await _handle_socks5(_PrefixedReader(reader, prefix), writer)
+        return
+    await _handle_mtproto_relay(reader, writer, prefix)
+
 
 async def _handle_socks5(reader, writer):
     _STATS["socks_connections"] += 1
@@ -694,7 +581,6 @@ async def _handle_socks5(reader, writer):
         except OSError:
             pass
 
-
 async def _handle_http_proxy(reader, writer):
     _STATS["http_connections"] += 1
     link = None
@@ -879,39 +765,961 @@ async def _handle_http_proxy(reader, writer):
         except OSError:
             pass
 
+def _telemt_binary():
+    env_bin = (os.environ.get("TELEMT_BIN") or "").strip()
+    if env_bin:
+        return env_bin
+    found = shutil.which("telemt")
+    if found:
+        return found
+    return _TELEMT_DEFAULT_BIN
 
-async def start_all(socks_port, mtproxy_port, auth_lookup, count_traffic, mtproxy_quota_ok, session_allowed=None, http_port=0):
+
+def telemt_available():
+    path = _telemt_binary()
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _telemt_dir():
+    global _TELEMT_DIR_CACHED
+    if _TELEMT_DIR_CACHED:
+        return _TELEMT_DIR_CACHED
+    wanted = (os.environ.get("TELEMT_DIR") or "").strip() or _TELEMT_DEFAULT_DIR
+    try:
+        os.makedirs(wanted, exist_ok=True)
+        probe = os.path.join(wanted, ".write-test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.unlink(probe)
+        _TELEMT_DIR_CACHED = wanted
+        return wanted
+    except OSError:
+        fallback = tempfile.mkdtemp(prefix="sulgx-telemt-")
+        _TELEMT_DIR_CACHED = fallback
+        return fallback
+
+
+def _telemt_lock(name):
+    lock = _TELEMT_LOCKS.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TELEMT_LOCKS[name] = lock
+    return lock
+
+
+def _free_loopback_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _random_bearer():
+    return secrets.token_hex(24)
+
+
+def _toml_escape(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _telemt_username(uid):
+    name = str(uid)
+    if _TELEMT_USERNAME_RE.match(name):
+        return name
+    return "u" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:40]
+
+
+def _valid_secret_hex(value):
+    return isinstance(value, str) and len(value) == 32 and all(c in _HEXDIGITS for c in value)
+
+
+def _valid_web_host(host):
+    if not isinstance(host, str):
+        return False
+    text = host.strip().lower()
+    if not text or len(text) > 253 or "." not in text:
+        return False
+    if not _TELEMT_HOST_RE.match(text):
+        return False
+    for label in text.split("."):
+        if not label or label.startswith("-") or label.endswith("-"):
+            return False
+    try:
+        ipaddress.ip_address(text)
+        return False
+    except ValueError:
+        return True
+
+
+def _ensure_decoy_dir():
+    global _TELEMT_DECOY_READY
+    base = _telemt_dir()
+    decoy_dir = os.path.join(base, "decoy")
+    if not _TELEMT_DECOY_READY:
+        os.makedirs(decoy_dir, exist_ok=True)
+        index_path = os.path.join(decoy_dir, "index.html")
+        if not os.path.exists(index_path):
+            with open(index_path, "w", encoding="utf-8") as handle:
+                handle.write(_TELEMT_DECOY_HTML)
+        _TELEMT_DECOY_READY = True
+    return decoy_dir
+
+
+def _write_text(path, text):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _mtproto_config_text(api_port, token, port, bootstrap_secret):
+    lines = [
+        "[general]",
+        "use_middle_proxy = false",
+        'log_level = "normal"',
+        "",
+        "[general.modes]",
+        "classic = true",
+        "secure = true",
+        "tls = true",
+        "",
+        "[server.api]",
+        "enabled = true",
+        'listen = "127.0.0.1:' + str(api_port) + '"',
+        'whitelist = ["127.0.0.1/32", "::1/128"]',
+        'auth_header = "Bearer ' + token + '"',
+        "",
+        "[[server.listeners]]",
+        'ip = "127.0.0.1"',
+        "port = " + str(port),
+        'transport = "mtproxy"',
+        "",
+        "[censorship]",
+        'tls_domain = "www.google.com"',
+        "mask = true",
+        "tls_emulation = true",
+        "",
+        "[censorship.tls_fetch]",
+        "total_budget_ms = 5000",
+        "attempt_timeout_ms = 2000",
+        "",
+        "[access.users]",
+        'bootstrap = "' + bootstrap_secret + '"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _web_config_text(fields):
+    username = _telemt_username(fields["uid"])
+    base_path = "" if fields.get("root_enabled") else fields["web_token"]
+    lines = [
+        "[general]",
+        "use_middle_proxy = false",
+        'log_level = "normal"',
+        "",
+        "[general.modes]",
+        "classic = true",
+        "secure = true",
+        "tls = false",
+        "",
+        "[server.api]",
+        "enabled = true",
+        'listen = "127.0.0.1:' + str(fields["api_port"]) + '"',
+        'whitelist = ["127.0.0.1/32", "::1/128"]',
+        'auth_header = "Bearer ' + fields["bearer"] + '"',
+        "",
+        "[[server.listeners]]",
+        'ip = "127.0.0.1"',
+        "port = " + str(fields["port"]),
+        'transport = "web"',
+        "proxy_protocol = false",
+        "reuse_allow = false",
+        'web_client_ip_source = "x_forwarded_for"',
+        'web_trusted_proxy_cidrs = ["127.0.0.1/32"]',
+        "",
+        "[web]",
+        "enabled = true",
+        'carrier = "https"',
+        'carriers = ["websocket-lanes", "websocket", "https-lanes", "https"]',
+        "carrier_learning = true",
+        'carrier_negotiation_aggressiveness = "aggressive"',
+        "",
+        "[web.retry_jitter]",
+        "enabled = false",
+        "",
+        "[[web.vhosts]]",
+        'host = "' + _toml_escape(fields["host"]) + '"',
+        'base_path = "' + _toml_escape(base_path) + '"',
+        'public_addr = "' + _toml_escape(fields["public_ip"]) + ':443"',
+        "",
+        "[web.vhosts.decoy]",
+        'mode = "static_directory"',
+        'directory = "' + _toml_escape(_ensure_decoy_dir()) + '"',
+        'index = "index.html"',
+        "",
+        "[[web.vhosts.profiles]]",
+        'user = "' + _toml_escape(username) + '"',
+        'secret_mode = "dd"',
+        "max_sessions = " + str(fields["max_sessions"]),
+        "max_streams = " + str(fields["max_streams"]),
+        "max_streams_per_session = 64",
+        "",
+        "[censorship]",
+        'tls_domain = "www.google.com"',
+        "mask = true",
+        "",
+        "[censorship.tls_fetch]",
+        "total_budget_ms = 5000",
+        "attempt_timeout_ms = 2000",
+        "",
+        "[access.users]",
+        '"' + _toml_escape(username) + '" = "' + fields["secret_hex"] + '"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _web_root_vhost(fields, enabled):
+    return {
+        "host": fields["host"],
+        "base_path": "" if enabled else fields["web_token"],
+        "public_addr": fields["public_ip"] + ":443",
+        "decoy": {"mode": "static_directory", "directory": _ensure_decoy_dir(), "index": "index.html"},
+        "profiles": [{"user": _telemt_username(fields["uid"]), "secret_mode": "dd", "max_sessions": fields["max_sessions"], "max_streams": fields["max_streams"], "max_streams_per_session": 64}],
+    }
+
+
+def _telemt_api(api_port, token, method, path, body=None, timeout=8.0):
+    url = "http://127.0.0.1:" + str(api_port) + path
+    data = None
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer " + token}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, {"ok": False, "error": {"code": "transport", "message": str(exc)}}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return status, {"ok": False, "error": {"code": "invalid_response", "message": "telemt API did not return JSON"}}
+    if not isinstance(payload, dict):
+        return status, {"ok": False, "error": {"code": "invalid_response", "message": "telemt API did not return a JSON object"}}
+    return status, payload
+
+
+def _telemt_api_error(payload):
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("code") or "telemt API error"
+        code = error.get("code") or ""
+        if code:
+            return code + ": " + str(message)
+        return str(message)
+    return "telemt API error"
+
+
+def _telemt_error_code(payload):
+    try:
+        error = (payload or {}).get("error") or {}
+        return error.get("code") or ""
+    except (AttributeError, TypeError):
+        return ""
+
+
+async def _telemt_api_async(api_port, token, method, path, body=None, timeout=8.0):
+    return await asyncio.to_thread(_telemt_api, api_port, token, method, path, body, timeout)
+
+
+async def _resolve_public_ip(host):
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return None
+    for info in infos or []:
+        sockaddr = info[4] if len(info) > 4 else None
+        if sockaddr:
+            return str(sockaddr[0])
+    return None
+
+
+def _redact_log_line(text):
+    text = re.sub(r"secret=[^&\s]*", "secret=REDACTED", text)
+    text = re.sub(r"Bearer [A-Za-z0-9._-]+", "Bearer REDACTED", text)
+    return text
+
+
+async def _stream_child_output(entry, proc):
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "ignore").rstrip()
+            text = _ANSI_RE.sub("", text)
+            if not text:
+                continue
+            text = _redact_log_line(text)
+            if len(text) > _TELEMT_LOG_MAX:
+                text = text[:_TELEMT_LOG_MAX]
+            entry["boot_log"].append(text)
+            if len(entry["boot_log"]) > _TELEMT_BOOT_LOG_MAX:
+                del entry["boot_log"][:len(entry["boot_log"]) - _TELEMT_BOOT_LOG_MAX]
+            lowered = text.lower()
+            if "error" in lowered or "panic" in lowered:
+                _LOG.warning("telemt[%s]: %s", entry["key"], text)
+            else:
+                _LOG.info("telemt[%s]: %s", entry["key"], text)
+    except asyncio.CancelledError:
+        raise
+    except (OSError, ValueError):
+        pass
+
+
+async def _terminate_proc(proc):
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+    except ProcessLookupError:
+        pass
+
+
+def _telemt_note_failure(entry, rc):
+    now = time.monotonic()
+    entry["failures"] = [item for item in entry["failures"] if now - item <= _TELEMT_FAILURE_WINDOW]
+    entry["failures"].append(now)
+    if len(entry["failures"]) >= _TELEMT_MAX_FAILURES:
+        entry["gave_up"] = True
+        entry["error"] = "telemt " + entry["kind"] + " " + str(entry["key"]) + " failed 5 times within 60s; last exit code " + str(rc) + "; not retrying until explicitly restarted"
+        _LOG.warning("telemt[%s]: %s", entry["key"], entry["error"])
+        return False
+    return True
+
+
+def _telemt_backoff(entry):
+    index = len(entry["failures"]) - 1
+    if index < 0:
+        index = 0
+    if index >= len(_TELEMT_BACKOFF):
+        index = len(_TELEMT_BACKOFF) - 1
+    return _TELEMT_BACKOFF[index]
+
+
+async def _wait_web_running(entry, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        proc = entry.get("proc")
+        if proc is not None and proc.returncode is not None:
+            return False, entry.get("error") or "telemt WEB child exited during startup"
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/runtime/web/status", timeout=2.0)
+        if status == 200 and payload.get("ok"):
+            data = payload.get("data") or {}
+            ingress = data.get("ingress") or {}
+            if data.get("lifecycle") == "running" and ingress.get("accepting_connections") is True:
+                return True, ""
+        await asyncio.sleep(0.25)
+    return False, "telemt WEB runtime did not reach running state within 10s"
+
+
+async def _wait_child_ready(entry, proc):
+    api_ok = False
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if proc.returncode is not None:
+            tail = entry["boot_log"][-5:]
+            entry["error"] = "telemt exited during startup with code " + str(proc.returncode) + (": " + " | ".join(tail) if tail else "")
+            return "dead"
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/system/info", timeout=2.0)
+        if status is not None and status < 500:
+            api_ok = True
+            break
+        await asyncio.sleep(0.25)
+    if not api_ok:
+        if proc.returncode is not None:
+            tail = entry["boot_log"][-5:]
+            entry["error"] = "telemt exited during startup with code " + str(proc.returncode) + (": " + " | ".join(tail) if tail else "")
+            return "dead"
+        entry["error"] = "telemt API did not answer within 10s"
+        return "starting"
+    if entry["kind"] == "web":
+        ok, reason = await _wait_web_running(entry, 10.0)
+        if ok:
+            return "ready"
+        if proc.returncode is not None:
+            entry["error"] = reason
+            return "dead"
+        entry["error"] = reason
+        return "starting"
+    return "ready"
+
+
+async def _wait_child_starting(entry, proc, timeout=60.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.returncode is not None:
+            tail = entry["boot_log"][-5:]
+            entry["error"] = "telemt exited during startup with code " + str(proc.returncode) + (": " + " | ".join(tail) if tail else "")
+            return "dead"
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/system/info", timeout=2.0)
+        if status is not None and status < 500:
+            if entry["kind"] == "web":
+                ok, reason = await _wait_web_running(entry, 10.0)
+                if ok:
+                    return "ready"
+                if proc.returncode is not None:
+                    entry["error"] = reason
+                    return "dead"
+                entry["error"] = reason
+                continue
+            return "ready"
+        await asyncio.sleep(0.5)
+    entry["error"] = "telemt did not become ready within 60s"
+    return "starting"
+
+
+def _new_telemt_entry(kind, key, run_dir, config_path, port, api_port, token):
+    return {"kind": kind, "key": key, "run_dir": run_dir, "config_path": config_path, "port": port, "api_port": api_port, "token": token, "proc": None, "task": None, "ready": False, "error": "", "stopping": False, "gave_up": False, "failures": [], "restarts": 0, "boot_log": [], "config_written": False, "config_text": "", "fields": {}}
+
+
+async def _spawn_entry(entry):
+    if entry["kind"] == "web":
+        fields = dict(entry["fields"])
+        fields["port"] = entry["port"]
+        fields["api_port"] = entry["api_port"]
+        fields["bearer"] = entry["token"]
+        entry["config_text"] = _web_config_text(fields)
+        _write_text(entry["config_path"], entry["config_text"])
+    elif not entry.get("config_written"):
+        _write_text(entry["config_path"], entry["config_text"])
+        entry["config_written"] = True
+    proc = await asyncio.create_subprocess_exec(
+        _telemt_binary(), "run", entry["config_path"],
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=entry["run_dir"],
+    )
+    entry["proc"] = proc
+    return proc
+
+
+async def _supervise_entry(entry):
+    while not entry["stopping"]:
+        entry["ready"] = False
+        try:
+            proc = await _spawn_entry(entry)
+        except (OSError, ValueError) as exc:
+            entry["error"] = "failed to start telemt: " + str(exc)
+            if not _telemt_note_failure(entry, None):
+                break
+            await asyncio.sleep(_telemt_backoff(entry))
+            continue
+        entry["error"] = ""
+        entry["restarts"] += 1
+        reader_task = asyncio.create_task(_stream_child_output(entry, proc))
+        state = await _wait_child_ready(entry, proc)
+        if state == "starting":
+            state = await _wait_child_starting(entry, proc)
+        if state == "ready":
+            entry["ready"] = True
+            entry["error"] = ""
+            rc = await proc.wait()
+            entry["ready"] = False
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+            if entry["stopping"]:
+                break
+            entry["error"] = "telemt exited with code " + str(rc)
+            if not _telemt_note_failure(entry, rc):
+                break
+            await asyncio.sleep(_telemt_backoff(entry))
+            continue
+        reader_task.cancel()
+        try:
+            await reader_task
+        except asyncio.CancelledError:
+            pass
+        await _terminate_proc(proc)
+        if entry["stopping"]:
+            break
+        if not entry["error"]:
+            entry["error"] = "telemt did not become ready"
+        if not _telemt_note_failure(entry, None):
+            break
+        await asyncio.sleep(_telemt_backoff(entry))
+
+
+async def _stop_entry(entry):
+    entry["stopping"] = True
+    entry["ready"] = False
+    proc = entry.get("proc")
+    if proc is not None:
+        await _terminate_proc(proc)
+    task = entry.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    entry["proc"] = None
+    entry["task"] = None
+
+
+async def _wait_entry_ready(entry, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if entry.get("ready"):
+            return True
+        if entry.get("gave_up"):
+            return False
+        await asyncio.sleep(0.2)
+    return bool(entry.get("ready"))
+
+def telemt_web_port(uid):
+    entry = _TELEMT_WEB.get(str(uid))
+    if entry is None:
+        return None
+    proc = entry.get("proc")
+    if proc is None or proc.returncode is not None:
+        return None
+    return entry["port"]
+
+
+def telemt_mtproto_port():
+    entry = _TELEMT_MTPROTO
+    if entry is None:
+        return None
+    proc = entry.get("proc")
+    if proc is None or proc.returncode is not None:
+        return None
+    return entry["port"]
+
+
+async def telemt_start_mtproto():
+    global _TELEMT_MTPROTO
+    if not telemt_available():
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
+    async with _telemt_lock("mtproto"):
+        entry = _TELEMT_MTPROTO
+        if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
+            return {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": ""}
+        if entry is not None:
+            await _stop_entry(entry)
+        base = _telemt_dir()
+        run_dir = os.path.join(base, "mtproto")
+        os.makedirs(run_dir, exist_ok=True)
+        config_path = os.path.join(run_dir, "config.toml")
+        port = _free_loopback_port()
+        api_port = _free_loopback_port()
+        token = _random_bearer()
+        fields = {"bootstrap_secret": secrets.token_hex(16)}
+        config_text = _mtproto_config_text(api_port, token, port, fields["bootstrap_secret"])
+        entry = _new_telemt_entry("mtproto", "mtproto", run_dir, config_path, port, api_port, token)
+        entry["config_text"] = config_text
+        entry["fields"] = fields
+        _TELEMT_MTPROTO = entry
+        entry["task"] = asyncio.create_task(_supervise_entry(entry))
+        ready = await _wait_entry_ready(entry, timeout=30.0)
+        if ready:
+            return {"enabled": True, "port": port, "api_port": api_port, "error": ""}
+        return {"enabled": False, "port": port, "api_port": api_port, "error": entry.get("error") or "telemt MTProto child did not become ready"}
+
+
+def _rfc3339(value):
+    if isinstance(value, datetime):
+        moment = value
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, (int, float)):
+        try:
+            moment = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+        return None
+    return None
+
+
+async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None):
+    if not _valid_secret_hex(secret_hex):
+        _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
+        return False
+    entry = _TELEMT_MTPROTO
+    if entry is None or not entry.get("ready"):
+        started = await telemt_start_mtproto()
+        if not started.get("enabled"):
+            return False
+        entry = _TELEMT_MTPROTO
+    username = _telemt_username(uid)
+    body = {"secret": secret_hex.lower()}
+    try:
+        if max_conns and int(max_conns) > 0:
+            body["max_tcp_conns"] = int(max_conns)
+        if limit_bytes and int(limit_bytes) > 0:
+            body["data_quota_bytes"] = int(limit_bytes)
+    except (TypeError, ValueError):
+        return False
+    if expires_at is not None:
+        text = _rfc3339(expires_at)
+        if text is None:
+            return False
+        body["expiration_rfc3339"] = text
+    path = "/v1/users/" + _url_path_quote(username, safe="")
+    status, payload = None, {}
+    for attempt in range(5):
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", path)
+        if status == 200 and payload.get("ok"):
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", path, body)
+            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+                await asyncio.sleep(1.0)
+                continue
+            return status in (200, 202) and bool(payload.get("ok"))
+        if status == 404:
+            create = {"username": username}
+            create.update(body)
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", "/v1/users", create)
+            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+                await asyncio.sleep(1.0)
+                continue
+            return status in (200, 201, 202) and bool(payload.get("ok"))
+        if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+            await asyncio.sleep(1.0)
+            continue
+        break
+    _LOG.warning("telemt MTProto upsert failed for uid %s: %s", uid, _telemt_api_error(payload))
+    return False
+
+
+async def telemt_mtproto_remove_user(uid):
+    entry = _TELEMT_MTPROTO
+    if entry is None or not entry.get("ready"):
+        return False
+    username = _telemt_username(uid)
+    path = "/v1/users/" + _url_path_quote(username, safe="")
+    status, payload = None, {}
+    for attempt in range(5):
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "DELETE", path)
+        if status in (200, 202) and payload.get("ok"):
+            return True
+        if status == 404:
+            return True
+        if status == 409:
+            if _telemt_error_code(payload) == "reload_in_progress":
+                await asyncio.sleep(1.0)
+                continue
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", path + "/disable")
+            if status in (200, 202) and payload.get("ok"):
+                _LOG.warning("telemt refused to delete the last MTProto user %s; disabled it instead", uid)
+                return True
+            return False
+        break
+    _LOG.warning("telemt MTProto remove failed for uid %s: %s", uid, _telemt_api_error(payload))
+    return False
+
+
+async def telemt_mtproto_user_stats(uid):
+    entry = _TELEMT_MTPROTO
+    if entry is None or not entry.get("ready"):
+        return {}
+    username = _telemt_username(uid)
+    path = "/v1/users/" + _url_path_quote(username, safe="")
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", path)
+    if status != 200 or not payload.get("ok"):
+        return {}
+    data = payload.get("data") or {}
+    try:
+        return {"total_octets": int(data.get("total_octets") or 0), "current_connections": int(data.get("current_connections") or 0), "active_unique_ips": int(data.get("active_unique_ips") or 0)}
+    except (TypeError, ValueError):
+        return {}
+
+
+async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None):
+    key = str(uid)
+    if not telemt_available():
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
+    if not _valid_secret_hex(secret_hex):
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "TG_WEB_SECRET for uid " + key + " is invalid: WEB secret must be 32 hex characters"}
+    if not isinstance(token, str) or not _TELEMT_TOKEN_RE.match(token):
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "WEB token for uid " + key + " is invalid: base_path must use [A-Za-z0-9_-] segments"}
+    if not _valid_web_host(host):
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt WEB host must be a public FQDN, got '" + str(host) + "'"}
+    try:
+        max_sessions = int(max_sessions)
+        max_streams = int(max_streams)
+    except (TypeError, ValueError):
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "max_sessions and max_streams must be integers"}
+    if max_sessions <= 0 or max_streams <= 0:
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "max_sessions and max_streams must be positive"}
+    host = str(host).strip().lower()
+    if public_ip is not None:
+        resolved_ip = str(public_ip).strip()
+    else:
+        try:
+            resolved_ip = await asyncio.wait_for(_resolve_public_ip(host), timeout=5.0)
+        except asyncio.TimeoutError:
+            resolved_ip = None
+        if not resolved_ip:
+            resolved_ip = host
+    async with _telemt_lock("web:" + key):
+        entry = _TELEMT_WEB.get(key)
+        if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
+            fields = entry["fields"]
+            if fields.get("web_token") == token and fields.get("secret_hex") == secret_hex.lower() and fields.get("host") == host and fields.get("public_ip") == resolved_ip and fields.get("max_sessions") == max_sessions and fields.get("max_streams") == max_streams and not fields.get("root_enabled"):
+                return {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": ""}
+        if entry is not None:
+            await _stop_entry(entry)
+            _TELEMT_WEB.pop(key, None)
+        base = _telemt_dir()
+        run_dir = os.path.join(base, _telemt_username(key))
+        os.makedirs(run_dir, exist_ok=True)
+        config_path = os.path.join(run_dir, "config.toml")
+        port = _free_loopback_port()
+        api_port = _free_loopback_port()
+        bearer = _random_bearer()
+        fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": False}
+        entry = _new_telemt_entry("web", key, run_dir, config_path, port, api_port, bearer)
+        entry["fields"] = fields
+        _TELEMT_WEB[key] = entry
+        entry["task"] = asyncio.create_task(_supervise_entry(entry))
+        ready = await _wait_entry_ready(entry, timeout=30.0)
+        if ready:
+            return {"enabled": True, "port": port, "api_port": api_port, "error": ""}
+        return {"enabled": False, "port": port, "api_port": api_port, "error": entry.get("error") or "telemt WEB child did not become ready"}
+
+
+async def telemt_stop_web(uid):
+    key = str(uid)
+    async with _telemt_lock("web:" + key):
+        entry = _TELEMT_WEB.pop(key, None)
+        if entry is None:
+            return False
+        await _stop_entry(entry)
+        return True
+
+
+async def _web_patch_root(entry, enabled):
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config")
+    if status != 200 or not payload.get("ok"):
+        _LOG.warning("telemt WEB root PATCH aborted for uid %s: config read failed: %s", entry["key"], _telemt_api_error(payload))
+        return False
+    try:
+        vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
+    except (AttributeError, TypeError):
+        _LOG.warning("telemt WEB root PATCH aborted for uid %s: config has no web vhosts", entry["key"])
+        return False
+    fields = entry["fields"]
+    target_base = "" if enabled else fields["web_token"]
+    replaced = False
+    new_vhosts = []
+    for vhost in vhosts:
+        if isinstance(vhost, dict) and str(vhost.get("host", "")).lower() == fields["host"]:
+            item = dict(vhost)
+            item["base_path"] = target_base
+            new_vhosts.append(item)
+            replaced = True
+        else:
+            new_vhosts.append(vhost)
+    if not replaced:
+        new_vhosts.append(_web_root_vhost(fields, enabled))
+    patched = False
+    status, payload = None, {}
+    for attempt in range(5):
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", "/v1/config?reload=instant", {"web": {"vhosts": new_vhosts}})
+        if status == 202 and payload.get("ok"):
+            patched = True
+            break
+        if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+            await asyncio.sleep(1.0)
+            continue
+        break
+    if not patched:
+        _LOG.warning("telemt WEB root PATCH failed for uid %s: %s", entry["key"], _telemt_api_error(payload))
+        return False
+    reload_id = None
+    try:
+        reload_id = ((payload.get("data") or {}).get("reload") or {}).get("reload_id")
+    except (AttributeError, TypeError):
+        reload_id = None
+    if reload_id is None:
+        _LOG.warning("telemt WEB root PATCH failed for uid %s: reload id missing", entry["key"])
+        return False
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/system/reload/" + str(reload_id))
+        if status == 200 and payload.get("ok"):
+            state = (payload.get("data") or {}).get("state")
+            if state == "succeeded":
+                return True
+            if state in ("failed", "rolled_back"):
+                _LOG.warning("telemt WEB root reload %s for uid %s: %s", state, entry["key"], _telemt_api_error(payload))
+                return False
+        await asyncio.sleep(0.5)
+    _LOG.warning("telemt WEB root reload timed out for uid %s", entry["key"])
+    return False
+
+
+async def _web_restart_with_root(key, enabled):
+    entry = _TELEMT_WEB.get(key)
+    if entry is None:
+        return False
+    entry["fields"]["root_enabled"] = bool(enabled)
+    await _stop_entry(entry)
+    _TELEMT_WEB.pop(key, None)
+    fresh = _new_telemt_entry("web", key, entry["run_dir"], entry["config_path"], entry["port"], entry["api_port"], entry["token"])
+    fresh["fields"] = entry["fields"]
+    _TELEMT_WEB[key] = fresh
+    fresh["task"] = asyncio.create_task(_supervise_entry(fresh))
+    return await _wait_entry_ready(fresh, timeout=30.0)
+
+
+async def telemt_web_set_root(uid, enabled):
+    key = str(uid)
+    entry = _TELEMT_WEB.get(key)
+    if entry is None:
+        return False
+    async with _telemt_lock("web:" + key):
+        entry = _TELEMT_WEB.get(key)
+        if entry is None or not entry.get("ready"):
+            return False
+        fields = entry["fields"]
+        if bool(fields.get("root_enabled")) == bool(enabled):
+            return True
+        if await _web_patch_root(entry, bool(enabled)):
+            fields["root_enabled"] = bool(enabled)
+            return True
+        _LOG.warning("telemt WEB root PATCH path failed for uid %s; restarting child with root vhost", key)
+        return await _web_restart_with_root(key, bool(enabled))
+
+
+async def telemt_web_status(uid):
+    key = str(uid)
+    entry = _TELEMT_WEB.get(key)
+    if entry is None:
+        return {"enabled": False, "port": 0, "error": "no telemt WEB child for uid " + key, "sessions": 0, "healthy": False}
+    port = entry["port"]
+    proc = entry.get("proc")
+    if proc is None or proc.returncode is not None:
+        return {"enabled": False, "port": port, "error": entry.get("error") or "telemt WEB child is not running", "sessions": 0, "healthy": False}
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/runtime/web/status", timeout=5.0)
+    if status != 200 or not payload.get("ok"):
+        return {"enabled": False, "port": port, "error": "telemt WEB API did not answer", "sessions": 0, "healthy": False}
+    data = payload.get("data") or {}
+    ingress = data.get("ingress") or {}
+    healthy = data.get("lifecycle") == "running" and ingress.get("accepting_connections") is True
+    sessions = 0
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/runtime/web/sessions?limit=200", timeout=5.0)
+    if status == 200 and payload.get("ok"):
+        rows = (payload.get("data") or {}).get("sessions") or []
+        sessions = len(rows)
+    error = ""
+    if not healthy:
+        error = str(data.get("reason") or data.get("lifecycle") or "WEB runtime is not running")
+    return {"enabled": True, "port": port, "error": error, "sessions": sessions, "healthy": healthy}
+
+
+async def telemt_stop_all():
+    global _TELEMT_MTPROTO
+    entry = _TELEMT_MTPROTO
+    if entry is not None:
+        await _stop_entry(entry)
+    _TELEMT_MTPROTO = None
+    for key in list(_TELEMT_WEB.keys()):
+        item = _TELEMT_WEB.pop(key, None)
+        if item is not None:
+            await _stop_entry(item)
+
+
+async def telemt_health():
+    available = telemt_available()
+    error = ""
+    if not available:
+        error = "telemt binary not found at " + _telemt_binary()
+    mtproto = {"enabled": False, "port": 0, "api_port": 0, "error": error or "telemt MTProto child is not running", "healthy": False}
+    entry = _TELEMT_MTPROTO
+    if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/health", timeout=5.0)
+        healthy = status == 200 and bool(payload.get("ok"))
+        mtproto = {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": "" if healthy else (entry.get("error") or "telemt MTProto API did not answer"), "healthy": healthy}
+    elif entry is not None and entry.get("error"):
+        mtproto["error"] = entry["error"]
+    web = {}
+    for key in list(_TELEMT_WEB.keys()):
+        web[key] = await telemt_web_status(key)
+    return {"available": available, "mtproto": mtproto, "web": web, "error": error}
+
+
+async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, session_allowed=None):
     global _AUTH_LOOKUP, _COUNT_TRAFFIC, _MTPROXY_QUOTA_OK, _SESSION_ALLOWED
     _AUTH_LOOKUP = auth_lookup
     _COUNT_TRAFFIC = count_traffic
     _MTPROXY_QUOTA_OK = mtproxy_quota_ok
     _SESSION_ALLOWED = session_allowed
+    if isinstance(multi_ports, int):
+        wanted = [multi_ports]
+    else:
+        wanted = list(multi_ports or [])
+    ports = []
+    for item in wanted:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if port and port not in ports:
+            ports.append(port)
+    if telemt_available():
+        mt = await telemt_start_mtproto()
+    else:
+        mt = {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
     status = {
-        "socks": {"enabled": False, "port": socks_port, "error": ""},
-        "mtproxy": {"enabled": False, "port": mtproxy_port, "error": ""},
-        "http": {"enabled": False, "port": http_port, "error": ""},
+        "socks": {"enabled": False, "port": 0, "error": ""},
+        "mtproxy": {"enabled": False, "port": 0, "error": mt.get("error", "")},
+        "http": {"enabled": False, "port": 0, "error": ""},
     }
-    if socks_port:
+    bound = []
+    bind_error = ""
+    for port in ports:
         try:
-            server = await asyncio.start_server(_handle_socks5, "0.0.0.0", socks_port)
+            server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
             _SERVERS.append(server)
-            status["socks"]["enabled"] = True
+            bound.append(port)
         except OSError as exc:
-            status["socks"]["error"] = str(exc)
-    if mtproxy_port:
-        try:
-            server = await asyncio.start_server(_handle_mtproxy, "0.0.0.0", mtproxy_port)
-            _SERVERS.append(server)
+            if not bind_error:
+                bind_error = str(exc)
+    first = bound[0] if bound else 0
+    status["socks"]["port"] = first
+    status["http"]["port"] = first
+    status["mtproxy"]["port"] = first
+    if bound:
+        status["socks"]["enabled"] = True
+        status["http"]["enabled"] = True
+        if mt.get("enabled"):
             status["mtproxy"]["enabled"] = True
-        except OSError as exc:
-            status["mtproxy"]["error"] = str(exc)
-    if http_port:
-        try:
-            server = await asyncio.start_server(_handle_http_proxy, "0.0.0.0", http_port)
-            _SERVERS.append(server)
-            status["http"]["enabled"] = True
-        except OSError as exc:
-            status["http"]["error"] = str(exc)
+        elif not mt.get("error"):
+            status["mtproxy"]["error"] = "telemt MTProto child is not running"
+    else:
+        status["socks"]["error"] = bind_error or "no proxy ports configured"
+        status["http"]["error"] = bind_error or "no proxy ports configured"
+        if not status["mtproxy"]["error"]:
+            status["mtproxy"]["error"] = bind_error or "no proxy ports configured"
     return status
 
 
@@ -923,1488 +1731,4 @@ async def stop_all():
         except OSError:
             pass
     _SERVERS.clear()
-
-
-WEBPROXY_VERSION = "1.3.0"
-WEBPROXY_CARRIER = "websocket-lanes"
-WEB_PROXY_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
-WEBPROXY_DC_PORTS = [443, 80, 5222]
-DC_HOSTS = {
-    1: ["149.154.175.50", "149.154.175.53", "149.154.175.54"],
-    2: ["149.154.167.51", "149.154.167.50", "149.154.167.40", "149.154.167.41"],
-    3: ["149.154.175.100", "149.154.175.101"],
-    4: ["149.154.167.91", "149.154.167.92", "149.154.167.90"],
-    5: ["91.108.56.156", "91.108.56.165", "91.108.56.170"],
-    203: ["91.105.192.110"],
-}
-WEBPROXY_TOKEN_BOOTSTRAP = 1
-WEBPROXY_TOKEN_SESSION = 2
-WEBPROXY_PORT_MODE_BASE = 10
-WEBPROXY_TOKEN_MODE = 200
-WEBPROXY_FRAME_OPEN = 1
-WEBPROXY_FRAME_DATA = 2
-WEBPROXY_FRAME_CLOSE = 3
-WEBPROXY_FRAME_WINDOW = 4
-WEBPROXY_FRAME_PING = 5
-WEBPROXY_FRAME_PONG = 6
-WEBPROXY_STREAM_WINDOW = 4194304
-WEBPROXY_MAX_STREAMS = 6
-WEBPROXY_MAX_QUEUED = 16777216
-WEBPROXY_SESSION_TTL = 86400
-WEBPROXY_BOOTSTRAP_TTL = 3600
-WEBPROXY_DC_TIMEOUT = 5.0
-WEBPROXY_WELCOME = bytes([0x11, 0, 0, 0, 0, 0, 0, 0])
-WEBPROXY_HANDSHAKE = bytes([0x10, 0, 0, 0, 0, 0, 0, 1, 1])
-WEBPROXY_DIRECT_DC_ONLY = True
-WEBPROXY_ME_SUPPORTED = False
-WEBPROXY_TOKEN_DOMAIN = b"tgweb-token-v1\x00"
-WEBPROXY_ME_CONSTANTS = {
-    "RPC_NONCE": 0x7ACB87AA,
-    "RPC_HANDSHAKE": 0x7682EEF5,
-    "RPC_PROXY_REQ": 0x36CEF1EE,
-    "RPC_PROXY_ANS": 0x0DFB190E,
-    "FLAG_HAS_AD_TAG": 0x00000008,
-    "FLAG_EXTMODE2": 0x00020000,
-    "FLAG_PAD": 0x08000000,
-    "FLAG_INTERMEDIATE": 0x20000000,
-    "FLAG_ABRIDGED": 0x40000000,
-    "FLAG_QUICKACK": 0x80000000,
-}
-_WEB_BASE = None
-_WEB_BASE_FROM = ""
-_WEB_CONFIGURED = False
-_WEB_CONFIGURE_ERROR = ""
-_WEB_CONFIGURE_SOURCE = ""
-_WEB_STARTED = time.time()
-_WEB_STATS = {
-    "sessions": 0,
-    "sessions_active": 0,
-    "streams": 0,
-    "dc_attempts": 0,
-    "dc_fails": 0,
-    "bytes_up": 0,
-    "bytes_down": 0,
-    "ws_rejects": 0,
-}
-_WEB_LOG = []
-_WEB_LAST_PROBE = []
-
-_WEB_HOOKS = {"count": None, "quota_ok": None, "session_allowed": None, "uid_for_mode": None, "quota_ok_sync": None}
-_WEB_ACTIVE = {}
-
-
-def webproxy_set_hooks(count=None, quota_ok=None, session_allowed=None, uid_for_mode=None, quota_ok_sync=None):
-    if count is not None:
-        _WEB_HOOKS["count"] = count
-    if quota_ok is not None:
-        _WEB_HOOKS["quota_ok"] = quota_ok
-    if session_allowed is not None:
-        _WEB_HOOKS["session_allowed"] = session_allowed
-    if uid_for_mode is not None:
-        _WEB_HOOKS["uid_for_mode"] = uid_for_mode
-    if quota_ok_sync is not None:
-        _WEB_HOOKS["quota_ok_sync"] = quota_ok_sync
-    return True
-
-
-def webproxy_uid_for_mode(mode, token=None):
-    fn = _WEB_HOOKS.get("uid_for_mode")
-    if fn is None:
-        return ""
-    try:
-        return str(fn(mode, token) or "")
-    except (TypeError, ValueError):
-        return ""
-
-
-def webproxy_active_sessions():
-    out = []
-    for entry in list(_WEB_ACTIVE.values()):
-        item = {k: v for k, v in entry.items() if k not in ("session", "websocket")}
-        out.append(item)
-    return out
-
-
-def webproxy_disconnect_session(sid):
-    entry = _WEB_ACTIVE.get(sid)
-    if entry is None:
-        return False
-    session = entry.get("session")
-    if session is None:
-        return False
-    try:
-        session.dispose()
-    except (AttributeError, RuntimeError):
-        pass
-    try:
-        asyncio.create_task(session.websocket.close(code=1000))
-    except (AttributeError, OSError, RuntimeError):
-        pass
-    return True
-
-
-async def _webproxy_flush_session(session, force=False):
-    async with session.flush_lock:
-        if not session.uid or _WEB_HOOKS.get("count") is None:
-            return True
-        delta = (session.bytes_up - session.flushed_up) + (session.bytes_down - session.flushed_down)
-        if delta <= 0:
-            return True
-        if not force and delta < 1048576:
-            return True
-        ok = await _WEB_HOOKS["count"](session.uid, delta)
-        if ok:
-            session.flushed_up = session.bytes_up
-            session.flushed_down = session.bytes_down
-            _entry = _WEB_ACTIVE.get(session.sid)
-            if _entry is not None:
-                _entry["bytes_flushed"] = session.flushed_up + session.flushed_down
-        return ok
-
-
-
-def _webproxy_log(event, detail):
-    try:
-        _WEB_LOG.append({"t": datetime.now(timezone.utc).isoformat(), "event": str(event)[:24], "detail": str(detail or "")[:120]})
-        if len(_WEB_LOG) > 120:
-            del _WEB_LOG[:len(_WEB_LOG) - 120]
-    except (AttributeError, TypeError, ValueError):
-        pass
-
-
-def _webproxy_parse_secret(value):
-    if value is None:
-        return None
-    raw_text = str(value).strip()
-    text = raw_text.lower()
-    if text.startswith("0x"):
-        text = text[2:]
-    hexdigits = "0123456789abcdef"
-    if len(text) == 32 and all(c in hexdigits for c in text):
-        return bytes.fromhex(text)
-    if len(text) == 34 and text.startswith("dd") and all(c in hexdigits for c in text[2:]):
-        return bytes.fromhex(text[2:])
-    raw_b64 = _b64u_decode_strict(raw_text)
-    if raw_b64 is not None and len(raw_b64) == 18 and raw_b64[0] == 0x70 and raw_b64[1] == 0xDD:
-        return raw_b64[2:]
-    return None
-
-
-def webproxy_configure(base_secret=None, secret_key=None):
-    global _WEB_BASE, _WEB_BASE_FROM, _WEB_CONFIGURED, _WEB_CONFIGURE_ERROR, _WEB_CONFIGURE_SOURCE
-    try:
-        if base_secret is not None:
-            if isinstance(base_secret, (bytes, bytearray)):
-                if len(base_secret) != 16:
-                    raise ValueError("web proxy base secret must be 16 bytes")
-                _WEB_BASE = bytes(base_secret)
-            else:
-                parsed = _webproxy_parse_secret(base_secret)
-                if parsed is None:
-                    raise ValueError("web proxy base secret must be 32 hex chars or dd plus 32 hex chars")
-                _WEB_BASE = parsed
-            _WEB_BASE_FROM = "explicit"
-        elif secret_key is not None:
-            _WEB_BASE = hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(secret_key).encode("utf-8")).digest()[:16]
-            _WEB_BASE_FROM = "SECRET_KEY"
-        else:
-            raise ValueError("webproxy_configure needs base_secret or secret_key")
-    except (ValueError, TypeError) as exc:
-        _WEB_CONFIGURED = False
-        _WEB_CONFIGURE_ERROR = str(exc)
-        _WEB_CONFIGURE_SOURCE = ""
-        raise
-    _WEB_CONFIGURED = True
-    _WEB_CONFIGURE_ERROR = ""
-    _WEB_CONFIGURE_SOURCE = _WEB_BASE_FROM
-    return {"configured": True, "source": _WEB_BASE_FROM}
-
-
-def webproxy_configure_state():
-    return {"configured": bool(_WEB_CONFIGURED and _WEB_BASE is not None), "source": _WEB_CONFIGURE_SOURCE, "error": _WEB_CONFIGURE_ERROR}
-
-
-def _webproxy_base_secret():
-    if _WEB_BASE is not None:
-        return _WEB_BASE
-    env_secret = os.environ.get("TG_WEB_SECRET", "").strip()
-    if env_secret:
-        parsed = _webproxy_parse_secret(env_secret)
-        if parsed is None:
-            raise ValueError("TG_WEB_SECRET must be 32 hex chars or dd plus 32 hex chars")
-        return parsed
-    panel_key = os.environ.get("SECRET_KEY", "")
-    if panel_key:
-        return hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + panel_key.encode("utf-8")).digest()[:16]
-    raise RuntimeError("web proxy base secret is not configured")
-
-
-def _webproxy_token_key():
-    return hashlib.sha256(b"tgweb-token-key-v1\x00" + _webproxy_base_secret()).digest()
-
-
-def webproxy_per_port_secret_bytes(port):
-    base = _webproxy_base_secret()
-    port = int(port)
-    if port == 443:
-        return base
-    material = hashlib.sha256(b"proxygosha-port-secret-v1\n" + base + ("\n" + str(port)).encode("ascii")).digest()
-    return material[:16]
-
-
-def webproxy_per_port_secret(port):
-    return "dd" + webproxy_per_port_secret_bytes(port).hex()
-
-
-def webproxy_token_secret_bytes(token):
-    base = _webproxy_base_secret()
-    token = str(token).strip().lower()
-    material = hashlib.sha256(b"proxygosha-web-token-secret-v1\n" + base + b"\n" + token.encode("ascii")).digest()
-    return material[:16]
-
-
-def webproxy_token_secret(token):
-    return _b64u_encode(b"\x70\xdd" + webproxy_token_secret_bytes(token))
-
-
-def webproxy_token_secret_matches(token, secret):
-    try:
-        raw = _webproxy_parse_secret(secret)
-    except (TypeError, ValueError):
-        return False
-    if raw is None:
-        return False
-    try:
-        expected = webproxy_token_secret_bytes(token)
-    except (RuntimeError, ValueError):
-        return False
-    return hmac_mod.compare_digest(expected, raw)
-
-
-def webproxy_port_mode(port):
-    return WEBPROXY_PORT_MODE_BASE + WEB_PROXY_PORTS.index(int(port))
-
-
-def webproxy_link(host, port, token=None):
-    port = int(port)
-    if token:
-        token = str(token).strip().lower()
-        secret = webproxy_token_secret(token)
-        return "tg://webproxy?server=" + str(host) + "/" + token + "&secret=" + secret
-    secret = webproxy_per_port_secret(port)
-    suffix = "" if port == 443 else "&port=" + str(port)
-    return "tg://webproxy?server=" + str(host) + suffix + "&secret=" + secret
-
-
-def webproxy_link_https(host, port, token=None):
-    port = int(port)
-    if token:
-        token = str(token).strip().lower()
-        secret = webproxy_token_secret(token)
-        return "https://t.me/webproxy?server=" + str(host) + "/" + token + "&secret=" + secret
-    secret = webproxy_per_port_secret(port)
-    suffix = "" if port == 443 else "&port=" + str(port)
-    return "https://t.me/webproxy?server=" + str(host) + suffix + "&secret=" + secret
-
-
-def webproxy_links(host):
-    out = []
-    for port in WEB_PROXY_PORTS:
-        out.append({"port": port, "secret": webproxy_per_port_secret(port), "link": webproxy_link(host, port), "link_https": webproxy_link_https(host, port)})
-    return out
-
-
-def webproxy_port_for_secret(secret):
-    raw = _webproxy_parse_secret(secret)
-    if raw is None:
-        return None
-    for port in WEB_PROXY_PORTS:
-        if webproxy_per_port_secret_bytes(port) == raw:
-            return port
-    return None
-
-
-def _b64u_encode(data):
-    return base64.urlsafe_b64encode(bytes(data)).rstrip(b"=").decode("ascii")
-
-
-def _b64u_decode_strict(value):
-    if not isinstance(value, str):
-        return None
-    if not value or len(value) % 4 == 1:
-        return None
-    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    for c in value:
-        if c not in allowed:
-            return None
-    try:
-        padded = value + "=" * ((4 - len(value) % 4) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-    except (ValueError, TypeError):
-        return None
-    if _b64u_encode(raw) != value:
-        return None
-    return raw
-
-
-def _webproxy_issue_token(kind, ttl, mode, token=None):
-    if kind not in (WEBPROXY_TOKEN_BOOTSTRAP, WEBPROXY_TOKEN_SESSION):
-        raise ValueError("unknown token kind")
-    if not 0 <= int(mode) <= 255:
-        raise ValueError("token mode out of range")
-    expiry = int(time.time()) + int(ttl)
-    nonce = bytearray(16)
-    nonce[0:4] = struct.pack(">I", expiry)
-    nonce[4] = int(mode)
-    if int(mode) == WEBPROXY_TOKEN_MODE:
-        if not token:
-            raise ValueError("token mode needs a token")
-        nonce[5:11] = bytes.fromhex(str(token).strip().lower())
-        nonce[11:16] = os.urandom(5)
-    else:
-        nonce[5:16] = os.urandom(11)
-    mac = hmac_mod.new(_webproxy_token_key(), WEBPROXY_TOKEN_DOMAIN + bytes([kind]) + bytes(nonce), hashlib.sha256).digest()
-    return _b64u_encode(bytes(nonce) + mac)
-
-
-def webproxy_verify_token(token, kind=WEBPROXY_TOKEN_SESSION):
-    try:
-        key = _webproxy_token_key()
-    except (RuntimeError, ValueError):
-        return None
-    raw = _b64u_decode_strict(token)
-    if raw is None or len(raw) != 48:
-        return None
-    nonce = raw[:16]
-    mac = raw[16:]
-    expected = hmac_mod.new(key, WEBPROXY_TOKEN_DOMAIN + bytes([kind]) + nonce, hashlib.sha256).digest()
-    if not hmac_mod.compare_digest(expected, mac):
-        return None
-    expires = struct.unpack(">I", nonce[0:4])[0]
-    if expires < int(time.time()):
-        return None
-    out = {"mode": nonce[4], "expires": expires}
-    if nonce[4] == WEBPROXY_TOKEN_MODE:
-        out["token"] = bytes(nonce[5:11]).hex()
-    else:
-        out["token"] = ""
-    return out
-
-
-def webproxy_bootstrap_token(mode=0, ttl=WEBPROXY_BOOTSTRAP_TTL, token=None):
-    return _webproxy_issue_token(WEBPROXY_TOKEN_BOOTSTRAP, ttl, mode, token)
-
-
-def webproxy_issue_session(bootstrap_token, handshake_body, ttl=WEBPROXY_SESSION_TTL):
-    verified = webproxy_verify_token(bootstrap_token, WEBPROXY_TOKEN_BOOTSTRAP)
-    if verified is None:
-        raise ValueError("invalid or expired bootstrap token")
-    if verified["mode"] in (1, 2):
-        raise ValueError("generated-domain bootstrap tokens are not accepted")
-    if bytes(handshake_body) != WEBPROXY_HANDSHAKE:
-        raise ValueError("invalid session handshake")
-    _issue_uid = webproxy_uid_for_mode(verified["mode"], verified.get("token") or None)
-    if verified["mode"] == WEBPROXY_TOKEN_MODE and not _issue_uid:
-        raise ValueError("no WEB proxy inbound for this token")
-    if _issue_uid:
-        _allowed = _WEB_HOOKS.get("session_allowed")
-        if _allowed is not None and not _allowed(_issue_uid, ""):
-            raise ValueError("session limit reached for this inbound")
-        _qsync = _WEB_HOOKS.get("quota_ok_sync")
-        if _qsync is not None and not _qsync(_issue_uid):
-            raise ValueError("quota exceeded for this inbound")
-    token = _webproxy_issue_token(WEBPROXY_TOKEN_SESSION, ttl, verified["mode"], verified.get("token") or None)
-    return {"session_token": token, "welcome": WEBPROXY_WELCOME, "carrier": WEBPROXY_CARRIER, "mode": verified["mode"]}
-
-
-def webproxy_delete_session(session_token):
-    return webproxy_verify_token(session_token, WEBPROXY_TOKEN_SESSION) is not None
-
-
-def _webproxy_secret_for_mode(mode, token=None):
-    if mode == WEBPROXY_TOKEN_MODE:
-        if not token:
-            return None
-        try:
-            return webproxy_token_secret_bytes(token)
-        except (RuntimeError, ValueError):
-            return None
-    if mode == 0:
-        return _webproxy_base_secret()
-    if WEBPROXY_PORT_MODE_BASE <= mode < WEBPROXY_PORT_MODE_BASE + len(WEB_PROXY_PORTS):
-        return webproxy_per_port_secret_bytes(WEB_PROXY_PORTS[mode - WEBPROXY_PORT_MODE_BASE])
-    return None
-
-
-def _webproxy_decode_capability(value):
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    decoded = _b64u_decode_strict(text)
-    if decoded is not None and len(decoded) == 32:
-        return decoded
-    cleaned = text.replace(" ", "+").replace("-", "+").replace("_", "/")
-    padded = cleaned + "=" * ((4 - len(cleaned) % 4) % 4)
-    try:
-        raw = base64.b64decode(padded.encode("ascii"), validate=True)
-    except (ValueError, TypeError):
-        raw = None
-    if raw is not None and len(raw) == 32:
-        return raw
-    lowered = text.lower()
-    if len(lowered) == 64 and all(c in "0123456789abcdef" for c in lowered):
-        try:
-            return bytes.fromhex(lowered)
-        except ValueError:
-            return None
-    return None
-
-
-def webproxy_verify_bridge_capability(host, capability, port=None, token=None):
-    provided = _webproxy_decode_capability(capability)
-    if provided is None or len(provided) != 32:
-        return (-1, "")
-    host = str(host).strip().lower()
-    if token:
-        token = str(token).strip().lower()
-        try:
-            secret = webproxy_token_secret_bytes(token)
-        except (RuntimeError, ValueError):
-            secret = None
-        if secret is not None:
-            for key in (secret, b"\xdd" + secret):
-                for context in ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(int(port) if port else 443), "tdesktop-web-proxy-bridge-v1\n" + host):
-                    mac = hmac_mod.new(key, context.encode("utf-8"), hashlib.sha256).digest()
-                    if hmac_mod.compare_digest(mac, provided):
-                        return (WEBPROXY_TOKEN_MODE, token)
-        return (-1, "")
-    ports = []
-    if port is not None:
-        try:
-            incoming = int(port)
-            if incoming in WEB_PROXY_PORTS:
-                ports.append(incoming)
-        except (TypeError, ValueError):
-            pass
-    for item in WEB_PROXY_PORTS:
-        if item not in ports:
-            ports.append(item)
-    for item in ports:
-        secret = webproxy_per_port_secret_bytes(item)
-        for key in (secret, b"\xdd" + secret):
-            for context in ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(item), "tdesktop-web-proxy-bridge-v1\n" + host):
-                mac = hmac_mod.new(key, context.encode("utf-8"), hashlib.sha256).digest()
-                if hmac_mod.compare_digest(mac, provided):
-                    return (WEBPROXY_PORT_MODE_BASE + WEB_PROXY_PORTS.index(item), "")
-    return (-1, "")
-
-
-def _webproxy_aes_ctr_at(key, iv, position, data):
-    if not data:
-        return b""
-    block = int(position / 16)
-    skip = position % 16
-    counter = (int.from_bytes(iv, "big") + block) % (1 << 128)
-    counter_bytes = counter.to_bytes(16, "big")
-    cipher = _aes_ctr(key, counter_bytes).encryptor()
-    if skip == 0:
-        return cipher.update(bytes(data))
-    padded = b"\x00" * skip + bytes(data)
-    return cipher.update(padded)[skip:]
-
-
-def _webproxy_safe_dc_prefix(first8):
-    if len(first8) < 8:
-        return False
-    if first8[0] == 0xEF:
-        return False
-    if first8[4] == 0 and first8[5] == 0 and first8[6] == 0 and first8[7] == 0:
-        return False
-    if first8[0:4] == b"GET ":
-        return False
-    if first8[0:4] == b"POST":
-        return False
-    if first8[0:4] == b"HEAD":
-        return False
-    if first8[0:4] == b"OPTI":
-        return False
-    if first8[0:4] == b"\xee\xee\xee\xee":
-        return False
-    if first8[0:4] == b"\xdd\xdd\xdd\xdd":
-        return False
-    if first8[0:4] == b"\x16\x03\x01\x02":
-        return False
-    return True
-
-
-def webproxy_parse_obfs_header(header, secret):
-    if len(header) != 64:
-        raise ValueError("obfuscated header must be 64 bytes")
-    header = bytes(header)
-    secret = bytes(secret)
-    read_key = hashlib.sha256(header[8:40] + secret).digest()
-    read_iv = header[40:56]
-    tail = _webproxy_aes_ctr_at(read_key, read_iv, 56, header[56:64])
-    tag = tail[0:4]
-    if tag not in VALID_TAGS:
-        raise ValueError("unknown protocol tag")
-    dc_id = struct.unpack("<h", tail[4:6])[0]
-    dc = abs(dc_id)
-    if dc not in DC_HOSTS:
-        raise ValueError("unknown dc id")
-    reversed_part = header[8:56][::-1]
-    write_key = hashlib.sha256(reversed_part[0:32] + secret).digest()
-    write_iv = reversed_part[32:48]
-    dc_material = (write_key + write_iv)[::-1]
-    return {
-        "tag": tag,
-        "dc_id": dc_id,
-        "dc": dc,
-        "read_key": read_key,
-        "read_iv": read_iv,
-        "write_key": write_key,
-        "write_iv": write_iv,
-        "dc_write_key": dc_material[0:32],
-        "dc_write_iv": dc_material[32:48],
-        "dc_material": dc_material,
-    }
-
-
-def _webproxy_build_dc_header(tag, dc_id, dc_material):
-    first = bytearray(os.urandom(8))
-    safe = _webproxy_safe_dc_prefix(bytes(first))
-    tries = 0
-    while not safe and tries < 16:
-        first = bytearray(os.urandom(8))
-        safe = _webproxy_safe_dc_prefix(bytes(first))
-        tries += 1
-    if not safe:
-        first = bytearray([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0])
-    header = bytearray(64)
-    header[0:8] = first
-    header[8:56] = dc_material
-    header[56:60] = tag
-    header[60:62] = struct.pack("<h", dc_id)
-    header[62:64] = b"\x00\x00"
-    dc_write_key = dc_material[0:32]
-    dc_write_iv = dc_material[32:48]
-    header[56:64] = _webproxy_aes_ctr_at(dc_write_key, dc_write_iv, 56, bytes(header[56:64]))
-    return bytes(header)
-
-
-def _webproxy_frame(frame_type, stream_id, payload):
-    payload = bytes(payload)
-    out = bytearray(8 + len(payload))
-    out[0] = frame_type
-    out[1] = (stream_id >> 16) & 0xFF
-    out[2] = (stream_id >> 8) & 0xFF
-    out[3] = stream_id & 0xFF
-    out[4:8] = struct.pack(">I", len(payload))
-    out[8:] = payload
-    return bytes(out)
-
-
-def _webproxy_window_frame(stream_id, amount):
-    return _webproxy_frame(WEBPROXY_FRAME_WINDOW, stream_id, struct.pack(">I", amount))
-
-
-class _WebProxyProtocolError(Exception):
-    pass
-
-
-class _WebProxyStream:
-    def __init__(self, session, stream_id):
-        self.session = session
-        self.stream_id = stream_id
-        self.phase = "header"
-        self.header = bytearray()
-        self.dead = False
-        self.reader = None
-        self.writer = None
-        self.in_queue = []
-        self.in_task = None
-        self.pump_task = None
-        self.queued_local = 0
-        self.recv_outstanding = 0
-        self.send_credit = WEBPROXY_STREAM_WINDOW
-        self.credit_waiter = None
-        self.client_read_key = None
-        self.client_read_iv = None
-        self.client_write_key = None
-        self.client_write_iv = None
-        self.dc_write_key = None
-        self.dc_write_iv = None
-        self.client_read_pos = 64
-        self.dc_write_pos = 64
-        _WEB_STATS["streams"] += 1
-        session.stream_count += 1
-
-    def feed(self, payload):
-        if self.dead or not payload:
-            return
-        self.recv_outstanding += len(payload)
-        if self.recv_outstanding > WEBPROXY_STREAM_WINDOW + 65536:
-            self.kill(True)
-            return
-        self.in_queue.append(bytes(payload))
-        self.queued_local += len(payload)
-        self.session.queued += len(payload)
-        if self.session.queued > WEBPROXY_MAX_QUEUED:
-            self.kill(True)
-            return
-        if self.in_task is None or self.in_task.done():
-            self.in_task = asyncio.create_task(self._run_in())
-
-    async def _run_in(self):
-        try:
-            while not self.dead and self.in_queue:
-                payload = self.in_queue[0]
-                if self.phase == "header":
-                    need = 64 - len(self.header)
-                    take = need if need < len(payload) else len(payload)
-                    self.header += payload[:take]
-                    self.queued_local -= take
-                    self.session.queued -= take
-                    if take == len(payload):
-                        self.in_queue.pop(0)
-                    else:
-                        self.in_queue[0] = payload[take:]
-                    if len(self.header) == 64:
-                        await self._init_dc()
-                        self._grant(64)
-                    continue
-                self.in_queue.pop(0)
-                self.queued_local -= len(payload)
-                self.session.queued -= len(payload)
-                await self._write_to_dc(payload)
-        except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):
-            self.kill(True)
-        finally:
-            if not self.dead and self.in_queue:
-                self.in_task = asyncio.create_task(self._run_in())
-
-    async def _init_dc(self):
-        parsed = webproxy_parse_obfs_header(bytes(self.header), self.session.secret)
-        self.client_read_key = parsed["read_key"]
-        self.client_read_iv = parsed["read_iv"]
-        self.client_write_key = parsed["write_key"]
-        self.client_write_iv = parsed["write_iv"]
-        self.dc_write_key = parsed["dc_write_key"]
-        self.dc_write_iv = parsed["dc_write_iv"]
-        dc = parsed["dc"]
-        dc_id = parsed["dc_id"]
-        tag = parsed["tag"]
-        ips = list(DC_HOSTS[dc])
-        random.shuffle(ips)
-        attempts = []
-        for port in WEBPROXY_DC_PORTS:
-            for ip in ips:
-                attempts.append((ip, port))
-        reader = None
-        writer = None
-        last_error = None
-        for ip, port in attempts[:4]:
-            if self.dead:
-                return
-            _WEB_STATS["dc_attempts"] += 1
-            try:
-                reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=WEBPROXY_DC_TIMEOUT)
-                break
-            except (OSError, asyncio.TimeoutError) as exc:
-                last_error = exc
-                _WEB_STATS["dc_fails"] += 1
-                if writer is not None:
-                    try:
-                        writer.close()
-                    except OSError:
-                        pass
-                    writer = None
-        if writer is None:
-            _webproxy_log("dc_fail", "dc=" + str(dc))
-            raise last_error if last_error is not None else ConnectionError("failed to connect to DC")
-        self.reader = reader
-        self.writer = writer
-        if self.dead:
-            try:
-                writer.close()
-            except OSError:
-                pass
-            return
-        dc_header = _webproxy_build_dc_header(tag, dc_id, parsed["dc_material"])
-        writer.write(dc_header)
-        await writer.drain()
-        if self.dead:
-            return
-        self.phase = "ready"
-        self.pump_task = asyncio.create_task(self._pump())
-
-    async def _write_to_dc(self, payload):
-        if self.dead:
-            return
-        plain = _webproxy_aes_ctr_at(self.client_read_key, self.client_read_iv, self.client_read_pos, payload)
-        self.client_read_pos += len(payload)
-        if self.dead:
-            return
-        encrypted = _webproxy_aes_ctr_at(self.dc_write_key, self.dc_write_iv, self.dc_write_pos, plain)
-        self.dc_write_pos += len(payload)
-        self.writer.write(encrypted)
-        await self.writer.drain()
-        self._grant(len(payload))
-
-    async def _pump(self):
-        try:
-            while not self.dead:
-                if self.send_credit <= 0:
-                    await self._wait_credit()
-                    continue
-                chunk = await self.reader.read(65536)
-                if not chunk:
-                    break
-                offset = 0
-                while offset < len(chunk) and not self.dead:
-                    if self.send_credit <= 0:
-                        await self._wait_credit()
-                        continue
-                    size = len(chunk) - offset
-                    if size > self.send_credit:
-                        size = self.send_credit
-                    if size > 65536:
-                        size = 65536
-                    piece = chunk[offset:offset + size]
-                    self.send_credit -= size
-                    self.session.send_frame(_webproxy_frame(WEBPROXY_FRAME_DATA, self.stream_id, piece))
-                    offset += size
-        except (ConnectionError, asyncio.TimeoutError, OSError):
-            pass
-        self.kill(True)
-
-    async def _wait_credit(self):
-        if self.dead or self.send_credit > 0:
-            return
-        loop = asyncio.get_running_loop()
-        self.credit_waiter = loop.create_future()
-        try:
-            await self.credit_waiter
-        finally:
-            self.credit_waiter = None
-
-    def add_credit(self, amount):
-        if self.dead:
-            return
-        self.send_credit = self.send_credit + amount
-        if self.send_credit > 0xFFFFFFFF:
-            self.send_credit = 0xFFFFFFFF
-        waiter = self.credit_waiter
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
-
-    def _grant(self, amount):
-        if self.dead or amount <= 0:
-            return
-        self.recv_outstanding = self.recv_outstanding - amount
-        if self.recv_outstanding < 0:
-            self.recv_outstanding = 0
-        self.session.send_frame(_webproxy_window_frame(self.stream_id, amount))
-
-    def kill(self, notify):
-        if self.dead:
-            return
-        self.dead = True
-        self.session.streams.pop(self.stream_id, None)
-        self.session.remember(self.stream_id)
-        self.session.queued -= self.queued_local
-        if self.session.queued < 0:
-            self.session.queued = 0
-        self.queued_local = 0
-        self.in_queue.clear()
-        waiter = self.credit_waiter
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
-        current = None
-        try:
-            current = asyncio.current_task()
-        except RuntimeError:
-            current = None
-        for task in (self.pump_task, self.in_task):
-            if task is not None and not task.done() and task is not current:
-                task.cancel()
-        self.pump_task = None
-        self.in_task = None
-        if self.writer is not None:
-            try:
-                self.writer.close()
-            except OSError:
-                pass
-            self.writer = None
-        self.reader = None
-        if notify and not self.session.closed:
-            self.session.send_frame(_webproxy_frame(WEBPROXY_FRAME_CLOSE, self.stream_id, b""))
-        self.session.on_stream_closed(self.stream_id)
-
-
-class _WebProxySession:
-    def __init__(self, websocket, secret, lane_id=0, uid="", mode=0, client_ip=""):
-        self.websocket = websocket
-        self.secret = bytes(secret)
-        self.lane_id = lane_id
-        self.uid = str(uid or "")
-        self.mode = int(mode or 0)
-        self.client_ip = str(client_ip or "")
-        self.sid = "webproxy-" + os.urandom(6).hex()
-        self.flushed_up = 0
-        self.flushed_down = 0
-        self.flush_lock = asyncio.Lock()
-        self.lane_used = False
-        self.streams = {}
-        self.closed = False
-        self.queued = 0
-        self.tombstones = set()
-        self.tombstone_order = []
-        self.stream_count = 0
-        self.bytes_up = 0
-        self.bytes_down = 0
-        self.opened_at = time.time()
-        self.last_pong = time.time()
-        self.send_queue = asyncio.Queue()
-        self.sender_task = None
-        self.keepalive_task = None
-        _WEB_STATS["sessions"] += 1
-        _WEB_STATS["sessions_active"] += 1
-        _WEB_ACTIVE[self.sid] = {"id": self.sid, "username": self.uid, "protocol": "webproxy", "client_ip": self.client_ip, "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "mode": self.mode, "session": self}
-        _webproxy_log("session_open", "lane=" + str(lane_id) + " carrier=" + WEBPROXY_CARRIER)
-
-    def send_frame(self, data):
-        if self.closed:
-            return
-        self.send_queue.put_nowait(bytes(data))
-
-    def remember(self, stream_id):
-        if stream_id in self.tombstones:
-            return
-        if len(self.tombstone_order) >= 4096:
-            oldest = self.tombstone_order.pop(0)
-            self.tombstones.discard(oldest)
-        self.tombstones.add(stream_id)
-        self.tombstone_order.append(stream_id)
-
-    def on_stream_closed(self, stream_id):
-        if not self.lane_id or self.closed or stream_id != self.lane_id:
-            return
-        self.dispose()
-        try:
-            asyncio.create_task(self.websocket.close(code=1000))
-        except (OSError, RuntimeError):
-            pass
-
-    def dispose(self):
-        if self.closed:
-            return
-        self.closed = True
-        _WEB_ACTIVE.pop(self.sid, None)
-        if self.uid and _WEB_HOOKS.get("count") is not None:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(_webproxy_flush_session(self, force=True))
-            except RuntimeError:
-                pass
-        _WEB_STATS["sessions_active"] -= 1
-        if _WEB_STATS["sessions_active"] < 0:
-            _WEB_STATS["sessions_active"] = 0
-        _webproxy_log("session_close", "streams=" + str(self.stream_count) + " up=" + str(self.bytes_up) + " down=" + str(self.bytes_down))
-        if self.keepalive_task is not None and not self.keepalive_task.done():
-            self.keepalive_task.cancel()
-        self.keepalive_task = None
-        for stream in list(self.streams.values()):
-            stream.kill(False)
-        self.streams.clear()
-        self.tombstones.clear()
-        self.tombstone_order.clear()
-        self.queued = 0
-
-    async def shutdown(self):
-        _webproxy_log("session_kill", "protocol")
-        self.dispose()
-        try:
-            await self.websocket.close(code=1011)
-        except (OSError, RuntimeError, AttributeError):
-            pass
-
-    async def _sender(self):
-        try:
-            while True:
-                data = await self.send_queue.get()
-                try:
-                    try:
-                        await self.websocket.send_bytes(data)
-                    except (ConnectionError, OSError, RuntimeError):
-                        break
-                    self.bytes_down += len(data)
-                    _WEB_STATS["bytes_down"] += len(data)
-                    _entry = _WEB_ACTIVE.get(self.sid)
-                    if _entry is not None:
-                        _entry["bytes_down"] = self.bytes_down
-                    if self.uid:
-                        if not await _webproxy_flush_session(self):
-                            await self.shutdown()
-                            break
-                finally:
-                    self.send_queue.task_done()
-        except asyncio.CancelledError:
-            raise
-
-    async def _keepalive(self):
-        try:
-            while not self.closed:
-                await asyncio.sleep(25)
-                if self.closed:
-                    break
-                if time.time() - self.last_pong > 90:
-                    await self.shutdown()
-                    break
-                payload = struct.pack(">I", int(time.time()))
-                self.send_frame(_webproxy_frame(WEBPROXY_FRAME_PING, 0, payload))
-        except asyncio.CancelledError:
-            raise
-
-    async def run(self):
-        self.sender_task = asyncio.create_task(self._sender())
-        if not self.lane_id:
-            self.keepalive_task = asyncio.create_task(self._keepalive())
-        try:
-            receive = getattr(self.websocket, "receive", None)
-            while not self.closed:
-                if receive is not None:
-                    message = await receive()
-                    if not isinstance(message, dict):
-                        await self.shutdown()
-                        break
-                    mtype = message.get("type", "")
-                    if mtype == "websocket.disconnect":
-                        break
-                    if mtype != "websocket.receive":
-                        continue
-                    if "bytes" in message and message["bytes"] is not None:
-                        await self.handle(message["bytes"])
-                    elif "text" in message:
-                        await self.shutdown()
-                        break
-                    else:
-                        await self.shutdown()
-                        break
-                else:
-                    try:
-                        data = await self.websocket.receive_bytes()
-                    except Exception:
-                        break
-                    await self.handle(data)
-        except _WebProxyProtocolError:
-            await self.shutdown()
-        except (ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
-            pass
-        finally:
-            self.dispose()
-            await _webproxy_flush_session(self, force=True)
-            if self.sender_task is not None:
-                try:
-                    try:
-                        await asyncio.wait_for(asyncio.shield(self.send_queue.join()), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        pass
-                finally:
-                    self.sender_task.cancel()
-                    try:
-                        await self.sender_task
-                    except asyncio.CancelledError:
-                        pass
-                    self.sender_task = None
-
-    async def handle(self, data):
-        if self.closed:
-            return
-        if not isinstance(data, (bytes, bytearray)):
-            raise _WebProxyProtocolError("binary only")
-        raw = bytes(data)
-        if len(raw) == 0 or len(raw) > 16777216:
-            raise _WebProxyProtocolError("bad batch size")
-        self.bytes_up += len(raw)
-        _WEB_STATS["bytes_up"] += len(raw)
-        _entry = _WEB_ACTIVE.get(self.sid)
-        if _entry is not None:
-            _entry["bytes_up"] = self.bytes_up
-        if self.uid:
-            if not await _webproxy_flush_session(self):
-                await self.shutdown()
-                raise _WebProxyProtocolError("quota exceeded")
-        offset = 0
-        frames = 0
-        while offset < len(raw):
-            if len(raw) - offset < 8:
-                raise _WebProxyProtocolError("short frame")
-            frames += 1
-            if frames > 4096:
-                raise _WebProxyProtocolError("too many frames")
-            frame_type = raw[offset]
-            stream_id = (raw[offset + 1] << 16) | (raw[offset + 2] << 8) | raw[offset + 3]
-            size = struct.unpack(">I", raw[offset + 4:offset + 8])[0]
-            end = offset + 8 + size
-            if size > 1048576 or end > len(raw):
-                raise _WebProxyProtocolError("bad frame size")
-            payload = raw[offset + 8:end]
-            offset = end
-            if self.lane_id and stream_id != self.lane_id:
-                raise _WebProxyProtocolError("cross lane frame")
-            if frame_type == WEBPROXY_FRAME_OPEN:
-                if stream_id == 0 or size != 0:
-                    raise _WebProxyProtocolError("bad open frame")
-                if self.lane_id:
-                    if self.lane_used:
-                        raise _WebProxyProtocolError("lane reused")
-                    self.lane_used = True
-                    self.streams[stream_id] = _WebProxyStream(self, stream_id)
-                    continue
-                if stream_id in self.streams or stream_id in self.tombstones or len(self.streams) >= WEBPROXY_MAX_STREAMS:
-                    self.send_frame(_webproxy_frame(WEBPROXY_FRAME_CLOSE, stream_id, b""))
-                    continue
-                self.streams[stream_id] = _WebProxyStream(self, stream_id)
-            elif frame_type == WEBPROXY_FRAME_DATA:
-                if stream_id == 0 or size == 0:
-                    raise _WebProxyProtocolError("bad data frame")
-                stream = self.streams.get(stream_id)
-                if stream is not None:
-                    stream.feed(payload)
-                elif stream_id not in self.tombstones:
-                    self.send_frame(_webproxy_frame(WEBPROXY_FRAME_CLOSE, stream_id, b""))
-            elif frame_type == WEBPROXY_FRAME_CLOSE:
-                if stream_id == 0 or size != 0:
-                    raise _WebProxyProtocolError("bad close frame")
-                stream = self.streams.get(stream_id)
-                if stream is not None:
-                    stream.kill(False)
-            elif frame_type == WEBPROXY_FRAME_WINDOW:
-                if stream_id == 0 or size != 4:
-                    raise _WebProxyProtocolError("bad window frame")
-                stream = self.streams.get(stream_id)
-                if stream is not None:
-                    stream.add_credit(struct.unpack(">I", payload)[0])
-            elif frame_type == WEBPROXY_FRAME_PING:
-                if stream_id == 0:
-                    if size > 64:
-                        raise _WebProxyProtocolError("ping too large")
-                    self.send_frame(_webproxy_frame(WEBPROXY_FRAME_PONG, 0, payload))
-            elif frame_type == WEBPROXY_FRAME_PONG:
-                if stream_id != 0:
-                    raise _WebProxyProtocolError("bad pong frame")
-                self.last_pong = time.time()
-            else:
-                raise _WebProxyProtocolError("unknown frame type")
-
-
-def webproxy_parse_subprotocol(value):
-    if value is None:
-        raise ValueError("missing websocket subprotocol")
-    offered = [part.strip() for part in str(value).split(",")]
-    offered = [part for part in offered if part]
-    if len(offered) != 1:
-        raise ValueError("exactly one websocket subprotocol is required")
-    protocol = offered[0]
-    if protocol.startswith("tproxy-v1."):
-        token = protocol[len("tproxy-v1."):]
-        if not token:
-            raise ValueError("empty session token")
-        return token, 0, protocol
-    if protocol.startswith("tproxy-lane-v1."):
-        rest = protocol[len("tproxy-lane-v1."):]
-        dot = rest.rfind(".")
-        if dot <= 0:
-            raise ValueError("bad lane subprotocol")
-        lane_text = rest[dot + 1:]
-        if not lane_text.isdigit() or len(lane_text) > 8:
-            raise ValueError("bad lane id")
-        if len(lane_text) > 1 and lane_text.startswith("0"):
-            raise ValueError("bad lane id")
-        lane_id = int(lane_text)
-        if lane_id < 1 or lane_id > 0xFFFFFF:
-            raise ValueError("bad lane id")
-        token = rest[:dot]
-        if not token:
-            raise ValueError("empty session token")
-        return token, lane_id, protocol
-    raise ValueError("unknown websocket subprotocol")
-
-
-async def webproxy_websocket_handler(websocket, protocol=None):
-    if protocol is None:
-        headers = getattr(websocket, "headers", None)
-        raw = ""
-        if headers is not None:
-            getter = getattr(headers, "get", None)
-            if getter is not None:
-                try:
-                    raw = getter("sec-websocket-protocol") or ""
-                except (AttributeError, KeyError, TypeError):
-                    raw = ""
-        protocol = raw
-    token, lane_id, protocol = webproxy_parse_subprotocol(protocol)
-    verified = webproxy_verify_token(token, WEBPROXY_TOKEN_SESSION)
-    if verified is None:
-        _WEB_STATS["ws_rejects"] += 1
-        _webproxy_log("ws_reject", "invalid or expired session token")
-        raise ValueError("invalid or expired session token")
-    secret = _webproxy_secret_for_mode(verified["mode"], verified.get("token") or None)
-    if secret is None:
-        _WEB_STATS["ws_rejects"] += 1
-        raise ValueError("unsupported token mode")
-    _ws_uid = webproxy_uid_for_mode(verified["mode"], verified.get("token") or None)
-    if not _ws_uid:
-        _WEB_STATS["ws_rejects"] += 1
-        _webproxy_log("ws_reject", "no WEB proxy link for this port")
-        raise ValueError("no WEB proxy link for this port")
-    _ws_ip = ""
-    try:
-        _client = getattr(websocket, "client", None)
-        if _client is not None:
-            _ws_ip = str(getattr(_client, "host", "") or "")
-    except (AttributeError, TypeError):
-        _ws_ip = ""
-    if _ws_uid:
-        _allowed = _WEB_HOOKS.get("session_allowed")
-        if _allowed is not None and not _allowed(_ws_uid, _ws_ip):
-            _WEB_STATS["ws_rejects"] += 1
-            raise ValueError("session limit reached for this inbound")
-        _count = _WEB_HOOKS.get("count")
-        if _count is not None and not await _count(_ws_uid, 0):
-            _WEB_STATS["ws_rejects"] += 1
-            raise ValueError("quota exceeded for this inbound")
-    await websocket.accept(subprotocol=protocol)
-    session = _WebProxySession(websocket, secret, lane_id, uid=_ws_uid, mode=verified["mode"], client_ip=_ws_ip)
-    await session.run()
-    return {
-        "uid": session.uid,
-        "lane_id": lane_id,
-        "streams": session.stream_count,
-        "bytes_up": session.bytes_up,
-        "bytes_down": session.bytes_down,
-        "duration": int(time.time() - session.opened_at),
-    }
-
-
-_WEBPROXY_DECOY_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="LUXVEIL premium contemporary fashion. Curated collections of designer apparel, outerwear, and accessories.">
-<meta name="robots" content="index, follow">
-<title>LUXVEIL Contemporary Fashion House</title>
-<style>
-body{margin:0;background:rgb(250,249,247);color:rgb(26,26,26);font-family:system-ui,sans-serif;line-height:1.6}
-header{background:rgb(255,255,255);border-bottom:1px solid rgb(228,228,231);padding:16px 32px;display:flex;justify-content:space-between;align-items:center}
-.logo{font-size:22px;font-weight:800;letter-spacing:4px}
-nav a{margin-left:24px;color:rgb(26,26,26);text-decoration:none;font-size:14px;text-transform:uppercase}
-.hero{max-width:1100px;margin:0 auto;padding:64px 32px;text-align:center}
-.hero h1{font-size:44px;margin:0 0 16px}
-.hero p{color:rgb(113,113,122);font-size:18px}
-.btn{display:inline-block;background:rgb(26,26,26);color:rgb(255,255,255);padding:14px 32px;border-radius:6px;text-decoration:none;text-transform:uppercase;font-size:14px;font-weight:600}
-.grid{max-width:1100px;margin:0 auto;padding:0 32px 64px;display:grid;grid-template-columns:repeat(4,1fr);gap:24px}
-.card{background:rgb(255,255,255);border:1px solid rgb(228,228,231);border-radius:12px;padding:16px}
-.swatch{height:180px;border-radius:8px;background:linear-gradient(160deg,rgb(196,181,163),rgb(168,146,121))}
-.card h3{font-size:15px;margin:12px 0 4px}
-.price{font-weight:700}
-footer{background:rgb(26,26,26);color:rgb(255,255,255);text-align:center;padding:32px;font-size:14px}
-</style>
-</head>
-<body>
-<header><div class="logo">LUXVEIL</div><nav><a href="/">New Arrivals</a><a href="/">Women</a><a href="/">Men</a><a href="/">Sale</a></nav></header>
-<section class="hero"><h1>Redefine Your Everyday Elegance</h1><p>Premium fabrics and contemporary silhouettes for the modern wardrobe.</p><a class="btn" href="/">Shop Collection</a></section>
-<section class="grid">
-<div class="card"><div class="swatch"></div><h3>Wool Blend Overcoat</h3><div class="price">$385.00</div></div>
-<div class="card"><div class="swatch"></div><h3>Relaxed Fit Blazer</h3><div class="price">$265.00</div></div>
-<div class="card"><div class="swatch"></div><h3>Merino Turtleneck</h3><div class="price">$145.00</div></div>
-<div class="card"><div class="swatch"></div><h3>Leather Crossbody Bag</h3><div class="price">$220.00</div></div>
-</section>
-<footer>LUXVEIL Ltd. All rights reserved.</footer>
-</body>
-</html>
-"""
-
-
-def webproxy_decoy_html():
-    return _WEBPROXY_DECOY_HTML
-
-
-_WEBPROXY_BRIDGE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connection</title>
-</head>
-<body>
-<script nonce="__NONCE__">
-(()=>{
-'use strict';
-const relayBase=location.origin+'/',bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__,sessionPath=__SESSION_PATH__,wsPath=__WS_PATH__,batchLimit=__BATCH_LIMIT__;
-let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
-const pending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
-function frame(type,id,payload){
- const out=new Uint8Array(8+payload.length);
- out[0]=type;out[1]=(id>>>16)&255;out[2]=(id>>>8)&255;out[3]=id&255;
- new DataView(out.buffer).setUint32(4,payload.length,false);
- out.set(payload,8);
- return out;
-}
-function closeFrame(id){return frame(3,id,new Uint8Array(0));}
-function splitFrames(value){
- const view=new DataView(value),result=[];let offset=0;
- while(offset<value.byteLength){
-  if(value.byteLength-offset<8)throw new Error('invalid frame batch');
-  const type=view.getUint8(offset),id=(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3);
-  const size=view.getUint32(offset+4),end=offset+8+size;
-  if((type===2&&!size)||size>1048576||end>value.byteLength)throw new Error('invalid frame');
-  result.push({type:type,id:id,data:value.slice(offset,end)});offset=end;
- }
- if(!result.length)throw new Error('empty frame batch');
- return result;
-}
-function fail(){
- if(closed)return;
- closeAll(true);
-}
-function ensureLane(id){
- let lane=lanes.get(id);
- if(!lane){lane={id:id,pending:[],socket:null,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane);}
- return lane;
-}
-function rememberClosed(id){
- if(!id||closedLanes.has(id))return;
- if(closedLaneOrder.length>=4096)closedLanes.delete(closedLaneOrder.shift());
- closedLanes.add(id);closedLaneOrder.push(id);
-}
-function finishLane(lane,notify){
- if(lane.finished||lanes.get(lane.id)!==lane)return;
- lane.finished=true;lane.pending.length=0;lanes.delete(lane.id);rememberClosed(lane.id);
- if(lane.socket){try{lane.socket.close();}catch(e){}}
- if(notify&&port&&!closed){const f=closeFrame(lane.id);port.postMessage(f,[f.buffer]);}
-}
-function flushLane(lane){
- const socket=lane.socket;
- if(closed||lane.finished||!socket||socket.readyState!==WebSocket.OPEN||!lane.pending.length)return;
- let total=0,count=0;
- while(count<lane.pending.length&&total+lane.pending[count].byteLength<=batchLimit){total+=lane.pending[count].byteLength;count++;}
- if(!count)return;
- const joined=new Uint8Array(total);let offset=0;
- for(let i=0;i<count;i++){joined.set(lane.pending[i],offset);offset+=lane.pending[i].byteLength;}
- lane.pending.splice(0,count);
- try{socket.send(joined.buffer);}catch(e){fail();return;}
- if(lane.pending.length)queueMicrotask(()=>flushLane(lane));
-}
-function openLane(lane){
- const target=relayBase.replace('https:','wss:').replace('http:','ws:')+wsPath;
- const socket=new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
- lane.socket=socket;socket.binaryType='arraybuffer';
- socket.onopen=()=>{if(closed||lane.finished){socket.close();return;}lane.opened=true;flushLane(lane);};
- socket.onmessage=event=>{
-  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return;}
-  let values;try{values=splitFrames(new Uint8Array(event.data));}catch(e){fail();return;}
-  if(values.some(v=>v.id!==lane.id)){fail();return;}
-  if(values.some(v=>v.type===3))lane.remoteClosed=true;
-  port.postMessage(event.data,[event.data]);
- };
- socket.onerror=()=>{};
- socket.onclose=()=>{
-  if(closed||lane.finished)return;
-  if(!lane.opened){fail();return;}
-  finishLane(lane,!lane.localClosed&&!lane.remoteClosed);
- };
-}
-function queueLane(value){
- let lane=lanes.get(value.id);
- if(!lane&&(value.type===2||value.type===3||value.type===4))return;
- if(!lane&&closedLanes.has(value.id))throw new Error('closed lane was reused');
- if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
- lane=lane||ensureLane(value.id);
- if(value.type===3&&!lane.opened){finishLane(lane,false);return;}
- lane.pending.push(value.data);
- if(value.type===3)lane.localClosed=true;
- if(!lane.socket)openLane(lane);else flushLane(lane);
-}
-function queueCarrier(data){
- let values;try{values=splitFrames(data);}catch(e){fail();return;}
- for(const value of values)queueLane(value);
-}
-async function createSession(first){
- try{
-  const response=await fetch(relayBase+sessionPath,{method:'POST',body:first,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',headers:{Authorization:'Bearer '+bootstrap,'Content-Type':'application/octet-stream'}});
-  if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
-  sessionToken=response.headers.get('X-Session-Token')||'';
-  if(!sessionToken)throw new Error('missing session token');
-  if(closed){fetch(relayBase+sessionPath,{method:'DELETE',keepalive:true,headers:{Authorization:'Bearer '+sessionToken}}).catch(()=>{});return;}
-  const welcome=await response.arrayBuffer();
-  port.postMessage(welcome,[welcome]);
-  for(const data of pending.splice(0))queueCarrier(data);
- }catch(e){fail();}
-}
-function closeAll(notifyServer){
- if(closed)return;
- closed=true;
- for(const lane of lanes.values()){if(lane.socket)try{lane.socket.close();}catch(e){}}
- lanes.clear();
- if(notifyServer&&sessionToken)fetch(relayBase+sessionPath,{method:'DELETE',keepalive:true,headers:{Authorization:'Bearer '+sessionToken}}).catch(()=>{});
- if(port)port.close();
-}
-function activatePort(nextPort){
- initialized=true;port=nextPort;
- port.onmessage=message=>{
-  if(message.data instanceof ArrayBuffer){
-   if(!createStarted){createStarted=true;createSession(new Uint8Array(message.data));}
-   else if(!sessionToken){pending.push(new Uint8Array(message.data));}
-   else queueCarrier(new Uint8Array(message.data));
-  }else if(message.data&&message.data.t==='close')closeAll(true);
- };
- port.start();
-}
-addEventListener('message',event=>{
- if(initialized||event.source!==parent||event.data===null||typeof event.data!=='object')return;
- const keys=Object.keys(event.data).sort();
- if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||event.data.t!=='tproxy-init'||event.data.v!==1||event.ports.length!==1)return;
- let source;try{source=new URL(event.origin);}catch(e){return;}
- if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||!source.port||source.origin!==event.origin)return;
- activatePort(event.ports[0]);
-},{once:false});
-addEventListener('pagehide',()=>closeAll(true),{once:true});
-})();
-</script>
-</body>
-</html>
-"""
-
-
-def webproxy_bridge_html(host, port, token=None):
-    if token:
-        bootstrap = webproxy_bootstrap_token(mode=WEBPROXY_TOKEN_MODE, token=token)
-    else:
-        mode = webproxy_port_mode(port)
-        bootstrap = webproxy_bootstrap_token(mode=mode)
-    page = _WEBPROXY_BRIDGE_HTML
-    page = page.replace("__NONCE__", _b64u_encode(os.urandom(18)))
-    page = page.replace("__BOOTSTRAP__", json.dumps(bootstrap))
-    page = page.replace("__CARRIER_MODE__", json.dumps(WEBPROXY_CARRIER))
-    page = page.replace("__SESSION_PATH__", json.dumps("api/v1/session"))
-    page = page.replace("__WS_PATH__", json.dumps("api/v1/ws"))
-    page = page.replace("__BATCH_LIMIT__", "2097152")
-    return page
-
-
-def webproxy_status():
-    try:
-        _webproxy_base_secret()
-        configured = True
-        source = _WEB_BASE_FROM or "environment"
-    except (RuntimeError, ValueError):
-        configured = False
-        source = ""
-    if _WEB_BASE is None and _WEB_CONFIGURE_ERROR:
-        configured = False
-    return {
-        "version": WEBPROXY_VERSION,
-        "carrier": WEBPROXY_CARRIER,
-        "mode": "direct-dc",
-        "token_mode": WEBPROXY_TOKEN_MODE,
-        "me_supported": WEBPROXY_ME_SUPPORTED,
-        "configured": configured,
-        "secret_source": source,
-        "configure_error": _WEB_CONFIGURE_ERROR,
-        "ports": list(WEB_PROXY_PORTS),
-        "sessions": _WEB_STATS["sessions"],
-        "sessions_active": _WEB_STATS["sessions_active"],
-        "streams": _WEB_STATS["streams"],
-        "dc_attempts": _WEB_STATS["dc_attempts"],
-        "dc_fails": _WEB_STATS["dc_fails"],
-        "bytes_up": _WEB_STATS["bytes_up"],
-        "bytes_down": _WEB_STATS["bytes_down"],
-        "ws_rejects": _WEB_STATS["ws_rejects"],
-        "uptime_seconds": int(time.time() - _WEB_STARTED),
-        "dc_probe": list(_WEB_LAST_PROBE),
-        "recent_events": list(_WEB_LOG[-60:]),
-    }
-
-
-def webproxy_capability_for(host, port, token=None):
-    port = int(port)
-    if token:
-        secret = webproxy_token_secret_bytes(token)
-    else:
-        secret = webproxy_per_port_secret_bytes(port)
-    host = str(host).strip().lower()
-    mac = hmac_mod.new(secret, ("tdesktop-web-proxy-bridge-v1\n" + host + ":" + str(port)).encode("utf-8"), hashlib.sha256).digest()
-    return _b64u_encode(mac)
-
-
-def webproxy_build_client_obfs_header(secret, dc=1, tag=None):
-    if tag is None:
-        tag = TAG_ABRIDGED
-    init = bytearray(os.urandom(64))
-    while init[0] == 0xEF:
-        init[0] = os.urandom(1)[0]
-    init[56:60] = tag
-    init[60:62] = struct.pack("<h", int(dc))
-    enc_key, enc_iv, _dk, _di = _derive_obfs_keys(bytes(init), bytes(secret))
-    cipher = _aes_ctr(enc_key, enc_iv).encryptor()
-    encrypted = cipher.update(bytes(init))
-    return bytes(init[:56]) + encrypted[56:64]
-
-
-def webproxy_self_check(host):
-    if not _WEB_CONFIGURED or _WEB_BASE is None:
-        if _WEB_CONFIGURE_ERROR:
-            return {"ok": False, "detail": "web proxy configure failed: " + _WEB_CONFIGURE_ERROR}
-        return {"ok": False, "detail": "web proxy was never configured at startup"}
-    try:
-        host = str(host or "").strip().lower() or "localhost"
-        capability = webproxy_capability_for(host, 443)
-        mode, _self_token = webproxy_verify_bridge_capability(host, capability, 443)
-        if mode != WEBPROXY_PORT_MODE_BASE:
-            return {"ok": False, "detail": "web proxy capability for port 443 did not verify (mode " + str(mode) + "); the secret used to build links is not the secret the bridge verifies with"}
-        bootstrap = webproxy_bootstrap_token(mode=mode)
-        verified = webproxy_verify_token(bootstrap, WEBPROXY_TOKEN_BOOTSTRAP)
-        if verified is None or verified.get("mode") != mode:
-            return {"ok": False, "detail": "web proxy bootstrap token did not verify"}
-        issued = webproxy_issue_session(bootstrap, WEBPROXY_HANDSHAKE)
-        session_token = issued.get("session_token", "")
-        if not session_token or webproxy_verify_token(session_token, WEBPROXY_TOKEN_SESSION) is None:
-            return {"ok": False, "detail": "web proxy session token did not verify"}
-    except (RuntimeError, ValueError) as exc:
-        return {"ok": False, "detail": "web proxy self-check failed: " + str(exc)}
-    return {"ok": True, "detail": "capability verifies for port 443, bootstrap and session tokens issue and verify"}
-
-
-async def _webproxy_probe_one(dc, timeout):
-    ips = DC_HOSTS[dc]
-    ip = ips[int.from_bytes(os.urandom(1), "big") % len(ips)]
-    started = time.time()
-    ok = False
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 443), timeout=timeout)
-        ok = True
-        try:
-            writer.close()
-        except OSError:
-            pass
-    except (OSError, asyncio.TimeoutError):
-        ok = False
-    ms = int((time.time() - started) * 1000)
-    return {"dc": dc, "ip": ip, "ok": ok, "ms": ms}
-
-
-async def webproxy_dc_probe(timeout=2.5):
-    results = []
-    keys = sorted(DC_HOSTS.keys())
-    for start in range(0, len(keys), 3):
-        batch = await asyncio.gather(*[_webproxy_probe_one(dc, timeout) for dc in keys[start:start + 3]])
-        results.extend(batch)
-    _WEB_LAST_PROBE.clear()
-    _WEB_LAST_PROBE.extend(results)
-    _webproxy_log("dc_probe", " ".join("DC" + str(item["dc"]) + (":ok" if item["ok"] else ":fail") for item in results))
-    return results
+    await telemt_stop_all()
